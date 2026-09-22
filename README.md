@@ -27,7 +27,7 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 |---------|-------------|----------|
 | **Fast** | Quick compression, minimal quality loss | Time-sensitive encoding |
 | **Balanced** | Good size vs quality compromise | General use |
-| **Max** | Stronger HEVC compression with lower audio bitrate | Smaller archive-friendly files |
+| **Max** | SVT-AV1 in MKV with Opus audio and hardware off | Smaller archive-friendly files |
 | **YouTube Upload** | Optimized for social media | Content creators |
 | **Mobile** | Smaller files for mobile | Mobile viewing |
 | **Streaming** | Fast encoding for live streams | Streamers |
@@ -122,6 +122,8 @@ python cli.py --hardware
 
 ## Dev Tooling
 
+GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI.
+
 All dev commands go through `dev.bat`:
 
 ```powershell
@@ -147,7 +149,7 @@ dev.bat build
 
 # Build installer (requires Inno Setup)
 dev.bat installer
-# Output: dist\SquishIt-Setup-v1.4.0.exe
+# Output: dist\SquishIt-Setup-v2.0.0.exe
 ```
 
 ---
@@ -155,7 +157,7 @@ dev.bat installer
 ## Project Structure
 
 ```
-squishit/                   # Main package
+video_compressor/          # Main package (launch: python -m video_compressor)
 ├── __init__.py
 ├── __main__.py             # CLI dispatch (--quick-compress, --open, --register)
 ├── config.py               # App config, paths, defaults
@@ -182,14 +184,13 @@ tools/                      # Build & dev tools
 ├── benchmark.py            # Encoder benchmark
 └── install_dev.bat         # Dev environment setup
 
-tests/                      # Test suite
+tests/                      # Test suite (pytest; no display required)
 ├── test_cli.py
 ├── test_codecs.py
-├── test_compressor.py
-├── test_context_menu.py
+├── test_config.py
 ├── test_eta.py
-├── test_hardware.py
-└── test_profiles.py
+├── test_profiles.py
+└── test_target_size.py
 ```
 
 ---

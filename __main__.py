@@ -4,8 +4,10 @@
 import sys
 import os
 
-# Add parent directory to path for development
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Keep the project root importable when this file is launched directly.
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from video_compressor.__main__ import main
 

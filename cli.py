@@ -10,7 +10,7 @@ import logging
 from video_compressor.core.compressor import VideoCompressor, CompressionResult
 from video_compressor.core.profiles import ProfileManager, CompressionProfile
 from video_compressor.core.hardware import get_hardware_detector
-from video_compressor.core.codecs import VideoCodec, AudioCodec, ImageFormat
+from video_compressor.core.codecs import VideoCodec, AudioCodec, ImageFormat, CodecManager
 from video_compressor.core.utils import (
     detect_media_type,
     format_size,
@@ -280,25 +280,31 @@ Examples:
     return parser
 
 
-def get_profile(args: argparse.Namespace) -> CompressionProfile:
+PROFILE_NAMES = {
+    'fast': 'Fast',
+    'balanced': 'Balanced',
+    'max': 'Max / Archival',
+    'youtube': 'YouTube Upload',
+    'mobile': 'Mobile',
+    'streaming': 'Streaming',
+}
+
+
+def get_profile(
+    args: argparse.Namespace,
+    manager: Optional[ProfileManager] = None,
+) -> CompressionProfile:
     """Get compression profile from arguments."""
-    manager = ProfileManager()
-    
-    # Map profile names
-    profile_map = {
-        'fast': 'Fast',
-        'balanced': 'Balanced',
-        'max': 'Max / Archival',
-        'youtube': 'YouTube Upload',
-        'mobile': 'Mobile',
-        'streaming': 'Streaming',
-    }
-    
-    profile_name = profile_map.get(args.profile, 'Balanced')
+    manager = manager or ProfileManager()
+
+    profile_name = PROFILE_NAMES.get(args.profile)
+    if profile_name is None:
+        known = ", ".join(sorted(PROFILE_NAMES))
+        raise ValueError(f"Unknown profile {args.profile!r}. Choose one of: {known}")
+
     base_profile = manager.get_profile(profile_name)
-    
     if not base_profile:
-        base_profile = manager.get_all_profiles()[0]
+        raise ValueError(f"Profile {profile_name!r} is not available")
 
     profile = CompressionProfile.from_dict(base_profile.to_dict())
     
@@ -336,7 +342,19 @@ def get_profile(args: argparse.Namespace) -> CompressionProfile:
         profile.resource_governor = args.resource_governor
     if args.no_hw_accel:
         profile.use_hw_accel = False
-    
+
+    # Keep the CLI profile on a container/audio pair the encoder can actually mux.
+    codec_manager = CodecManager()
+    profile.video_container = codec_manager.get_compatible_container(
+        profile.video_codec,
+        profile.video_container,
+    ).value
+    if not profile.disable_audio:
+        profile.audio_codec = codec_manager.coerce_audio_codec(
+            profile.audio_codec,
+            profile.video_container,
+        )
+
     return profile
 
 
@@ -555,10 +573,10 @@ def process_file(
     return result
 
 
-def main():
+def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point."""
     parser = create_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     # Setup logging
     if args.quiet:
@@ -608,7 +626,11 @@ def main():
         return 0
     
     # Get profile
-    profile = get_profile(args)
+    try:
+        profile = get_profile(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     # Apply batch strategy
     input_files = sort_input_files(input_files, args.batch_order, compressor)
