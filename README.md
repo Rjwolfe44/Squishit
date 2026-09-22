@@ -137,14 +137,14 @@ python cli.py --hardware
 
 ## Dev Tooling
 
-GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI.
+GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI. CI installs FFmpeg, then runs the unit tests and a separate `smoke` step (`pytest -m smoke`). That smoke test encodes about one second of generated video with `libx264` and checks that FFmpeg exits 0 and writes a non-empty MP4. Locally it skips when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
 
 All dev commands go through `dev.bat`:
 
 ```powershell
 dev.bat run             # Launch the GUI
 dev.bat cli video.mp4   # Run CLI
-dev.bat test            # Run pytest suite
+dev.bat test            # Run pytest suite (includes the FFmpeg smoke when ffmpeg is installed)
 dev.bat lint            # Ruff linting
 dev.bat format          # Black formatting
 dev.bat build           # PyInstaller EXE build
@@ -204,6 +204,7 @@ tests/                      # Test suite (pytest; no display required)
 ├── test_codecs.py
 ├── test_config.py
 ├── test_eta.py
+├── test_ffmpeg_smoke.py    # Real short libx264 encode (marker: smoke)
 ├── test_profiles.py
 └── test_target_size.py
 ```
