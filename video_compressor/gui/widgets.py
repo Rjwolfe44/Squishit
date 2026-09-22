@@ -22,6 +22,18 @@ from ..core.quality_ladder import (
     uses_numeric_preset,
 )
 from ..core.utils import format_size, format_time, parse_timecode
+from .copy import (
+    DROP_ZONE_NEXT,
+    DROP_ZONE_TITLE,
+    MORE_MENU_LABEL,
+    MORE_PROFILES_TOOLTIP,
+    PROGRESS_PHASES,
+    human_progress_status,
+    profile_ui_text,
+    progress_detail,
+    progress_phase,
+    secondary_menu_entries,
+)
 from .scaling import UI_SCALE_OPTIONS
 from .software_fallback_dialog import (
     declined_software_fallback_notice,
@@ -65,8 +77,10 @@ def _lbl(parent, text: str, size: int = 12, weight: str = "normal",
 
 
 def _section_hdr(parent, text: str):
-    _lbl(parent, text.upper(), size=10, weight="bold",
-         color=COLORS["text_muted"]).pack(anchor="w", pady=(0, 8))
+    """Quiet settings heading. The queue and profile pills carry the weight."""
+
+    _lbl(parent, text.upper(), size=9, weight="normal",
+         color=COLORS["text_muted"]).pack(anchor="w", pady=(2, 6))
 
 
 def _bind_adaptive_wrap(
@@ -139,7 +153,61 @@ class HardwareBadge(ctk.CTkFrame):
         self._lbl_widget.pack(side="left", padx=(10, 10), pady=5)
 
 
-# â”€â”€ DropZone â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ HoverTip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class HoverTip:
+    """Small hover note. The text matches the profile description it explains."""
+
+    def __init__(self, widget, text: str = ""):
+        self.widget = widget
+        self.text = text
+        self._tip = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def set_text(self, text: str) -> None:
+        self.text = text or ""
+
+    def hide(self) -> None:
+        self._hide()
+
+    def _show(self, _event=None):
+        if not self.text:
+            return
+        self._hide()
+        try:
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.configure(bg=COLORS["surface_raised"])
+            tk.Label(
+                tip,
+                text=self.text,
+                justify="left",
+                bg=COLORS["surface_raised"],
+                fg=COLORS["text"],
+                font=("Segoe UI", 10),
+                padx=8,
+                pady=6,
+                wraplength=280,
+            ).pack()
+            x = self.widget.winfo_rootx() + 8
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            tip.wm_geometry(f"+{x}+{y}")
+            self._tip = tip
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        tip = self._tip
+        self._tip = None
+        if tip is None:
+            return
+        try:
+            tip.destroy()
+        except Exception:
+            pass
+
 
 class DropZone(ctk.CTkFrame):
     """
@@ -147,11 +215,16 @@ class DropZone(ctk.CTkFrame):
     and a compact "Add more files" button when files are queued.
     """
 
-    _FULL_H = 200
+    _FULL_H = 228
 
     def __init__(self, master, on_drop: Callable[[List[str]], None], **kwargs):
         super().__init__(
-            master, fg_color=COLORS["surface"], corner_radius=12, **kwargs
+            master,
+            fg_color=COLORS["surface"],
+            corner_radius=12,
+            border_width=1,
+            border_color=COLORS["accent_dim"],
+            **kwargs,
         )
         self.pack_propagate(False)
         self.on_drop = on_drop
@@ -170,14 +243,23 @@ class DropZone(ctk.CTkFrame):
         inner.place(relx=0.5, rely=0.5, anchor="center")
 
         _lbl(inner, "📂", size=40, anchor="center").pack()
-        _lbl(inner, "Drop files here", size=16, weight="bold", anchor="center").pack(
-            pady=(6, 3)
+        _lbl(inner, DROP_ZONE_TITLE, size=18, weight="bold", anchor="center").pack(
+            pady=(6, 2)
         )
         _lbl(
             inner,
-            "MP4 · MKV · MOV · AVI · WebM · JPG · PNG · WebP · GIF",
-            size=11, color=COLORS["text_dim"], anchor="center",
+            DROP_ZONE_NEXT,
+            size=12,
+            color=COLORS["text_dim"],
+            anchor="center",
+            justify="center",
+            wraplength=460,
         ).pack()
+        _lbl(
+            inner,
+            "MP4 · MKV · MOV · AVI · WebM · JPG · PNG · WebP · GIF",
+            size=11, color=COLORS["text_muted"], anchor="center",
+        ).pack(pady=(4, 0))
         button_row = ctk.CTkFrame(inner, fg_color="transparent")
         button_row.pack(pady=(16, 0))
         ctk.CTkButton(
@@ -405,6 +487,7 @@ class ProgressCard(ctk.CTkFrame):
         )
         self.job = job
         self._on_cancel = on_cancel
+        self._awaiting_software_fallback = False
         self._build()
 
     def _build(self):
@@ -448,48 +531,88 @@ class ProgressCard(ctk.CTkFrame):
         self._bar.pack(fill="x", pady=(8, 5))
         self._bar.set(0)
 
-        # Footer row
+        phase_row = ctk.CTkFrame(body, fg_color="transparent")
+        phase_row.pack(fill="x", pady=(0, 4))
+        self._phase_lbls = {}
+        for index, name in enumerate(PROGRESS_PHASES):
+            if index:
+                _lbl(phase_row, "→", size=11, color=COLORS["text_muted"]).pack(
+                    side="left", padx=4
+                )
+            label = _lbl(phase_row, name, size=11, color=COLORS["text_muted"])
+            label.pack(side="left")
+            self._phase_lbls[name] = label
+
+        # Footer row: human status, then ETA and size when known
         foot = ctk.CTkFrame(body, fg_color="transparent")
         foot.pack(fill="x")
-        self._status_lbl = _lbl(foot, "Queued", size=11, color=COLORS["text_dim"])
-        self._status_lbl.pack(side="left")
         self._detail_lbl = _lbl(foot, "", size=11, color=COLORS["text_muted"], anchor="e")
         self._detail_lbl.pack(side="right")
+        self._status_lbl = _lbl(foot, "", size=11, color=COLORS["text"], anchor="w")
+        self._status_lbl.pack(side="left", fill="x", expand=True)
+        self.update(self.job)
+
+    def set_awaiting_software_fallback(self, awaiting: bool) -> None:
+        """Show the ask-before-software wait without changing the job."""
+
+        self._awaiting_software_fallback = bool(awaiting)
+        self.update(self.job)
+
+    def _paint_phase(self, phase: str) -> None:
+        order = list(PROGRESS_PHASES)
+        if phase not in order:
+            phase = order[0]
+        current = order.index(phase)
+        for index, name in enumerate(order):
+            label = self._phase_lbls[name]
+            if index == current:
+                label.configure(
+                    text_color=COLORS["accent"],
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                )
+            elif index < current:
+                label.configure(
+                    text_color=COLORS["text_dim"],
+                    font=ctk.CTkFont(size=11),
+                )
+            else:
+                label.configure(
+                    text_color=COLORS["text_muted"],
+                    font=ctk.CTkFont(size=11),
+                )
 
     def update(self, job: "CompressionJob"):
         self.job = job
         status_value = getattr(job.status, "value", job.status)
-        self._bar.set(job.progress / 100)
+        self._bar.set(max(0.0, min(1.0, job.progress / 100)))
         self._pct_lbl.configure(text=f"{job.progress:.0f}%")
         self._icon_lbl.configure(text=self._ICONS.get(status_value, "·"))
+        self._paint_phase(progress_phase(str(status_value), job.progress))
 
-        status_text = str(status_value).title()
-        if getattr(job, "attempt_count", 0) > 1 and status_value == "compressing":
-            status_text = f"Retry {job.attempt_count}"
-        self._status_lbl.configure(text=status_text)
-
-        parts = []
-        profile_name = getattr(getattr(job, "profile", None), "name", "")
-        if profile_name:
-            parts.append(profile_name)
-        if getattr(job, "encoder_name", ""):
-            parts.append(job.encoder_name)
-        if getattr(job, "threads_used", 0):
-            parts.append(f"{job.threads_used}T")
-        if job.speed and job.speed > 0:
-            parts.append(f"{job.speed:.1f} fps")
-        if job.throughput_mb_s and job.throughput_mb_s > 0:
-            parts.append(f"{job.throughput_mb_s:.2f} MB/s")
-        if job.eta and job.eta > 0:
-            parts.append(f"ETA {format_time(job.eta)}")
-        self._detail_lbl.configure(text="  ·  ".join(parts))
-
-        if status_value == "completed":
-            self._bar.configure(progress_color=COLORS["success"])
+        waiting = self._awaiting_software_fallback
+        status_text = human_progress_status(job, awaiting_software_fallback=waiting)
+        if waiting:
+            status_color = COLORS["warning"]
         elif status_value == "failed":
-            self._bar.configure(progress_color=COLORS["error"])
+            status_color = COLORS["error"]
+        elif status_value == "completed":
+            status_color = COLORS["success"]
+        else:
+            status_color = COLORS["text"]
+        self._status_lbl.configure(text=status_text, text_color=status_color)
+        self._detail_lbl.configure(text=progress_detail(job))
+
+        if waiting:
+            bar_color = COLORS["warning"]
+        elif status_value == "completed":
+            bar_color = COLORS["success"]
+        elif status_value == "failed":
+            bar_color = COLORS["error"]
         elif status_value == "cancelled":
-            self._bar.configure(progress_color=COLORS["text_muted"])
+            bar_color = COLORS["text_muted"]
+        else:
+            bar_color = COLORS["accent"]
+        self._bar.configure(progress_color=bar_color)
 
 
 # â”€â”€ ResultCard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -641,11 +764,16 @@ class ResultCard(ctk.CTkFrame):
 
 class ProfileBar(ctk.CTkFrame):
     """
-    Profile selector: pill buttons for the three main profiles,
-    plus a "More…" dropdown for the rest.
+    Primary pills for Fast, Balanced, and Max / Archival.
+    YouTube, Mobile, Streaming upload, and customs sit in a smaller More… menu.
     """
 
     _MAIN = ["Fast", "Balanced", "Max / Archival"]
+    _PRIMARY_WIDTH = {
+        "Fast": 92,
+        "Balanced": 116,
+        "Max / Archival": 164,
+    }
 
     def __init__(self, master, profiles: List[CompressionProfile],
                  on_select: Optional[Callable[[str], None]] = None, **kwargs):
@@ -654,40 +782,73 @@ class ProfileBar(ctk.CTkFrame):
         self.on_select = on_select
         self._selected: Optional[str] = None
         self._buttons: dict = {}
+        self._tips: List[HoverTip] = []
         self._more_var: Optional[ctk.StringVar] = None
+        self._more_menu: Optional[ctk.CTkOptionMenu] = None
+        self._more_tip: Optional[HoverTip] = None
+        self._label_to_name: Dict[str, str] = {}
+        self._name_to_label: Dict[str, str] = {}
+        self._syncing_more = False
         self._build()
+
+    def _clear_tips(self) -> None:
+        for tip in self._tips:
+            tip.hide()
+        self._tips.clear()
+        self._more_tip = None
+
+    def _remember_tip(self, widget, text: str) -> HoverTip:
+        tip = HoverTip(widget, text)
+        self._tips.append(tip)
+        return tip
 
     def _build(self):
         pill_row = ctk.CTkFrame(self, fg_color="transparent")
         pill_row.pack(fill="x")
 
+        primary_font = ctk.CTkFont(size=13, weight="bold")
         for profile in [p for p in self.profiles if p.name in self._MAIN]:
             label = profile_picker_label(profile.name)
-            button_width = 148 if "Archival" in label else 0
+            _shown, blurb = profile_ui_text(profile.name, profile.description)
             btn = ctk.CTkButton(
                 pill_row,
-                text=label, height=30, width=button_width, corner_radius=8,
-                fg_color=COLORS["surface_raised"], hover_color=COLORS["border"],
-                text_color=COLORS["text_dim"], font=ctk.CTkFont(size=12),
+                text=label,
+                height=36,
+                width=self._PRIMARY_WIDTH.get(profile.name, 0),
+                corner_radius=10,
+                fg_color=COLORS["surface_raised"],
+                hover_color=COLORS["border"],
+                text_color=COLORS["text"],
+                font=primary_font,
                 command=lambda n=profile.name: self._select(n),
             )
-            btn.pack(side="left", padx=(0, 5))
+            btn.pack(side="left", padx=(0, 6))
             self._buttons[profile.name] = btn
+            self._remember_tip(btn, blurb)
 
-        other = [p for p in self.profiles if p.name not in self._MAIN]
-        if other:
-            self._more_var = ctk.StringVar(value="More…")
-            ctk.CTkOptionMenu(
-                pill_row,
+        entries = secondary_menu_entries(self.profiles, self._MAIN)
+        self._label_to_name = {label: name for label, name in entries}
+        self._name_to_label = {name: label for label, name in entries}
+        if entries:
+            more_row = ctk.CTkFrame(self, fg_color="transparent")
+            more_row.pack(fill="x", pady=(8, 0))
+            self._more_var = ctk.StringVar(value=MORE_MENU_LABEL)
+            self._more_menu = ctk.CTkOptionMenu(
+                more_row,
                 variable=self._more_var,
-                values=["More…"] + [p.name for p in other],
-                height=30, width=80, corner_radius=8,
-                fg_color=COLORS["surface_raised"],
-                button_color=COLORS["border"],
-                button_hover_color=COLORS["accent"],
-                text_color=COLORS["text_dim"], font=ctk.CTkFont(size=12),
+                values=[MORE_MENU_LABEL] + [label for label, _name in entries],
+                height=26,
+                width=220,
+                corner_radius=8,
+                fg_color=COLORS["surface"],
+                button_color=COLORS["surface_raised"],
+                button_hover_color=COLORS["border"],
+                text_color=COLORS["text_muted"],
+                font=ctk.CTkFont(size=11),
                 command=self._on_more,
-            ).pack(side="left")
+            )
+            self._more_menu.pack(side="left")
+            self._more_tip = self._remember_tip(self._more_menu, MORE_PROFILES_TOOLTIP)
 
         self._desc_lbl = _lbl(
             self,
@@ -696,29 +857,59 @@ class ProfileBar(ctk.CTkFrame):
             color=COLORS["text_dim"],
             anchor="w",
             justify="left",
-            wraplength=236,
         )
         self._desc_lbl.pack(anchor="w", fill="x", pady=(6, 0))
-        _bind_adaptive_wrap(self._desc_lbl, minimum=220, maximum=236, padding=32)
+        _bind_adaptive_wrap(self._desc_lbl, minimum=220, padding=8)
 
-    def _on_more(self, name: str):
-        if name != "More…":
+    def _on_more(self, label: str):
+        if self._syncing_more or label == MORE_MENU_LABEL:
+            return
+        name = self._label_to_name.get(label)
+        if name and name != self._selected:
             self._select(name)
-            if self._more_var:
-                self._more_var.set("More…")
+
+    def _style_more(self, name: str) -> None:
+        if self._more_var is None:
+            return
+        self._syncing_more = True
+        try:
+            if name in self._buttons:
+                self._more_var.set(MORE_MENU_LABEL)
+                if self._more_menu is not None:
+                    self._more_menu.configure(text_color=COLORS["text_muted"])
+                if self._more_tip is not None:
+                    self._more_tip.set_text(MORE_PROFILES_TOOLTIP)
+            else:
+                self._more_var.set(self._name_to_label.get(name, name))
+                if self._more_menu is not None:
+                    self._more_menu.configure(text_color=COLORS["accent"])
+        finally:
+            self._syncing_more = False
 
     def _select(self, name: str):
+        primary_font = ctk.CTkFont(size=13, weight="bold")
         for n, btn in self._buttons.items():
             if n == name:
-                btn.configure(fg_color=COLORS["accent"], text_color="#ffffff")
+                btn.configure(
+                    fg_color=COLORS["accent"],
+                    text_color="#ffffff",
+                    font=primary_font,
+                )
             else:
                 btn.configure(
-                    fg_color=COLORS["surface_raised"], text_color=COLORS["text_dim"]
+                    fg_color=COLORS["surface_raised"],
+                    text_color=COLORS["text"],
+                    font=primary_font,
                 )
         self._selected = name
         profile = next((p for p in self.profiles if p.name == name), None)
+        blurb = ""
         if profile:
-            self._desc_lbl.configure(text=profile.description)
+            _label, blurb = profile_ui_text(profile.name, profile.description)
+            self._desc_lbl.configure(text=blurb)
+        self._style_more(name)
+        if self._more_tip is not None and name not in self._buttons and blurb:
+            self._more_tip.set_text(blurb)
         if self.on_select:
             self.on_select(name)
 
@@ -732,10 +923,12 @@ class ProfileBar(ctk.CTkFrame):
         """Rebuild the profile bar with updated profiles."""
         self.profiles = profiles
         old_selected = self._selected
+        self._clear_tips()
         for w in self.winfo_children():
             w.destroy()
         self._buttons.clear()
         self._more_var = None
+        self._more_menu = None
         self._build()
         if old_selected and any(p.name == old_selected for p in profiles):
             self._select(old_selected)
