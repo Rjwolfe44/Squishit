@@ -34,9 +34,8 @@ from .scaling import (
     scaled,
 )
 from .software_fallback_dialog import (
-    SOFTWARE_FALLBACK_QUEUE_KIND,
     bind_main_window_software_fallback,
-    finish_software_fallback_prompt,
+    handle_software_fallback_queue_message,
     with_declined_fallback_summary,
 )
 from ..core.profiles import CompressionProfile, ProfileManager, describe_target_size_plan
@@ -1435,17 +1434,9 @@ class MainWindow(tkinterdnd2.Tk):
             self._pump_after_id = self.after(80, self._pump_ui)
 
     def _handle(self, msg: tuple):
-        kind = msg[0]
-        if kind == SOFTWARE_FALLBACK_QUEUE_KIND:
-            _, request, holder, done = msg
-            try:
-                self._set_software_fallback_wait(request, True)
-            finally:
-                try:
-                    finish_software_fallback_prompt(self, request, holder, done)
-                finally:
-                    self._set_software_fallback_wait(request, False)
+        if handle_software_fallback_queue_message(self, msg):
             return
+        kind = msg[0]
         if kind == "update_available":
             _, info = msg
             self._show_update_banner(info)
