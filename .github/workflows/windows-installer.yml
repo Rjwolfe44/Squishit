@@ -1,0 +1,126 @@
+name: windows-installer
+
+# Builds the Inno Setup installer on a Windows runner and, for a v* tag,
+# publishes it to GitHub Releases on this repository.
+# The in-app updater uses the first .exe asset on the latest release.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install `
+            "customtkinter>=5.2.0" `
+            "tkinterdnd2>=0.4.3" `
+            "Pillow>=10.0.0" `
+            "pystray>=0.19.5" `
+            "ffmpeg-python>=0.2.0" `
+            "psutil>=5.9.0" `
+            "pyyaml>=6.0" `
+            "colorlog>=6.8.0" `
+            "rich>=13.7.0" `
+            "WMI>=1.5.1" `
+            "winotify>=1.1.0" `
+            "pyinstaller>=6.0.0"
+
+      - name: Fetch full-GPL FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path vendor\ffmpeg | Out-Null
+          $zip = "ffmpeg-full.zip"
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.zip"
+          curl.exe -L --fail --retry 3 -o $zip $url
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg download failed" }
+          New-Item -ItemType Directory -Force -Path vendor\ffmpeg\_extract | Out-Null
+          tar.exe -xf $zip -C vendor\ffmpeg\_extract
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg extract failed" }
+          $ffmpeg = Get-ChildItem vendor\ffmpeg\_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          $ffprobe = Get-ChildItem vendor\ffmpeg\_extract -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          if (-not $ffmpeg -or -not $ffprobe) { throw "ffmpeg.exe or ffprobe.exe missing from archive" }
+          Copy-Item $ffmpeg.FullName vendor\ffmpeg\ffmpeg.exe -Force
+          Copy-Item $ffprobe.FullName vendor\ffmpeg\ffprobe.exe -Force
+          Get-Item vendor\ffmpeg\ffmpeg.exe, vendor\ffmpeg\ffprobe.exe | Format-List Name, Length
+
+      - name: Build SquishIt with PyInstaller
+        shell: pwsh
+        run: |
+          python -m PyInstaller squishit.spec --noconfirm
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
+          if (-not (Test-Path dist\SquishIt\SquishIt.exe)) { throw "dist\SquishIt\SquishIt.exe was not produced" }
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = "innosetup.exe"
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          curl.exe -L --fail --retry 3 -o $installer $url
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup download failed" }
+          Start-Process -FilePath ".\$installer" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-" -Wait
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after Inno Setup install" }
+          Set-Content -Path iscc-path.txt -Value $iscc -Encoding ascii
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = Get-Content iscc-path.txt
+          & $iscc "tools\squishit.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
+          $setup = Get-Item "dist\SquishIt-Setup-v*.exe"
+          if (-not $setup) { throw "Installer exe missing" }
+          if ($setup.Length -lt 20MB) { throw "Installer looks too small: $($setup.Length) bytes" }
+          $bytes = [System.IO.File]::ReadAllBytes($setup.FullName)[0..1]
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "Installer is not a PE executable" }
+          Get-FileHash $setup.FullName -Algorithm SHA256 | Format-List
+          Get-Item $setup.FullName | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/SquishIt-Setup-*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.ref_name }}"
+          $notes = git tag -l --format="%(contents)" $tag
+          if ([string]::IsNullOrWhiteSpace($notes)) { throw "Tag $tag has no annotation; refusing to publish empty notes" }
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          [System.IO.File]::WriteAllText($notesPath, $notes.Trim() + "`n")
+          $installer = Get-ChildItem dist -Filter "SquishIt-Setup-*.exe" | Select-Object -First 1
+          gh release create $tag $installer.FullName `
+            --repo "${{ github.repository }}" `
+            --title "SquishIt $tag" `
+            --notes-file $notesPath `
+            --verify-tag
