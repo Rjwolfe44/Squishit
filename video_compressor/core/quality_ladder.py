@@ -6,12 +6,13 @@ one FFmpeg argument set. Two Max labels stay separate:
 * Max / Archival is the SVT-AV1 lane. Hardware stays off.
 * Quick Compress Max is the HEVC lane (``HEVC Max``). Hardware may stay on.
 
+Quick Lite, the fastest Quick Compress button, is the H.264 Quick rung.
+It prefers hardware in ``HW_VENDOR_PREFERENCE`` order (NVENC, then QSV, then
+AMF) and otherwise uses libx264. AV1 is not that rung.
+
 Quick is the fast, larger-file end of a lane (faster preset, lower CRF).
 Balanced is the default tradeoff. Max is the best compression that lane
 exposes: a slower preset and a CRF at least as high as Balanced.
-
-``HW_VENDOR_PREFERENCE`` is the later hardware selector order
-(NVENC, then QSV, then AMF, then software). This module only records it.
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ PROFILE_FLAG_RUNGS = {
     "max": QualityRung.MAX,
 }
 
-# Ticket 2 will walk vendors in this order, then fall back to software.
+# Hardware selector order. Software is the caller's fallback when none match.
 HW_VENDOR_PREFERENCE = ("nvidia", "intel", "amd")
 
 _HW_PRESETS = {
@@ -77,7 +78,12 @@ _HW_PRESETS = {
 }
 
 ARCHIVAL_PROFILE_NAME = "Max / Archival"
+QUICK_COMPRESS_LITE_LABEL = "Quick Lite"
 QUICK_COMPRESS_MAX_LABEL = "HEVC Max"
+
+# SVT-AV1 and libaom take a numeric preset. x264 names such as "medium"
+# must not be forwarded onto those encoders.
+_NUMERIC_PRESET_CODECS = {VideoCodec.SVT_AV1, VideoCodec.AV1}
 
 
 @dataclass(frozen=True)
@@ -140,7 +146,8 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             QualityRung.QUICK,
             24,
             "veryfast",
-            "Quick: faster HEVC encode, larger files (CRF 24, veryfast).",
+            "HEVC Quick: faster HEVC encode, larger files (CRF 24, veryfast). "
+            "Quick Lite, the fastest context-menu rung, stays on H.264.",
         ),
         QualityRung.BALANCED: _step(
             VideoCodec.HEVC,
@@ -217,7 +224,8 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             QualityRung.QUICK,
             26,
             "fast",
-            "H.264 Quick: faster encode, larger files (CRF 26, fast).",
+            "Quick Lite: fastest Quick Compress rung on H.264 "
+            "(CRF 26, fast). Prefers NVENC, then QSV, then AMF, then libx264.",
         ),
         QualityRung.BALANCED: _step(
             VideoCodec.H264,
@@ -288,6 +296,31 @@ def get_step(codec: VideoCodec, rung: QualityRung) -> LadderStep:
         ) from exc
 
 
+def uses_numeric_preset(codec: VideoCodec) -> bool:
+    """True when the encoder preset is a number, not an x264 name."""
+
+    return codec in _NUMERIC_PRESET_CODECS
+
+
+def coerce_preset_override(
+    codec: VideoCodec, preset_override: Optional[str]
+) -> Optional[str]:
+    """Drop x264-style names for SVT-AV1 and libaom.
+
+    A numeric override such as ``"4"`` still wins. ``"medium"`` or ``"slow"``
+    does not, so the ladder preset stays in place.
+    """
+
+    if preset_override is None:
+        return None
+    text = str(preset_override).strip()
+    if not text:
+        return None
+    if uses_numeric_preset(codec) and not text.isdigit():
+        return None
+    return text
+
+
 def matching_rung(codec: VideoCodec, crf: int, preset: str) -> Optional[QualityRung]:
     """Return the rung whose locked CRF and preset match, if any."""
 
@@ -314,11 +347,12 @@ def resolve_encoder_choice(
     """
 
     step = get_step(codec, rung)
+    preset = coerce_preset_override(codec, preset_override)
     return EncoderChoice(
         codec=codec,
         rung=rung,
         crf=step.crf if crf_override is None else crf_override,
-        preset=step.preset if preset_override is None else preset_override,
+        preset=step.preset if preset is None else preset,
         force_software=step.force_software,
         allow_hw_accel=step.allow_hw_accel,
         hint=step.hint,
@@ -374,6 +408,31 @@ def ladder_codec_settings(
         disable_audio=True,
         pixel_format="yuv420p",
     )
+
+
+def apply_hardware_ladder(settings: CodecSettings, hw_encoder: Optional[str]) -> None:
+    """Swap a matched software rung for that rung's hardware CQ and preset.
+
+    Unmatched CRF/preset pairs are left alone. SVT-AV1 stays on its numeric
+    software preset. Encoders without a placeholder (VideoToolbox) are left
+    alone too.
+    """
+
+    if not hw_encoder or settings.crf is None:
+        return
+    rung = matching_rung(settings.video_codec, settings.crf, settings.preset)
+    if rung is None:
+        return
+    step = get_step(settings.video_codec, rung)
+    if step.force_software:
+        return
+    try:
+        vendor = _vendor_for_encoder(hw_encoder)
+        preset = step.hw_presets[vendor]
+    except (ValueError, KeyError):
+        return
+    settings.preset = preset
+    settings.crf = step.hw_cq
 
 
 def ladder_video_ffmpeg_args(

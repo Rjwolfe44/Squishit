@@ -14,10 +14,12 @@ from ..core.codecs import AudioCodec, VideoCodec, CodecManager, RateControl, Aud
 from ..core.profiles import CompressionProfile
 from ..core.quality_ladder import (
     QualityRung,
+    coerce_preset_override,
     get_step,
     matching_rung,
     profile_picker_label,
     resolve_encoder_choice,
+    uses_numeric_preset,
 )
 from ..core.utils import format_size, format_time, parse_timecode
 from .scaling import UI_SCALE_OPTIONS
@@ -795,6 +797,8 @@ class SettingsPanel(ctk.CTkFrame):
             return
         if step.force_software and hasattr(self, "hw_var"):
             self.hw_var.set(False)
+        self._preset_override = coerce_preset_override(codec, self._preset_override)
+        numeric_preset = uses_numeric_preset(codec)
         preset = self._preset_override or step.preset
         if self._crf_override is not None or self._preset_override is not None:
             shown_crf = step.crf if self._crf_override is None else self._crf_override
@@ -803,7 +807,9 @@ class SettingsPanel(ctk.CTkFrame):
             hint = step.hint
         if hasattr(self, "preset_lbl"):
             self.preset_lbl.configure(text=preset)
-        if preset in self._PRESETS and hasattr(self, "preset_slider"):
+        if hasattr(self, "preset_slider"):
+            self.preset_slider.configure(state="disabled" if numeric_preset else "normal")
+        if not numeric_preset and preset in self._PRESETS and hasattr(self, "preset_slider"):
             self.preset_var.set(preset)
             self.preset_slider.set(self._PRESETS.index(preset))
         if hasattr(self, "_ladder_hint"):
@@ -1199,6 +1205,12 @@ class SettingsPanel(ctk.CTkFrame):
     # â”€â”€ events â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_preset(self, val):
+        if uses_numeric_preset(self._selected_codec()):
+            self._preset_override = coerce_preset_override(
+                self._selected_codec(), self._preset_override
+            )
+            self._sync_ladder_controls()
+            return
         idx = int(round(float(val)))
         name = self._PRESETS[idx]
         self._preset_override = name
@@ -1324,7 +1336,9 @@ class SettingsPanel(ctk.CTkFrame):
         matched = matching_rung(profile.video_codec, profile.crf, profile.preset)
         if matched is None:
             self._crf_override = profile.crf
-            self._preset_override = profile.preset
+            self._preset_override = coerce_preset_override(
+                profile.video_codec, profile.preset
+            )
             self.compression_var.set(QualityRung.BALANCED.label)
         else:
             self._crf_override = None

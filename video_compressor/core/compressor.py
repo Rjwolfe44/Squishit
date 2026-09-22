@@ -38,6 +38,7 @@ from .profiles import (
     resolve_requested_target_size_mb,
 )
 from .hardware import HardwareDetector, get_hardware_detector
+from .quality_ladder import apply_hardware_ladder, ordered_hw_vendors
 from .utils import (
     format_size, format_time, format_bitrate,
     validate_video_file, validate_image_file, detect_media_type,
@@ -1031,34 +1032,28 @@ class VideoCompressor:
         )
 
     def _select_hw_encoder(self, codec: VideoCodec) -> Optional[str]:
-        """Pick the best available hardware encoder for a codec.
+        """Pick a hardware encoder: NVENC, then QSV, then AMF.
 
-        A later hardware pass should walk vendors with
-        quality_ladder.ordered_hw_vendors (NVENC, then QSV, then AMF)
-        before software. This method still honors the detector's preferred
-        vendor first.
+        A GPU must advertise support for the codec and FFmpeg must provide
+        that vendor's encoder. None means the caller keeps the software
+        encoder (libx264 on the Quick Lite rung).
         """
         info = self.hw_detector.info
         if not info.gpus:
             return None
 
-        preferred_vendor = info.preferred_hw_encoder
-        vendors: List[str] = []
-        if preferred_vendor:
-            vendors.append(preferred_vendor)
-
+        supported: List[str] = []
         for gpu in info.gpus:
             vendor_name = gpu.vendor.value
-            if vendor_name not in vendors:
-                vendors.append(vendor_name)
-
-        for vendor in vendors:
-            encoder = self.codec_manager.get_hw_encoder(codec, vendor)
-            if not encoder:
+            if vendor_name in supported:
                 continue
-            for gpu in info.gpus:
-                if gpu.vendor.value == vendor and gpu.encoder_support.get(codec.value, False):
-                    return encoder
+            if gpu.encoder_support.get(codec.value, False):
+                supported.append(vendor_name)
+
+        for vendor in ordered_hw_vendors(supported):
+            encoder = self.codec_manager.get_hw_encoder(codec, vendor)
+            if encoder:
+                return encoder
 
         return None
 
@@ -1246,6 +1241,9 @@ class VideoCompressor:
             )
             if target_rate_control is not None:
                 codec_settings.rate_control = target_rate_control
+
+        if hw_encoder and codec_settings.crf is not None and not codec_settings.video_bitrate:
+            apply_hardware_ladder(codec_settings, hw_encoder)
 
         codec_args = codec_settings.to_ffmpeg_args(hw_encoder)
         cmd.extend(codec_args)

@@ -16,12 +16,13 @@ from ..core.profiles import (
     CompressionProfile,
     build_quick_compress_profiles,
     normalize_quick_compress_name,
+    retarget_quick_compress_fallback,
 )
 from ..core.codecs import VideoCodec
 from ..config import APP_NAME, get_config_manager
 from .scaling import apply_tk_scaling, center_window, resolve_ui_scale, scaled
 
-# HEVC Quick / Balanced / HEVC Max. CRF and preset come from the shared ladder.
+# Quick Lite (H.264) / Balanced (HEVC) / HEVC Max. CRF and preset come from the ladder.
 _QUICK_PRESETS: dict[str, CompressionProfile] = build_quick_compress_profiles()
 _PRESET_ORDER = list(QUICK_COMPRESS_ORDER)
 
@@ -204,7 +205,7 @@ class QuickCompressWindow(tk.Tk):
         hevc_missing = not self._get_compressor().codec_manager.is_codec_usable(VideoCodec.HEVC)
         if resolve_fallback and profile.video_codec == VideoCodec.HEVC and hevc_missing:
             fallback_codec = self._get_compressor().codec_manager.get_best_codec(prefer_efficiency=True)
-            profile.video_codec = fallback_codec
+            retarget_quick_compress_fallback(profile, fallback_codec, selected)
             profile.video_container = self._get_compressor().codec_manager.get_compatible_container(
                 fallback_codec,
                 profile.video_container,

@@ -8,16 +8,21 @@ import pytest
 
 from cli import create_parser, get_profile
 from video_compressor.core.codecs import CodecSettings, VideoCodec
+from video_compressor.core.compressor import CompressionJob, VideoCompressor, VideoInfo
+from video_compressor.core.hardware import GPUInfo, GPUVendor, HardwareInfo
 from video_compressor.core.profiles import (
     QUICK_COMPRESS_ORDER,
+    CompressionProfile,
     ProfileManager,
     build_quick_compress_profiles,
     normalize_quick_compress_name,
     profile_video_ffmpeg_args,
+    retarget_quick_compress_fallback,
 )
 from video_compressor.core.quality_ladder import (
     ARCHIVAL_PROFILE_NAME,
     HW_VENDOR_PREFERENCE,
+    QUICK_COMPRESS_LITE_LABEL,
     QUICK_COMPRESS_MAX_LABEL,
     QualityRung,
     get_step,
@@ -404,15 +409,19 @@ def test_builtin_profiles_match_the_ladder(tmp_path):
     assert "Not Quick Compress Max" in archival.description
 
 
-def test_quick_compress_profiles_use_the_hevc_lane():
+def test_quick_compress_profiles_keep_lite_h264_and_max_hevc():
     profiles = build_quick_compress_profiles()
 
-    assert QUICK_COMPRESS_ORDER == ["Quick", "Balanced", "HEVC Max"]
-    assert normalize_quick_compress_name("Lite") == "Quick"
+    assert QUICK_COMPRESS_ORDER == ["Quick Lite", "Balanced", "HEVC Max"]
+    assert QUICK_COMPRESS_LITE_LABEL == "Quick Lite"
+    assert normalize_quick_compress_name("Lite") == "Quick Lite"
+    assert normalize_quick_compress_name("Quick") == "Quick Lite"
     assert normalize_quick_compress_name("Max") == "HEVC Max"
+    assert profiles["Quick Lite"].video_codec is VideoCodec.H264
+    assert profiles["Quick Lite"].use_hw_accel is True
     assert (
-        profile_video_ffmpeg_args(profiles["Quick"])
-        == EXPECTED_SOFTWARE_ARGS[(VideoCodec.HEVC, QualityRung.QUICK)]
+        profile_video_ffmpeg_args(profiles["Quick Lite"])
+        == EXPECTED_SOFTWARE_ARGS[(VideoCodec.H264, QualityRung.QUICK)]
     )
     assert (
         profile_video_ffmpeg_args(profiles["Balanced"])
@@ -424,6 +433,7 @@ def test_quick_compress_profiles_use_the_hevc_lane():
     )
     assert profiles["HEVC Max"].use_hw_accel is True
     assert profiles["HEVC Max"].video_codec is VideoCodec.HEVC
+    assert "AV1" not in profiles["Quick Lite"].description
 
 
 def test_gui_choice_matches_cli_ladder_args():
@@ -483,6 +493,18 @@ def test_cli_help_names_both_max_settings_and_offers_av1():
             True,
         ),
         (["clip.mp4", "--profile", "fast"], VideoCodec.H264, QualityRung.QUICK, True),
+        (
+            ["clip.mp4", "--profile", "max", "--codec", "svt-av1"],
+            VideoCodec.SVT_AV1,
+            QualityRung.MAX,
+            False,
+        ),
+        (
+            ["clip.mp4", "--profile", "max", "--codec", "av1"],
+            VideoCodec.AV1,
+            QualityRung.MAX,
+            True,
+        ),
     ],
 )
 def test_cli_profile_emits_the_same_video_args_as_the_ladder(
@@ -536,3 +558,237 @@ def test_cli_non_ladder_profile_keeps_its_own_crf(tmp_path):
     assert profile.video_codec is VideoCodec.HEVC
     assert profile.crf == 23
     assert profile.preset == "fast"
+
+
+def test_x264_preset_names_do_not_replace_numeric_av1_presets():
+    svt_named = resolve_encoder_choice(
+        VideoCodec.SVT_AV1, QualityRung.MAX, preset_override="medium"
+    )
+    svt_slow = resolve_encoder_choice(
+        VideoCodec.SVT_AV1, QualityRung.MAX, preset_override="slow"
+    )
+    svt_numeric = resolve_encoder_choice(
+        VideoCodec.SVT_AV1, QualityRung.MAX, preset_override="4"
+    )
+    av1_named = resolve_encoder_choice(
+        VideoCodec.AV1, QualityRung.BALANCED, preset_override="medium"
+    )
+    hevc_named = resolve_encoder_choice(
+        VideoCodec.HEVC, QualityRung.MAX, preset_override="medium"
+    )
+
+    assert svt_named.preset == "6"
+    assert svt_named.crf == 35
+    assert svt_named.force_software is True
+    assert svt_slow.preset == "6"
+    assert svt_numeric.preset == "4"
+    assert av1_named.preset == "6"
+    assert av1_named.crf == 30
+    assert hevc_named.preset == "medium"
+    assert hevc_named.force_software is False
+
+
+def test_quick_max_switch_keeps_archival_hardware_off(tmp_path):
+    profiles = build_quick_compress_profiles()
+    lite = profiles["Quick Lite"]
+    hevc_max = profiles["HEVC Max"]
+    archival = ProfileManager(config_dir=tmp_path).get_profile(ARCHIVAL_PROFILE_NAME)
+    archival_choice = resolve_encoder_choice(
+        VideoCodec.SVT_AV1, QualityRung.MAX, preset_override="slow"
+    )
+    hevc_choice = resolve_encoder_choice(VideoCodec.HEVC, QualityRung.MAX)
+
+    assert (lite.crf, lite.preset, lite.use_hw_accel) == (26, "fast", True)
+    assert lite.video_codec is VideoCodec.H264
+    assert (hevc_max.crf, hevc_max.preset, hevc_max.use_hw_accel) == (30, "slow", True)
+    assert hevc_choice.crf == 30
+    assert hevc_choice.preset == "slow"
+    assert hevc_choice.force_software is False
+    assert archival.use_hw_accel is False
+    assert archival.video_codec is VideoCodec.SVT_AV1
+    assert archival_choice.crf == 35
+    assert archival_choice.preset == "6"
+    assert archival_choice.force_software is True
+
+
+def test_hevc_missing_fallback_retargets_crf_and_preset():
+    profiles = build_quick_compress_profiles()
+    hevc_max = CompressionProfile.from_dict(profiles["HEVC Max"].to_dict())
+    balanced = CompressionProfile.from_dict(profiles["Balanced"].to_dict())
+
+    retarget_quick_compress_fallback(hevc_max, VideoCodec.H264, "HEVC Max")
+    retarget_quick_compress_fallback(balanced, VideoCodec.SVT_AV1, "Balanced")
+
+    assert hevc_max.video_codec is VideoCodec.H264
+    assert hevc_max.crf == get_step(VideoCodec.H264, QualityRung.MAX).crf
+    assert hevc_max.preset == "slow"
+    assert hevc_max.crf != 30
+    assert hevc_max.use_hw_accel is True
+    assert (
+        profile_video_ffmpeg_args(hevc_max)
+        == EXPECTED_SOFTWARE_ARGS[(VideoCodec.H264, QualityRung.MAX)]
+    )
+    assert balanced.video_codec is VideoCodec.SVT_AV1
+    assert balanced.crf == 35
+    assert balanced.preset == "8"
+    assert balanced.use_hw_accel is False
+    assert (
+        profile_video_ffmpeg_args(balanced)
+        == EXPECTED_SOFTWARE_ARGS[(VideoCodec.SVT_AV1, QualityRung.BALANCED)]
+    )
+
+
+def test_select_hw_encoder_prefers_nvenc_then_qsv_then_amf(monkeypatch):
+    monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
+    monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
+
+    compressor = VideoCompressor()
+    compressor.codec_manager._available_encoders = {
+        "h264_nvenc",
+        "h264_qsv",
+        "h264_amf",
+        "libx264",
+    }
+    compressor.hw_detector._info = HardwareInfo(
+        os_name="Linux",
+        os_version="test",
+        cpu_name="cpu",
+        cpu_cores=4,
+        cpu_threads=8,
+        total_ram_gb=16,
+        preferred_hw_encoder="amd",
+        gpus=[
+            GPUInfo(
+                "AMD",
+                GPUVendor.AMD,
+                encoder_support={"h264": True, "hevc": True},
+            ),
+            GPUInfo(
+                "Intel",
+                GPUVendor.INTEL,
+                encoder_support={"h264": True, "hevc": True},
+            ),
+            GPUInfo(
+                "NVIDIA",
+                GPUVendor.NVIDIA,
+                encoder_support={"h264": True, "hevc": True},
+            ),
+        ],
+    )
+
+    assert compressor._select_hw_encoder(VideoCodec.H264) == "h264_nvenc"
+
+    compressor.hw_detector.info.gpus[2].encoder_support["h264"] = False
+    assert compressor._select_hw_encoder(VideoCodec.H264) == "h264_qsv"
+
+    compressor.hw_detector.info.gpus[1].encoder_support["h264"] = False
+    assert compressor._select_hw_encoder(VideoCodec.H264) == "h264_amf"
+
+    compressor.codec_manager._available_encoders.discard("h264_amf")
+    assert compressor._select_hw_encoder(VideoCodec.H264) is None
+
+
+def _sample_video_info(input_file):
+    return VideoInfo(
+        filepath=input_file,
+        duration=10.0,
+        size=5_000_000,
+        width=1920,
+        height=1080,
+        fps=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        video_bitrate=3_000_000,
+        audio_bitrate=128_000,
+        total_bitrate=3_128_000,
+        frame_count=300,
+    )
+
+
+def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
+    monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
+    monkeypatch.setattr(VideoCompressor, "_get_thread_count", lambda *args, **kwargs: 4)
+
+    compressor = VideoCompressor()
+    input_file = tmp_path / "input.mp4"
+    input_file.write_bytes(b"0")
+    archival = ProfileManager(config_dir=tmp_path).get_profile(ARCHIVAL_PROFILE_NAME)
+    archival_out = tmp_path / "archival.mkv"
+    archival_job = CompressionJob(
+        id="job-archival",
+        input_file=input_file,
+        output_file=archival_out,
+        profile=archival,
+        parallel_jobs=1,
+    )
+    archival_job.video_info = _sample_video_info(input_file)
+
+    archival_cmd = compressor._build_video_ffmpeg_command(archival_job, archival)
+
+    assert archival_cmd == [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(input_file),
+        "-c:v",
+        "libsvtav1",
+        "-crf",
+        "35",
+        "-preset",
+        "6",
+        "-svtav1-params",
+        "lp=4",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96000",
+        "-threads",
+        "4",
+        str(archival_out),
+    ]
+    assert "nvenc" not in " ".join(archival_cmd)
+
+    hevc_max = build_quick_compress_profiles()["HEVC Max"]
+    monkeypatch.setattr(compressor, "_select_hw_encoder", lambda codec: "hevc_nvenc")
+    hevc_out = tmp_path / "hevc-max.mkv"
+    hevc_job = CompressionJob(
+        id="job-hevc-max",
+        input_file=input_file,
+        output_file=hevc_out,
+        profile=hevc_max,
+        parallel_jobs=1,
+    )
+    hevc_job.video_info = _sample_video_info(input_file)
+
+    hevc_cmd = compressor._build_video_ffmpeg_command(hevc_job, hevc_max)
+
+    assert hevc_cmd == [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(input_file),
+        "-c:v",
+        "hevc_nvenc",
+        "-preset",
+        "p7",
+        "-cq",
+        "30",
+        "-b:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96000",
+        "-threads",
+        "4",
+        str(hevc_out),
+    ]
