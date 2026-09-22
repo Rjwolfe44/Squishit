@@ -30,7 +30,7 @@ jobs:
       - name: Run pytest
         run: python -m pytest -m "not smoke"
 
-      - name: Run FFmpeg smoke encode
+      - name: Run FFmpeg and VideoCompressor smoke encodes
         run: python -m pytest -m smoke -v --tb=short
 
       - name: Verify the wheel packages the CLI module
