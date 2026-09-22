@@ -30,6 +30,12 @@ from .scaling import (
     resolve_ui_scale,
     scaled,
 )
+from .software_fallback_dialog import (
+    SOFTWARE_FALLBACK_QUEUE_KIND,
+    bind_main_window_software_fallback,
+    finish_software_fallback_prompt,
+    with_declined_fallback_summary,
+)
 from ..core.profiles import CompressionProfile, ProfileManager, describe_target_size_plan
 from ..core.hardware import get_hardware_detector
 from ..core.codecs import VideoCodec
@@ -156,6 +162,7 @@ class MainWindow(tkinterdnd2.Tk):
         self.is_compressing = False
         self._compare_mode = False
         self._q: queue.Queue = queue.Queue()
+        self._ui_thread = threading.current_thread()
         self.output_folder: Optional[Path] = None
         self.startup_files = startup_files or []
         self.auto_start = auto_start
@@ -233,6 +240,12 @@ class MainWindow(tkinterdnd2.Tk):
             self.compressor = VideoCompressor()
             self.compressor.set_progress_callback(
                 lambda job: self._q.put(("progress", job))
+            )
+            bind_main_window_software_fallback(
+                self.compressor,
+                self,
+                self._q,
+                ui_thread=self._ui_thread,
             )
         return self.compressor
 
@@ -1340,6 +1353,10 @@ class MainWindow(tkinterdnd2.Tk):
 
     def _handle(self, msg: tuple):
         kind = msg[0]
+        if kind == SOFTWARE_FALLBACK_QUEUE_KIND:
+            _, request, holder, done = msg
+            finish_software_fallback_prompt(self, request, holder, done)
+            return
         if kind == "update_available":
             _, info = msg
             self._show_update_banner(info)
@@ -1513,6 +1530,7 @@ class MainWindow(tkinterdnd2.Tk):
             msg += f", {skipped} skipped"
         if fail:
             msg += f", {fail} failed"
+        msg = with_declined_fallback_summary(msg, self.results)
         self._queue_lbl.configure(text=msg)
 
         for result in self.results:

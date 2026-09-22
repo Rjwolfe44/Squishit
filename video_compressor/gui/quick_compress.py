@@ -159,6 +159,9 @@ class QuickCompressWindow(tk.Tk):
             pass
 
     def _get_compressor(self) -> VideoCompressor:
+        # Quick Lite / Balanced / HEVC Max are CRF ladder jobs with no target
+        # size, so they never ask before a software retry. That dialog is on
+        # the main window, which is where target-size jobs are started.
         if self.compressor is None:
             self.compressor = VideoCompressor()
         return self.compressor

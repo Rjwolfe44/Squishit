@@ -24,7 +24,7 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 - Intel Quick Sync Video (QSV)
 - AMD AMF (H.264, HEVC — including RX 9070 XT)
 - Software libx264 when Quick Lite has no matching hardware encoder
-- Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band or fails, SquishIt does not switch to software until the caller confirms (`VideoCompressor.set_software_fallback_callback`, or `--allow-software-fallback`)
+- Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band or fails, SquishIt does not switch to software until the caller confirms. The main window asks with a Yes/No dialog; No or dismissing it keeps the hardware result and shows that on the result card. The CLI confirms with `--allow-software-fallback`. Quick Compress presets are not target-size jobs, so they do not ask. Leaving the callback unset also keeps the hardware result.
 
 ### Compression Profiles
 | Profile | Description | Use Case |

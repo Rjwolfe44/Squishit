@@ -23,6 +23,10 @@ from ..core.quality_ladder import (
 )
 from ..core.utils import format_size, format_time, parse_timecode
 from .scaling import UI_SCALE_OPTIONS
+from .software_fallback_dialog import (
+    declined_software_fallback_notice,
+    detail_without_fallback_message,
+)
 
 if TYPE_CHECKING:
     from ..core.compressor import CompressionJob
@@ -539,6 +543,19 @@ class ResultCard(ctk.CTkFrame):
                 command=self._open_file,
             ).pack(side="right")
 
+        notice = declined_software_fallback_notice(self.result)
+        if notice:
+            notice_label = _lbl(
+                body,
+                notice,
+                size=11,
+                color=COLORS["warning"],
+                anchor="w",
+                justify="left",
+            )
+            notice_label.pack(fill="x", pady=(8, 0))
+            _bind_adaptive_wrap(notice_label, minimum=220, padding=24)
+
         if ok:
             # Savings progress bar
             pct = self.result.reduction_percent
@@ -572,10 +589,14 @@ class ResultCard(ctk.CTkFrame):
                 )
                 path_label.pack(fill="x", pady=(8, 0))
                 _bind_adaptive_wrap(path_label, minimum=220, padding=24)
-            if getattr(self.result, "note", ""):
+            note = detail_without_fallback_message(
+                getattr(self.result, "note", "") or "",
+                self.result,
+            )
+            if note:
                 note_label = _lbl(
                     body,
-                    self.result.note,
+                    note,
                     size=11, color=COLORS["text_dim"], anchor="w", justify="left",
                 )
                 note_label.pack(fill="x", pady=(8, 0))
@@ -590,13 +611,20 @@ class ResultCard(ctk.CTkFrame):
                 encoder_label.pack(fill="x", pady=(6, 0))
                 _bind_adaptive_wrap(encoder_label, minimum=220, padding=24)
         else:
-            error_label = _lbl(
-                body,
-                self.result.error_message or "Unknown error",
-                size=12, color=COLORS["error"], anchor="w",
+            error = detail_without_fallback_message(
+                self.result.error_message or "",
+                self.result,
             )
-            error_label.pack(fill="x", pady=(8, 0))
-            _bind_adaptive_wrap(error_label, minimum=240, padding=24)
+            if not error and not notice:
+                error = "Unknown error"
+            if error:
+                error_label = _lbl(
+                    body,
+                    error,
+                    size=12, color=COLORS["error"], anchor="w",
+                )
+                error_label.pack(fill="x", pady=(8, 0))
+                _bind_adaptive_wrap(error_label, minimum=240, padding=24)
 
     def _open_file(self):
         try:
