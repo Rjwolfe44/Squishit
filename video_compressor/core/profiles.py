@@ -752,7 +752,8 @@ def build_target_size_plan(
         )
     elif resolved_mode == TargetSizeMode.EXACT:
         warning = (
-            "Exact mode may disable hardware, lower audio bitrate, reduce frame rate and resolution, "
+            "Exact mode tries hardware first and asks before a software retry. "
+            "It may lower audio bitrate, frame rate, and resolution, "
             "and pad the final file to hit the requested size."
         )
     elif target_size_mb <= max(8, int(round(reserved_audio_mb * 1.2))):

@@ -211,6 +211,39 @@ def test_cli_sorts_batch_largest_first(tmp_path):
     assert ordered == [large, small]
 
 
+def test_cli_allow_software_fallback_installs_confirming_callback(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from video_compressor.core.compressor import CompressionResult, VideoCompressor
+
+    sample = tmp_path / "clip.mp4"
+    sample.write_bytes(b"0")
+    seen = {}
+
+    def fake_compress(self, input_file, output_file, profile, job_id=None, parallel_jobs=1):
+        callback = self._software_fallback_callback
+        seen["callback"] = callback
+        seen["confirmed"] = bool(callback and callback(object()))
+        return CompressionResult(
+            success=True,
+            input_file=Path(input_file),
+            output_file=Path(output_file),
+            skipped=True,
+            original_size=10,
+            compressed_size=10,
+        )
+
+    monkeypatch.setattr(VideoCompressor, "compress", fake_compress)
+
+    assert main([str(sample), "--allow-software-fallback", "--quiet"]) == 0
+    assert seen["confirmed"] is True
+
+    seen.clear()
+    assert main([str(sample), "--quiet"]) == 0
+    assert seen["callback"] is None
+    assert seen["confirmed"] is False
+
+
 def test_cli_accepts_compare_and_batch_flags():
     parser = create_parser()
     args = parser.parse_args([

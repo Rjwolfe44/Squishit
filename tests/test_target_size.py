@@ -1,12 +1,19 @@
 import pytest
 
 from video_compressor.core.codecs import AudioCodec, VideoCodec, VideoContainer
-from video_compressor.core.compressor import VideoCompressor, VideoInfo, CompressionJob, TargetSizeSearchState
-from video_compressor.core.hardware import HardwareDetector, HardwareInfo
+from video_compressor.core.compressor import (
+    VideoCompressor,
+    VideoInfo,
+    CompressionJob,
+    SoftwareFallbackReason,
+    TargetSizeSearchState,
+)
+from video_compressor.core.hardware import GPUInfo, GPUVendor, HardwareDetector, HardwareInfo
 from video_compressor.core.profiles import (
     CompressionProfile,
     ProfileType,
     TargetSizeMode,
+    build_quick_compress_profiles,
     build_target_size_plan,
     describe_target_size_plan,
     refine_target_size_bitrate,
@@ -259,7 +266,7 @@ def test_auto_resource_governor_resolves_from_workload():
     )
 
 
-def test_exact_target_profile_forces_software_and_harsher_limits(monkeypatch, tmp_path):
+def test_exact_target_profile_uses_software_when_no_hardware_encoder(monkeypatch, tmp_path):
     monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
     monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
     monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
@@ -597,3 +604,231 @@ def test_compress_skips_when_target_is_not_smaller(tmp_path, monkeypatch):
     assert result.skipped is True
     assert result.output_file is None
     assert "not smaller" in result.note.lower()
+
+
+def _encoder_name(cmd):
+    return cmd[cmd.index("-c:v") + 1]
+
+
+def _hw_target_compressor(monkeypatch):
+    monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
+    monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
+    monkeypatch.setattr(VideoCompressor, "_get_thread_count", lambda *args, **kwargs: 4)
+
+    compressor = VideoCompressor()
+    compressor.codec_manager._available_encoders = {
+        "libx264",
+        "libx265",
+        "h264_nvenc",
+        "hevc_nvenc",
+        "aac",
+        "libopus",
+    }
+    compressor.hw_detector._info = HardwareInfo(
+        os_name="Linux",
+        os_version="test",
+        cpu_name="cpu",
+        cpu_cores=4,
+        cpu_threads=8,
+        total_ram_gb=16,
+        preferred_hw_encoder="amd",
+        has_hw_encoder=True,
+        gpus=[
+            GPUInfo(
+                "AMD",
+                GPUVendor.AMD,
+                encoder_support={"h264": True, "hevc": True},
+            ),
+            GPUInfo(
+                "NVIDIA",
+                GPUVendor.NVIDIA,
+                encoder_support={"h264": True, "hevc": True},
+            ),
+        ],
+        recommended_threads=4,
+    )
+    return compressor
+
+
+def _run_target_job(compressor, profile, source, output, outputs):
+    """Encode with a stubbed FFmpeg and return every argv plus the result."""
+
+    commands = []
+
+    def fake_run(cmd, *, job, job_id, media_info, start_time, **kwargs):
+        commands.append(list(cmd))
+        encoder = _encoder_name(cmd)
+        size = outputs(encoder)
+        if size is None:
+            return 1, [f"{encoder} failed"]
+        job.output_file.parent.mkdir(parents=True, exist_ok=True)
+        job.output_file.write_bytes(b"0" * size)
+        return 0, []
+
+    compressor._run_ffmpeg_process = fake_run
+    compressor.analyze_media = lambda path: VideoInfo(
+        filepath=path,
+        duration=10.0,
+        size=8_000_000,
+        width=1920,
+        height=1080,
+        fps=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        video_bitrate=5_000_000,
+        audio_bitrate=128_000,
+        total_bitrate=5_128_000,
+        frame_count=300,
+    )
+    result = compressor.compress(source, output, profile, job_id=output.stem)
+    return commands, result
+
+
+def test_exact_target_keeps_quick_lite_hardware_until_confirmed(monkeypatch, tmp_path):
+    """Exact size tries H.264 hardware first and does not swap to software."""
+
+    compressor = _hw_target_compressor(monkeypatch)
+    monkeypatch.setattr(compressor, "_apply_exact_target_fallback", lambda profile, media: None)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+
+    commands, result = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "exact.mp4",
+        lambda encoder: 2_000_000,
+    )
+
+    assert commands
+    assert {_encoder_name(cmd) for cmd in commands} == {"h264_nvenc"}
+    assert result.success is True
+    assert result.software_fallback_required is True
+    assert result.software_fallback_reason == SoftwareFallbackReason.SIZE_MISS.value
+    assert "Confirm before retrying with libx264" in result.software_fallback_message
+    assert "Confirm before retrying with libx264" in result.note
+    assert result.encoder_name == "h264_nvenc"
+    assert "libx264" not in result.encoder_name
+    assert "libx265" not in " ".join(" ".join(cmd) for cmd in commands)
+
+
+def test_exact_target_software_retry_runs_only_after_confirmation(monkeypatch, tmp_path):
+    compressor = _hw_target_compressor(monkeypatch)
+    monkeypatch.setattr(compressor, "_apply_exact_target_fallback", lambda profile, media: None)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+    asked = []
+
+    def confirm(request):
+        asked.append(request)
+        return False
+
+    compressor.set_software_fallback_callback(confirm)
+    commands, declined = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "declined.mp4",
+        lambda encoder: 2_000_000,
+    )
+
+    assert len(asked) == 1
+    assert asked[0].reason is SoftwareFallbackReason.SIZE_MISS
+    assert asked[0].hw_encoder == "h264_nvenc"
+    assert asked[0].software_encoder == "libx264"
+    assert {_encoder_name(cmd) for cmd in commands} == {"h264_nvenc"}
+    assert declined.software_fallback_required is True
+
+    compressor.set_software_fallback_callback(lambda _request: True)
+    commands, confirmed = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "confirmed.mp4",
+        lambda encoder: 1_000_000 if encoder == "libx264" else 2_000_000,
+    )
+
+    assert _encoder_name(commands[0]) == "h264_nvenc"
+    assert _encoder_name(commands[-1]) == "libx264"
+    assert confirmed.success is True
+    assert confirmed.software_fallback_required is False
+    assert confirmed.encoder_name == "libx264"
+
+
+def test_target_size_hardware_failure_does_not_silently_use_software(monkeypatch, tmp_path):
+    compressor = _hw_target_compressor(monkeypatch)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["HEVC Max"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "fast"
+
+    commands, failed = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "failed.mkv",
+        lambda encoder: None,
+    )
+
+    assert [_encoder_name(cmd) for cmd in commands] == ["hevc_nvenc"]
+    assert failed.success is False
+    assert failed.software_fallback_required is True
+    assert failed.software_fallback_reason == SoftwareFallbackReason.ENCODE_FAILED.value
+    assert "Confirm before retrying with libx265" in failed.error_message
+    assert "libx265" not in " ".join(" ".join(cmd) for cmd in commands)
+
+    compressor.set_software_fallback_callback(lambda _request: True)
+    commands, confirmed = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "failed-then-sw.mkv",
+        lambda encoder: None if encoder == "hevc_nvenc" else 1_000_000,
+    )
+
+    assert [_encoder_name(cmd) for cmd in commands] == ["hevc_nvenc", "libx265"]
+    assert confirmed.success is True
+    assert confirmed.software_fallback_required is False
+    assert confirmed.encoder_name == "libx265"
+
+
+def test_exact_target_profile_keeps_hardware_when_an_encoder_exists(monkeypatch, tmp_path):
+    compressor = _hw_target_compressor(monkeypatch)
+    media_info = VideoInfo(
+        filepath=tmp_path / "clip.mp4",
+        duration=600.0,
+        size=400_000_000,
+        width=1920,
+        height=1080,
+        fps=60.0,
+        video_codec="h264",
+        audio_codec="aac",
+        video_bitrate=4_000_000,
+        audio_bitrate=192_000,
+        total_bitrate=4_192_000,
+        frame_count=36_000,
+    )
+    profile = CompressionProfile(
+        name="Exact HW",
+        profile_type=ProfileType.CUSTOM,
+        video_codec=VideoCodec.HEVC,
+        audio_codec=AudioCodec.AAC,
+        audio_bitrate=192_000,
+        use_hw_accel=True,
+        target_size_mb=10,
+        target_size_mode="exact",
+    )
+
+    prepared = compressor._prepare_target_size_profile(profile, media_info)
+
+    assert prepared.use_hw_accel is True
+    assert prepared.video_codec == VideoCodec.HEVC
+    assert compressor._select_hw_encoder(prepared.video_codec) == "hevc_nvenc"
