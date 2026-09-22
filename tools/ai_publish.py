@@ -4,6 +4,9 @@ tools/ai_publish.py — Non-interactive release publisher for AI use.
 GitHub Copilot calls this directly from the terminal. No prompts, no editors.
 All args are required. Exits 0 on success, 1 on any failure.
 
+Publishes to GitHub Releases on Rjwolfe44/Squishit. The product README in this
+repository is maintained in git and is not rewritten.
+
 Usage:
     python tools/ai_publish.py --version X.Y.Z --notes "Markdown release notes"
 """
@@ -11,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -24,7 +26,7 @@ from urllib.parse import quote
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OWNER = "Rjwolfe44"
-REPO  = "squishit-releases"
+REPO  = "Squishit"
 API   = "https://api.github.com"
 
 
@@ -137,117 +139,6 @@ def _post_binary(url: str, token: str, data: bytes) -> dict:
         _die(f"Upload network error: {e.reason}")
 
 
-def _put_json(url: str, token: str, payload: dict) -> None:
-    data = json.dumps(payload).encode()
-    req = request.Request(url, data=data,
-                          headers={**_headers(token), "Content-Type": "application/json"},
-                          method="PUT")
-    try:
-        with request.urlopen(req, timeout=30) as r:
-            r.read()
-    except HTTPError as e:
-        _die(f"PUT {url} → {e.code}: {e.read().decode(errors='replace')[:300]}")
-    except URLError as e:
-        _die(f"Network error: {e.reason}")
-
-
-# ── README builder ────────────────────────────────────────────────────────────
-
-def _exe_asset(rel: dict):
-    return next((a for a in rel.get("assets", [])
-                 if a["name"].lower().endswith(".exe")), None)
-
-
-def _build_readme(releases: list) -> str:
-    lines = [
-        "# SquishIt — Releases",
-        "",
-        "Power-user desktop media compression for Windows.  ",
-        "Modern codecs (AV1, HEVC, H.264) · Hardware acceleration · Explorer right-click integration",
-        "",
-        "---",
-        "",
-    ]
-
-    if releases:
-        latest = releases[0]
-        exe = _exe_asset(latest)
-        dl_url  = exe["browser_download_url"] if exe else latest["html_url"]
-        dl_name = exe["name"] if exe else latest["tag_name"]
-        pub     = (latest.get("published_at") or "")[:10]
-        body    = (latest.get("body") or "").strip()
-
-        lines += [
-            "## ⬇ Latest Download",
-            "",
-            f"**[{dl_name}]({dl_url})**"
-            f" &nbsp;·&nbsp; {latest['tag_name']}"
-            f" &nbsp;·&nbsp; Released {pub}",
-            "",
-        ]
-        if body:
-            preview = [ln for ln in body.splitlines() if ln.strip()][:4]
-            lines.append("> " + "  \n> ".join(preview))
-            lines.append("")
-
-    lines += ["---", "", "## All Releases", ""]
-    lines.append("| Version | Released | Download |")
-    lines.append("|---------|----------|----------|")
-    for rel in releases:
-        tag  = rel["tag_name"]
-        pub  = (rel.get("published_at") or "")[:10]
-        exe  = _exe_asset(rel)
-        link = (f"[{exe['name']}]({exe['browser_download_url']})"
-                if exe else f"[Release page]({rel['html_url']})")
-        lines.append(f"| **{tag}** | {pub} | {link} |")
-
-    lines += ["", "---", "", "## Release Notes", ""]
-    for rel in releases:
-        tag   = rel["tag_name"]
-        pub   = (rel.get("published_at") or "")[:10]
-        notes = (rel.get("body") or "").strip()
-        lines += [
-            f"### {tag} — {pub}",
-            "",
-            notes or "*(No release notes provided.)*",
-            "",
-        ]
-
-    lines += [
-        "---", "",
-        "## System Requirements", "",
-        "- Windows 10 / 11 (64-bit)",
-        "- ~50 MB disk space",
-        "- No additional runtime or dependencies required",
-        "",
-        "## Installation", "",
-        "1. Download the setup installer above.",
-        "2. Run it — no elevated privileges required for a per-user install.",
-        "3. During setup, optionally enable the Explorer right-click context menu.",
-        "",
-        "---", "",
-        "*This repository contains only release builds. Source code is private.*",
-    ]
-    return "\n".join(lines) + "\n"
-
-
-def _update_readme(token: str) -> None:
-    all_releases = _get(f"{API}/repos/{OWNER}/{REPO}/releases?per_page=100", token)
-    if not isinstance(all_releases, list):
-        all_releases = []
-    content = _build_readme(all_releases)
-    url      = f"{API}/repos/{OWNER}/{REPO}/contents/README.md"
-    existing = _get(url, token)
-    payload  = {
-        "message": "docs: regenerate release list",
-        "content": base64.b64encode(content.encode()).decode(),
-        "branch":  "main",
-    }
-    if existing and "sha" in existing:
-        payload["sha"] = existing["sha"]
-    _put_json(url, token, payload)
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -294,10 +185,6 @@ def main() -> None:
     upload_url = release["upload_url"].split("{")[0] + f"?name={quote(installer.name)}"
     asset = _post_binary(upload_url, token, installer.read_bytes())
     print(f"DOWNLOAD_URL={asset.get('browser_download_url', '')}")
-
-    # Regenerate README
-    _update_readme(token)
-    print("README_UPDATED=true")
     print("OK")
 
 

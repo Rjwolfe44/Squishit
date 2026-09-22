@@ -14,9 +14,7 @@ import customtkinter as ctk
 from .scaling import apply_dialog_geometry
 from .widgets import COLORS, _lbl
 from ..config import APP_NAME, APP_VERSION
-
-RELEASES_URL = "https://github.com/Rjwolfe44/squishit-releases/releases"
-ISSUES_URL = "https://github.com/Rjwolfe44/squishit-releases/issues"
+from ..core.updater import ISSUES_URL, RELEASES_URL
 
 
 class AboutDialog(ctk.CTkToplevel):
