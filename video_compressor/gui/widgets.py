@@ -12,6 +12,13 @@ import os
 
 from ..core.codecs import AudioCodec, VideoCodec, CodecManager, RateControl, AudioMode, ENCODER_REGISTRY
 from ..core.profiles import CompressionProfile
+from ..core.quality_ladder import (
+    QualityRung,
+    get_step,
+    matching_rung,
+    profile_picker_label,
+    resolve_encoder_choice,
+)
 from ..core.utils import format_size, format_time, parse_timecode
 from .scaling import UI_SCALE_OPTIONS
 
@@ -625,10 +632,11 @@ class ProfileBar(ctk.CTkFrame):
         pill_row.pack(fill="x")
 
         for profile in [p for p in self.profiles if p.name in self._MAIN]:
-            short = profile.name.replace(" / Archival", "")
+            label = profile_picker_label(profile.name)
+            button_width = 148 if "Archival" in label else 0
             btn = ctk.CTkButton(
                 pill_row,
-                text=short, height=30, width=0, corner_radius=8,
+                text=label, height=30, width=button_width, corner_radius=8,
                 fg_color=COLORS["surface_raised"], hover_color=COLORS["border"],
                 text_color=COLORS["text_dim"], font=ctk.CTkFont(size=12),
                 command=lambda n=profile.name: self._select(n),
@@ -715,14 +723,7 @@ class SettingsPanel(ctk.CTkFrame):
         "ultrafast", "superfast", "veryfast", "fast",
         "medium", "slow", "slower", "veryslow",
     ]
-    _COMPRESSION_LEVELS = ["Light", "Balanced", "Strong", "Extreme"]
-    _CRF_BY_CODEC = {
-        VideoCodec.H264: {"Light": 23, "Balanced": 27, "Strong": 31, "Extreme": 35},
-        VideoCodec.HEVC: {"Light": 21, "Balanced": 26, "Strong": 30, "Extreme": 34},
-        VideoCodec.AV1: {"Light": 24, "Balanced": 28, "Strong": 32, "Extreme": 36},
-        VideoCodec.SVT_AV1: {"Light": 24, "Balanced": 28, "Strong": 32, "Extreme": 36},
-        VideoCodec.VP9: {"Light": 28, "Balanced": 32, "Strong": 36, "Extreme": 40},
-    }
+    _COMPRESSION_LEVELS = [rung.label for rung in QualityRung]
     _CODEC_ORDER = [VideoCodec.H264, VideoCodec.HEVC, VideoCodec.VP9, VideoCodec.SVT_AV1, VideoCodec.AV1]
 
     def __init__(self, master, profiles: List[CompressionProfile],
@@ -737,6 +738,8 @@ class SettingsPanel(ctk.CTkFrame):
         self.hw_vendor = hw_vendor
         self._size_mode_on = False
         self._size_entry_row: Optional[ctk.CTkFrame] = None
+        self._preset_override: Optional[str] = None
+        self._crf_override: Optional[int] = None
         self._recommendation_label: Optional[ctk.CTkLabel] = None
         self._build()
 
@@ -764,7 +767,7 @@ class SettingsPanel(ctk.CTkFrame):
 
     def _available_codec_values(self) -> List[str]:
         if not self.codec_manager:
-            return ["h264", "hevc", "vp9"]
+            return ["h264", "hevc", "vp9", "svt-av1", "av1"]
         codecs = self.codec_manager.get_supported_codecs(hw_vendor=self.hw_vendor)
         ordered = [codec.value for codec in self._CODEC_ORDER if codec in codecs]
         return ordered or ["h264"]
@@ -775,13 +778,37 @@ class SettingsPanel(ctk.CTkFrame):
         except ValueError:
             return VideoCodec.H264
 
-    def _crf_for_level(self, codec: VideoCodec, level: str) -> int:
-        values = self._CRF_BY_CODEC.get(codec, self._CRF_BY_CODEC[VideoCodec.HEVC])
-        return values.get(level, values["Balanced"])
+    def _current_rung(self) -> QualityRung:
+        try:
+            return QualityRung.from_label(self.compression_var.get())
+        except KeyError:
+            return QualityRung.BALANCED
 
-    def _level_for_crf(self, codec: VideoCodec, crf: int) -> str:
-        values = self._CRF_BY_CODEC.get(codec, self._CRF_BY_CODEC[VideoCodec.HEVC])
-        return min(values, key=lambda level: abs(values[level] - crf))
+    def _sync_ladder_controls(self) -> None:
+        """Show the locked rung preset and the dual-Max hint for this codec."""
+
+        codec = self._selected_codec()
+        rung = self._current_rung()
+        try:
+            step = get_step(codec, rung)
+        except KeyError:
+            return
+        if step.force_software and hasattr(self, "hw_var"):
+            self.hw_var.set(False)
+        preset = self._preset_override or step.preset
+        if self._crf_override is not None or self._preset_override is not None:
+            shown_crf = step.crf if self._crf_override is None else self._crf_override
+            hint = f"Custom encoder settings (CRF {shown_crf}, preset {preset})."
+        else:
+            hint = step.hint
+        if hasattr(self, "preset_lbl"):
+            self.preset_lbl.configure(text=preset)
+        if preset in self._PRESETS and hasattr(self, "preset_slider"):
+            self.preset_var.set(preset)
+            self.preset_slider.set(self._PRESETS.index(preset))
+        if hasattr(self, "_ladder_hint"):
+            self._ladder_hint.configure(text=hint)
+        self._refresh_hw_hint()
 
     def _refresh_container_options(self):
         if not hasattr(self, "container_menu"):
@@ -819,16 +846,26 @@ class SettingsPanel(ctk.CTkFrame):
 
     def _on_codec_change(self, value: str):
         self.codec_var.set(value)
+        self._crf_override = None
+        self._preset_override = None
         self._refresh_container_options()
-        self._refresh_hw_hint()
+        self._sync_ladder_controls()
         self._changed()
 
     def _on_compression_level_change(self, value: str):
         self.compression_var.set(value)
-        self._refresh_hw_hint()
+        self._crf_override = None
+        self._preset_override = None
+        self._sync_ladder_controls()
         self._changed()
 
     def _on_hw_toggle(self):
+        try:
+            step = get_step(self._selected_codec(), self._current_rung())
+        except KeyError:
+            step = None
+        if step is not None and step.force_software:
+            self.hw_var.set(False)
         self._refresh_hw_hint()
         self._changed()
 
@@ -931,7 +968,13 @@ class SettingsPanel(ctk.CTkFrame):
         self.codec_menu = self._menu_row(parent, "Codec", self.codec_var, codec_values, command=self._on_codec_change)
 
         self.compression_var = ctk.StringVar(value="Balanced")
-        self._menu_row(parent, "Compression", self.compression_var, self._COMPRESSION_LEVELS, command=self._on_compression_level_change)
+        self._menu_row(
+            parent, "Compression", self.compression_var, self._COMPRESSION_LEVELS,
+            command=self._on_compression_level_change,
+        )
+        self._ladder_hint = _lbl(parent, "", size=10, color=COLORS["text_muted"], anchor="w")
+        self._ladder_hint.pack(fill="x", pady=(0, 8))
+        _bind_adaptive_wrap(self._ladder_hint, minimum=180, padding=18)
 
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=(0, 10))
@@ -985,7 +1028,7 @@ class SettingsPanel(ctk.CTkFrame):
         self._hw_hint = _lbl(parent, "", size=10, color=COLORS["text_muted"], anchor="w")
         self._hw_hint.pack(fill="x", pady=(0, 8))
         _bind_adaptive_wrap(self._hw_hint, minimum=180, padding=18)
-        self._refresh_hw_hint()
+        self._sync_ladder_controls()
 
         self._recommendation_label = _lbl(
             parent,
@@ -1158,6 +1201,7 @@ class SettingsPanel(ctk.CTkFrame):
     def _on_preset(self, val):
         idx = int(round(float(val)))
         name = self._PRESETS[idx]
+        self._preset_override = name
         self.preset_var.set(name)
         self.preset_lbl.configure(text=name)
         self._changed()
@@ -1222,15 +1266,23 @@ class SettingsPanel(ctk.CTkFrame):
                 threads = int(self.thread_var.get())
             except ValueError:
                 threads = None
+        codec = codec_map.get(self.codec_var.get(), VideoCodec.HEVC)
+        choice = resolve_encoder_choice(
+            codec,
+            self._current_rung(),
+            crf_override=self._crf_override,
+            preset_override=self._preset_override,
+        )
+        use_hw = False if choice.force_software else self.hw_var.get()
         return {
             "max_resolution": res_map.get(self.res_var.get()),
             "frame_rate": fps_map.get(self.fps_var.get()),
-            "video_codec": codec_map.get(self.codec_var.get(), VideoCodec.HEVC),
-            "crf": self._crf_for_level(codec_map.get(self.codec_var.get(), VideoCodec.HEVC), self.compression_var.get()),
+            "video_codec": codec,
+            "crf": choice.crf,
             "video_container": self.container_var.get(),
             "image_format": self.image_format_var.get(),
-            "preset": self.preset_var.get(),
-            "use_hw_accel": self.hw_var.get(),
+            "preset": choice.preset,
+            "use_hw_accel": use_hw,
             "audio_codec": AudioCodec(self.audio_codec_var.get()),
             "audio_bitrate": int(self.audio_var.get()) * 1000,
             "target_size_mb": target_size,
@@ -1269,15 +1321,20 @@ class SettingsPanel(ctk.CTkFrame):
             codec_value = codec_values[0]
         self.codec_menu.configure(values=codec_values)
         self.codec_var.set(codec_value)
-        self.compression_var.set(self._level_for_crf(profile.video_codec, profile.crf))
+        matched = matching_rung(profile.video_codec, profile.crf, profile.preset)
+        if matched is None:
+            self._crf_override = profile.crf
+            self._preset_override = profile.preset
+            self.compression_var.set(QualityRung.BALANCED.label)
+        else:
+            self._crf_override = None
+            self._preset_override = None
+            self.compression_var.set(matched.label)
         self._refresh_container_options()
         self.container_var.set(profile.video_container or "mp4")
         self.image_format_var.set(profile.image_format or "webp")
-        p = profile.preset if profile.preset in self._PRESETS else "medium"
-        self.preset_var.set(p)
-        self.preset_slider.set(self._PRESETS.index(p))
-        self.preset_lbl.configure(text=p)
         self.hw_var.set(profile.use_hw_accel)
+        self._sync_ladder_controls()
         self.thread_var.set(str(profile.threads) if profile.threads else "auto")
         kbps = str(profile.audio_bitrate // 1000)
         self.audio_var.set(kbps if kbps in ["320", "256", "192", "128", "96"] else "192")
@@ -1296,7 +1353,6 @@ class SettingsPanel(ctk.CTkFrame):
         self.trim_end_var.set(str(profile.trim_end or ""))
         self.extra_args_var.set(profile.extra_ffmpeg_args or "")
         self.set_target_size_preview("")
-        self._refresh_hw_hint()
         if self._trim_mode_var.get():
             self._trim_row.pack(fill="x", pady=(0, 10))
         else:

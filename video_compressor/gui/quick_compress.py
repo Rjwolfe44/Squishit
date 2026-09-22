@@ -11,50 +11,19 @@ from pathlib import Path
 from typing import Optional
 
 from ..core.compressor import CompressionResult, VideoCompressor
-from ..core.profiles import CompressionProfile, ProfileType
-from ..core.codecs import VideoCodec, AudioCodec
+from ..core.profiles import (
+    QUICK_COMPRESS_ORDER,
+    CompressionProfile,
+    build_quick_compress_profiles,
+    normalize_quick_compress_name,
+)
+from ..core.codecs import VideoCodec
 from ..config import APP_NAME, get_config_manager
 from .scaling import apply_tk_scaling, center_window, resolve_ui_scale, scaled
 
-# Quick compress presets — lightweight standalone definitions, no ProfileManager needed.
-_QUICK_PRESETS: dict[str, CompressionProfile] = {
-    "Lite": CompressionProfile(
-        name="Lite",
-        profile_type=ProfileType.FAST,
-        description="Fastest option. Smaller files with minimal CPU use.",
-        video_codec=VideoCodec.H264,
-        crf=28,
-        preset="fast",
-        audio_codec=AudioCodec.AAC,
-        audio_bitrate=128_000,
-        video_container="mp4",
-    ),
-    "Balanced": CompressionProfile(
-        name="Balanced",
-        profile_type=ProfileType.BALANCED,
-        description="Recommended. Better compression without slowing to a crawl.",
-        video_codec=VideoCodec.HEVC,
-        crf=28,
-        preset="medium",
-        audio_codec=AudioCodec.AAC,
-        audio_bitrate=128_000,
-        video_container="mp4",
-    ),
-    "Max": CompressionProfile(
-        name="Max",
-        profile_type=ProfileType.MAX,
-        description="Smallest practical files. Uses stronger HEVC compression.",
-        video_codec=VideoCodec.HEVC,
-        crf=29,
-        preset="slow",
-        audio_codec=AudioCodec.OPUS,
-        audio_bitrate=96_000,
-        video_container="mkv",
-        use_hw_accel=True,
-    ),
-}
-
-_PRESET_ORDER = ["Lite", "Balanced", "Max"]
+# HEVC Quick / Balanced / HEVC Max. CRF and preset come from the shared ladder.
+_QUICK_PRESETS: dict[str, CompressionProfile] = build_quick_compress_profiles()
+_PRESET_ORDER = list(QUICK_COMPRESS_ORDER)
 
 
 def _window_icon_path() -> Optional[Path]:
@@ -87,9 +56,9 @@ class QuickCompressWindow(tk.Tk):
         self.option_add("*Font", ("Segoe UI", max(9, int(round(10 * self._ui_scale)))))
 
         # Restore last-used preset (default to Balanced)
-        saved = self.config_manager.config.quick_compress_profile
-        if saved not in _QUICK_PRESETS:
-            saved = "Balanced"
+        saved = normalize_quick_compress_name(
+            self.config_manager.config.quick_compress_profile
+        )
         self._preset_var = tk.StringVar(value=saved)
 
         self.title(f"{APP_NAME} Quick Compress")
@@ -122,7 +91,7 @@ class QuickCompressWindow(tk.Tk):
                 preset_row,
                 text=name,
                 font=("Segoe UI", max(9, int(round(9 * self._ui_scale)))),
-                width=10,
+                width=12,
                 relief="flat",
                 bd=0,
                 padx=10,
@@ -232,7 +201,8 @@ class QuickCompressWindow(tk.Tk):
     def _get_profile(self, resolve_fallback: bool = True) -> CompressionProfile:
         selected = self._preset_var.get()
         profile = CompressionProfile.from_dict(_QUICK_PRESETS[selected].to_dict())
-        if resolve_fallback and selected == "Max" and not self._get_compressor().codec_manager.is_codec_usable(VideoCodec.HEVC):
+        hevc_missing = not self._get_compressor().codec_manager.is_codec_usable(VideoCodec.HEVC)
+        if resolve_fallback and profile.video_codec == VideoCodec.HEVC and hevc_missing:
             fallback_codec = self._get_compressor().codec_manager.get_best_codec(prefer_efficiency=True)
             profile.video_codec = fallback_codec
             profile.video_container = self._get_compressor().codec_manager.get_compatible_container(

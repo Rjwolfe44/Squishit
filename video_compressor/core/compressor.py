@@ -1031,7 +1031,13 @@ class VideoCompressor:
         )
 
     def _select_hw_encoder(self, codec: VideoCodec) -> Optional[str]:
-        """Pick the best available hardware encoder for a codec."""
+        """Pick the best available hardware encoder for a codec.
+
+        A later hardware pass should walk vendors with
+        quality_ladder.ordered_hw_vendors (NVENC, then QSV, then AMF)
+        before software. This method still honors the detector's preferred
+        vendor first.
+        """
         info = self.hw_detector.info
         if not info.gpus:
             return None
