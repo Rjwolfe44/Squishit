@@ -837,27 +837,39 @@ class MainWindow(tkinterdnd2.Tk):
         self._refresh_size_preview()
         self._refresh_recommendation()
 
-    def _effective_parallel_jobs(self) -> int:
+    def _queue_slot_count(self) -> int:
+        """Jobs the governor will actually run for the current queue."""
+
         settings = self._settings.get_settings() if hasattr(self, "_settings") else {}
-        configured_jobs = max(
-            1,
-            int(settings.get("parallel_jobs", getattr(get_config(), "max_parallel_jobs", 1)) or 1),
-        )
+        if self.is_compressing and getattr(self, "_max_parallel", None):
+            configured_jobs = max(1, int(self._max_parallel or 1))
+        else:
+            configured_jobs = max(
+                1,
+                int(settings.get("parallel_jobs", getattr(get_config(), "max_parallel_jobs", 1)) or 1),
+            )
 
         if self.is_compressing:
             queued_jobs = self._active_job_count + len(getattr(self, "_pending_files", []))
-            if queued_jobs > 0:
-                return min(configured_jobs, queued_jobs)
+        else:
+            queued_jobs = len(self.video_files)
+        queued_jobs = max(1, queued_jobs)
 
-        queued_files = len(self.video_files)
-        if queued_files > 0:
-            return min(configured_jobs, queued_files)
-        return 1
+        try:
+            return self._get_compressor().queue_slots(
+                self._get_profile(),
+                requested_parallel=configured_jobs,
+                queued_files=queued_jobs,
+                media_info=self._first_analyzed_video_info(),
+            )
+        except Exception:
+            return min(configured_jobs, queued_jobs)
+
+    def _effective_parallel_jobs(self) -> int:
+        return self._queue_slot_count()
 
     def _planned_parallel_jobs(self) -> int:
-        configured_jobs = max(1, int(getattr(self, "_max_parallel", 1) or 1))
-        queued_jobs = self._active_job_count + 1 + len(self._pending_files)
-        return min(configured_jobs, max(1, queued_jobs))
+        return self._queue_slot_count()
 
     def _fit_encoder_preview_text(self, candidates: List[str]) -> str:
         label = self._encoder_preview_lbl
@@ -1120,16 +1132,16 @@ class MainWindow(tkinterdnd2.Tk):
         self._launch_next_jobs()
 
     def _launch_next_jobs(self):
-        """Launch jobs up to the parallel limit."""
-        import time
-        while self._pending_files and self._active_job_count < self._max_parallel:
+        """Launch jobs up to the governor's slot cap for this queue."""
+        slots = self._queue_slot_count()
+        while self._pending_files and self._active_job_count < slots:
             fp = self._pending_files.pop(0)
             in_path = Path(fp)
             profile = self._current_profile
             if profile is None:
                 break
 
-            planned_parallel_jobs = self._planned_parallel_jobs()
+            planned_parallel_jobs = slots
 
             job_profile = CompressionProfile.from_dict(profile.to_dict())
 

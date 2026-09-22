@@ -13,6 +13,7 @@ from typing import Optional, List, Dict, Tuple
 from enum import Enum
 import multiprocessing
 
+from .governor import recommend_thread_share, resolve_governor_mode
 from .quality_ladder import ordered_hw_vendors
 
 try:
@@ -478,36 +479,22 @@ class HardwareDetector:
         hw_encoder: Optional[str] = None,
         frame_height: int = 0,
     ) -> str:
-        """Resolve the effective resource governor for the current workload."""
+        """Resolve the effective resource governor for the current workload.
 
-        normalized = (governor or "auto").lower()
-        if normalized in {"low", "balanced", "max"}:
-            return normalized
+        Delegates to the encode resource governor so detection and budgeting
+        share one mode table.
+        """
 
         info = self.info
-        codec_name = (codec or "").lower()
-        heavy_cpu_codec = codec_name in {"av1", "svt-av1"} and not hw_encoder
-        high_resolution = frame_height >= 2160
-
-        if n_parallel >= 4:
-            return "low" if info.cpu_threads <= 12 else "balanced"
-
-        if hw_encoder:
-            if n_parallel >= 3:
-                return "low"
-            if high_resolution or info.total_ram_gb < 16:
-                return "balanced"
-            return "low" if codec_name == "h264" else "balanced"
-
-        if heavy_cpu_codec:
-            if n_parallel == 1 and info.cpu_threads >= 12 and info.total_ram_gb >= 16:
-                return "max"
-            return "balanced"
-
-        if codec_name == "hevc":
-            return "balanced" if n_parallel <= 2 else "low"
-
-        return "balanced"
+        return resolve_governor_mode(
+            governor=governor,
+            n_parallel=n_parallel,
+            codec=codec,
+            hw_encoder=hw_encoder,
+            frame_height=frame_height,
+            cpu_threads=info.cpu_threads,
+            total_ram_gb=info.total_ram_gb,
+        )
 
     def recommend_threads_for_job(
         self,
@@ -519,24 +506,16 @@ class HardwareDetector:
     ) -> int:
         """Return a fair thread count when *n_parallel* jobs run simultaneously."""
 
-        resolved_governor = self.resolve_resource_governor(
-            governor=governor,
+        info = self.info
+        return recommend_thread_share(
+            cpu_threads=info.cpu_threads,
+            total_ram_gb=info.total_ram_gb,
             n_parallel=n_parallel,
+            governor=governor,
             codec=codec,
             hw_encoder=hw_encoder,
             frame_height=frame_height,
         )
-        governor_scale = {
-            "low": 0.45,
-            "balanced": 0.7,
-            "max": 1.0,
-        }[resolved_governor]
-
-        if resolved_governor == "max" and not hw_encoder and self.info.total_ram_gb < 16:
-            governor_scale = 0.85
-
-        total_budget = max(1, int(self.info.cpu_threads * governor_scale))
-        return max(1, int(total_budget / max(1, n_parallel)))
 
     def get_optimal_settings(self, target_codec: str = "hevc") -> Dict:
         """

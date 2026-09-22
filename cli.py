@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 import logging
@@ -554,7 +555,8 @@ def process_file(
     suffix: str,
     profile: CompressionProfile,
     compressor: VideoCompressor,
-    dry_run: bool = False
+    dry_run: bool = False,
+    parallel_jobs: int = 1,
 ) -> Optional[CompressionResult]:
     """Process a single file."""
     media_type = detect_media_type(input_path)
@@ -597,7 +599,8 @@ def process_file(
     result = compressor.compress(
         input_file=input_path,
         output_file=output_path,
-        profile=profile
+        profile=profile,
+        parallel_jobs=max(1, int(parallel_jobs or 1)),
     )
     
     if result.success:
@@ -732,22 +735,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Profile: {profile.name}")
     print(f"Codec: {profile.video_codec.value}")
     
+    existing_files = [filepath for filepath in input_files if filepath.exists()]
     for filepath in input_files:
-        if not filepath.exists():
+        if filepath not in existing_files:
             print(f"Warning: File not found: {filepath}")
-            continue
-        
-        result = process_file(
+
+    slots = 1
+    if existing_files and not args.dry_run:
+        slots = compressor.queue_slots(
+            profile,
+            requested_parallel=max(1, int(args.jobs or 1)),
+            queued_files=len(existing_files),
+        )
+
+    def _run_one(filepath: Path) -> Optional[CompressionResult]:
+        return process_file(
             input_path=filepath,
             output_dir=output_dir,
             suffix=args.suffix,
             profile=profile,
             compressor=compressor,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            parallel_jobs=slots,
         )
-        
-        if result:
-            results.append(result)
+
+    if slots <= 1 or args.dry_run:
+        for filepath in existing_files:
+            result = _run_one(filepath)
+            if result:
+                results.append(result)
+    else:
+        with ThreadPoolExecutor(max_workers=slots) as pool:
+            for result in pool.map(_run_one, existing_files):
+                if result:
+                    results.append(result)
     
     # Summary
     if results and not args.dry_run:

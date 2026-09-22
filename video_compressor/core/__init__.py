@@ -4,6 +4,7 @@ Core module for video compression functionality.
 
 from .compressor import VideoCompressor
 from .profiles import CompressionProfile, ProfileManager
+from .governor import EncodeResourceGovernor
 from .hardware import HardwareDetector
 from .codecs import CodecManager, VideoCodec, AudioCodec, VideoContainer, ImageFormat
 from .eta import ETACalculator
@@ -13,6 +14,7 @@ __all__ = [
     "VideoCompressor",
     "CompressionProfile",
     "ProfileManager",
+    "EncodeResourceGovernor",
     "HardwareDetector",
     "CodecManager",
     "VideoCodec",
