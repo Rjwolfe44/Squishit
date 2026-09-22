@@ -1,0 +1,62 @@
+﻿# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Bundled FFmpeg / binaries (fetch via: dev.bat fetch-ffmpeg)
+vendor/
+bin/
+
+# PyInstaller
+*.spec.bak
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+.pyi-build.log
+.pytest-target-size.log
+.venv-python-*.txt
+.venv-pyver.txt
+
+# Config (user-specific, not version-controlled)
+config.yaml
+
+# GitHub token — NEVER commit this
+.github_token
+tools/.github_token
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+tmp-smoke/
+
+# Temp / scratch
+*.tmp
+*.bak
+scratch/
