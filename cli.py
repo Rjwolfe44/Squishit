@@ -8,7 +8,11 @@ from typing import List, Optional
 import logging
 
 from video_compressor.core.compressor import VideoCompressor, CompressionResult
-from video_compressor.core.profiles import ProfileManager, CompressionProfile
+from video_compressor.core.profiles import (
+    ProfileManager,
+    CompressionProfile,
+    apply_cli_quality_ladder,
+)
 from video_compressor.core.hardware import get_hardware_detector
 from video_compressor.core.codecs import VideoCodec, AudioCodec, ImageFormat, CodecManager
 from video_compressor.core.utils import (
@@ -48,8 +52,14 @@ Examples:
   # Batch compress all videos in a folder
   %(prog)s *.mp4 --output ./compressed/
   
-    # Compress to stronger HEVC output
-    %(prog)s video.mp4 --codec hevc --preset slow
+  # Compress to stronger HEVC output
+  %(prog)s video.mp4 --codec hevc --preset slow
+
+  # Max / Archival: SVT-AV1, hardware off
+  %(prog)s video.mp4 --profile max
+
+  # Quick Compress Max: HEVC, not archival SVT-AV1
+  %(prog)s video.mp4 --profile max --codec hevc
         """
     )
     
@@ -81,16 +91,24 @@ Examples:
         type=str,
         choices=['fast', 'balanced', 'max', 'youtube', 'mobile', 'streaming'],
         default='balanced',
-        help='Compression profile to use (default: balanced)'
+        help=(
+            'Compression profile (default: balanced). '
+            'max is Max / Archival (SVT-AV1, hardware off). '
+            'Quick Compress Max is HEVC: --profile max --codec hevc. '
+            'Those are two different Max settings.'
+        ),
     )
     
     # Codec options
     parser.add_argument(
         '-c', '--codec',
         type=str,
-        choices=['hevc', 'h264', 'vp9'],
+        choices=['hevc', 'h264', 'vp9', 'svt-av1', 'av1'],
         default=None,
-        help='Video codec (default: depends on profile)'
+        help=(
+            'Video codec (default: depends on profile). '
+            'AV1 is available as svt-av1 (archival lane) or av1 (libaom).'
+        ),
     )
 
     parser.add_argument(
@@ -307,7 +325,12 @@ def get_profile(
         raise ValueError(f"Profile {profile_name!r} is not available")
 
     profile = CompressionProfile.from_dict(base_profile.to_dict())
-    
+
+    codec_overridden = args.codec is not None
+    crf_overridden = args.crf is not None
+    preset_overridden = bool(args.preset)
+    hw_overridden = bool(args.no_hw_accel)
+
     # Apply overrides
     if args.codec:
         profile.video_codec = VideoCodec(args.codec)
@@ -342,6 +365,15 @@ def get_profile(
         profile.resource_governor = args.resource_governor
     if args.no_hw_accel:
         profile.use_hw_accel = False
+
+    apply_cli_quality_ladder(
+        profile,
+        args.profile,
+        codec_overridden=codec_overridden,
+        crf_overridden=crf_overridden,
+        preset_overridden=preset_overridden,
+        hw_overridden=hw_overridden,
+    )
 
     # Keep the CLI profile on a container/audio pair the encoder can actually mux.
     codec_manager = CodecManager()

@@ -5,8 +5,10 @@ A modern Windows desktop media compression app with a sleek dark-themed GUI. Bui
 ## Features
 
 ### Video Codecs
-- **HEVC (H.265)** — Excellent quality-to-size ratio
-- **H.264 (AVC)** — Maximum compatibility
+- **HEVC (H.265)** — Default speed lane. Quick Compress Max stays on HEVC
+- **AV1 (SVT-AV1)** — User-available archival codec. Max / Archival uses this lane with hardware off
+- **AV1 (libaom)** — User-available reference AV1 encoder
+- **H.264 (AVC)** — Maximum compatibility. Quick Lite, the fastest Quick Compress rung, uses H.264 and prefers NVENC, then QSV, then AMF, then libx264
 - **VP9** — Web-friendly fallback when you specifically want WebM output
 
 ### Output Containers
@@ -18,19 +20,34 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 - Automatic format selection based on profile
 
 ### Hardware Acceleration
-- NVIDIA NVENC (H.264, HEVC)
+- NVIDIA NVENC (H.264, HEVC) — preferred when more than one vendor is available
 - Intel Quick Sync Video (QSV)
 - AMD AMF (H.264, HEVC — including RX 9070 XT)
+- Software libx264 when Quick Lite has no matching hardware encoder
 
 ### Compression Profiles
 | Profile | Description | Use Case |
 |---------|-------------|----------|
-| **Fast** | Quick compression, minimal quality loss | Time-sensitive encoding |
-| **Balanced** | Good size vs quality compromise | General use |
-| **Max** | SVT-AV1 in MKV with Opus audio and hardware off | Smaller archive-friendly files |
+| **Fast** | H.264 Quick rung (CRF 26, fast) | Time-sensitive encoding |
+| **Balanced** | HEVC Balanced rung (CRF 28, medium) | General use |
+| **Max / Archival** | SVT-AV1 Max rung (CRF 35, preset 6) in MKV, hardware off | Archive-friendly files |
 | **YouTube Upload** | Optimized for social media | Content creators |
 | **Mobile** | Smaller files for mobile | Mobile viewing |
 | **Streaming** | Fast encoding for live streams | Streamers |
+
+**Max / Archival** and **Quick Compress Max** are different settings. Archival Max is SVT-AV1 with hardware off. Quick Compress Max is the HEVC Max rung (CRF 30, slow) and is labeled **HEVC Max** in the context-menu window. **Quick Lite** is the fastest context-menu rung: H.264 CRF 26, preset fast, with hardware preferred in the order NVENC, then QSV, then AMF, then software libx264. AV1 is not that rung.
+
+### Quality ladder
+Quick, Balanced, and Max share one CRF/preset table. The GUI compression control and `squishit --profile` read that table, so they emit the same FFmpeg arguments.
+
+| Lane | Quick | Balanced | Max |
+|------|-------|----------|-----|
+| **H.264** (Quick Lite) | CRF 26, fast — fastest Quick Compress rung | CRF 28, medium | CRF 32, slow |
+| **HEVC** (Quick Compress) | CRF 24, veryfast | CRF 28, medium | CRF 30, slow — **HEVC Max** |
+| **SVT-AV1** (archival, hardware off) | CRF 32, preset 10 | CRF 35, preset 8 | CRF 35, preset 6 — **Max / Archival** |
+| **AV1 (libaom)** | CRF 26, cpu-used 8 | CRF 30, cpu-used 6 | CRF 34, cpu-used 4 |
+
+Quick finishes sooner and makes larger files. Balanced is the default tradeoff. Max is the best compression in that lane. When a profile matches a rung and a hardware encoder is selected, the command uses that rung's CQ and vendor preset (NVENC, then QSV, then AMF). SVT-AV1 stays on the software encoder. The encode-speed slider keeps the numeric SVT-AV1 and libaom preset instead of applying an x264 name.
 
 ### Smart Threading
 Per-codec CPU thread optimization:
@@ -107,8 +124,8 @@ python cli.py --hardware
 ### CLI Options
 | Option | Description |
 |--------|-------------|
-| `-p, --profile` | Compression profile (fast/balanced/max/youtube/mobile/streaming) |
-| `-c, --codec` | Video codec (hevc/h264/vp9) |
+| `-p, --profile` | Profile: fast, balanced, max, youtube, mobile, streaming. `max` is Max / Archival (SVT-AV1, hardware off). Quick Compress Max is `--profile max --codec hevc` |
+| `-c, --codec` | Video codec: hevc, h264, vp9, svt-av1, av1 |
 | `--crf` | Constant Rate Factor (0-51, lower = better quality) |
 | `--preset` | Encoding speed (ultrafast to veryslow) |
 | `-t, --target-size` | Target file size in MB |
@@ -199,7 +216,7 @@ tests/                      # Test suite (pytest; no display required)
 ## Requirements
 
 - **Python** 3.10+
-- **FFmpeg** with libx265, libx264, libvpx-vp9
+- **FFmpeg** with libx265, libsvtav1, libaom-av1, libx264, and libvpx-vp9
 - **Windows 10/11** (context menu integration is Windows-only)
 
 ### Python Dependencies

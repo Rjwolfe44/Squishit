@@ -9,6 +9,14 @@ import yaml
 from pathlib import Path
 
 from .codecs import VideoCodec, AudioCodec, CodecSettings, RateControl, AudioMode
+from .quality_ladder import (
+    ARCHIVAL_PROFILE_NAME,
+    PROFILE_FLAG_RUNGS,
+    QUICK_COMPRESS_LITE_LABEL,
+    QUICK_COMPRESS_MAX_LABEL,
+    QualityRung,
+    get_step,
+)
 from ..config import PROFILES_DIR
 
 
@@ -327,15 +335,16 @@ def normalize_profile_container(codec: VideoCodec, value: Any, audio_codec: Audi
 class ProfileManager:
     """Manages compression profiles."""
     
-    # Default profiles
+    # Default profiles. Fast, Balanced, and Max / Archival take CRF, preset,
+    # and codec from the shared quality ladder so the CLI matches the GUI.
     DEFAULT_PROFILES = [
         CompressionProfile(
             name="Fast",
             profile_type=ProfileType.FAST,
-            description="Quick compression with minimal quality loss. Best for when time is limited.",
+            description=get_step(VideoCodec.H264, QualityRung.QUICK).hint,
             video_codec=VideoCodec.H264,
-            crf=26,
-            preset="fast",
+            crf=get_step(VideoCodec.H264, QualityRung.QUICK).crf,
+            preset=get_step(VideoCodec.H264, QualityRung.QUICK).preset,
             audio_codec=AudioCodec.OPUS,
             audio_bitrate=128_000,
             use_hw_accel=True,
@@ -344,22 +353,22 @@ class ProfileManager:
         CompressionProfile(
             name="Balanced",
             profile_type=ProfileType.BALANCED,
-            description="Good balance between file size, quality, and encoding speed. Recommended for most uses.",
+            description=get_step(VideoCodec.HEVC, QualityRung.BALANCED).hint,
             video_codec=VideoCodec.HEVC,
-            crf=28,
-            preset="medium",
+            crf=get_step(VideoCodec.HEVC, QualityRung.BALANCED).crf,
+            preset=get_step(VideoCodec.HEVC, QualityRung.BALANCED).preset,
             audio_codec=AudioCodec.OPUS,
             audio_bitrate=128_000,
             use_hw_accel=True,
             image_quality=82,
         ),
         CompressionProfile(
-            name="Max / Archival",
+            name=ARCHIVAL_PROFILE_NAME,
             profile_type=ProfileType.MAX,
-            description="Smallest practical files with SVT-AV1 compression and Opus audio.",
+            description=get_step(VideoCodec.SVT_AV1, QualityRung.MAX).hint,
             video_codec=VideoCodec.SVT_AV1,
-            crf=35,
-            preset="6",
+            crf=get_step(VideoCodec.SVT_AV1, QualityRung.MAX).crf,
+            preset=get_step(VideoCodec.SVT_AV1, QualityRung.MAX).preset,
             audio_codec=AudioCodec.OPUS,
             audio_bitrate=96_000,
             video_container="mkv",
@@ -847,3 +856,160 @@ def calculate_target_size_bitrate(
         duration_seconds,
         audio_bitrate,
     )
+
+
+QUICK_COMPRESS_ORDER = [
+    QUICK_COMPRESS_LITE_LABEL,
+    "Balanced",
+    QUICK_COMPRESS_MAX_LABEL,
+]
+
+_QUICK_COMPRESS_ALIASES = {
+    "lite": QUICK_COMPRESS_LITE_LABEL,
+    "quick": QUICK_COMPRESS_LITE_LABEL,
+    "quick lite": QUICK_COMPRESS_LITE_LABEL,
+    "balanced": "Balanced",
+    "max": QUICK_COMPRESS_MAX_LABEL,
+    "hevc max": QUICK_COMPRESS_MAX_LABEL,
+}
+
+
+def normalize_quick_compress_name(name: str) -> str:
+    """Map saved Quick Compress labels, including the old Lite/Quick/Max names."""
+
+    return _QUICK_COMPRESS_ALIASES.get(str(name or "").strip().lower(), "Balanced")
+
+
+def quick_compress_rung(name: str) -> QualityRung:
+    """Rung selected by a Quick Compress button, after alias normalization."""
+
+    normalized = normalize_quick_compress_name(name)
+    if normalized == QUICK_COMPRESS_LITE_LABEL:
+        return QualityRung.QUICK
+    if normalized == QUICK_COMPRESS_MAX_LABEL:
+        return QualityRung.MAX
+    return QualityRung.BALANCED
+
+
+def build_quick_compress_profiles() -> Dict[str, CompressionProfile]:
+    """Quick Lite (H.264) / Balanced (HEVC) / HEVC Max for the context menu.
+
+    Video CRF and preset come from that codec's ladder rung. Audio and
+    container stay with the quick-compress choices. HEVC Max is not
+    Max / Archival, and Quick Lite is not AV1.
+    """
+
+    specs = (
+        (
+            QUICK_COMPRESS_LITE_LABEL,
+            VideoCodec.H264,
+            QualityRung.QUICK,
+            ProfileType.FAST,
+            AudioCodec.AAC,
+            128_000,
+            "mp4",
+            76,
+        ),
+        (
+            "Balanced",
+            VideoCodec.HEVC,
+            QualityRung.BALANCED,
+            ProfileType.BALANCED,
+            AudioCodec.AAC,
+            128_000,
+            "mp4",
+            82,
+        ),
+        (
+            QUICK_COMPRESS_MAX_LABEL,
+            VideoCodec.HEVC,
+            QualityRung.MAX,
+            ProfileType.MAX,
+            AudioCodec.OPUS,
+            96_000,
+            "mkv",
+            90,
+        ),
+    )
+    profiles: Dict[str, CompressionProfile] = {}
+    for name, codec, rung, profile_type, audio, bitrate, container, image_quality in specs:
+        step = get_step(codec, rung)
+        profiles[name] = CompressionProfile(
+            name=name,
+            profile_type=profile_type,
+            description=step.hint,
+            video_codec=codec,
+            crf=step.crf,
+            preset=step.preset,
+            audio_codec=audio,
+            audio_bitrate=bitrate,
+            video_container=container,
+            use_hw_accel=step.allow_hw_accel,
+            image_quality=image_quality,
+        )
+    return profiles
+
+
+def retarget_quick_compress_fallback(
+    profile: CompressionProfile,
+    fallback_codec: VideoCodec,
+    selected_name: str,
+) -> CompressionProfile:
+    """When HEVC is missing, apply the same rung on the fallback codec.
+
+    Leaving the HEVC CRF and preset in place would encode H.264 (or SVT-AV1)
+    with HEVC rung numbers. The ladder step for the fallback codec replaces
+    both, and SVT-AV1 turns hardware off.
+    """
+
+    step = get_step(fallback_codec, quick_compress_rung(selected_name))
+    profile.video_codec = fallback_codec
+    profile.crf = step.crf
+    profile.preset = step.preset
+    profile.use_hw_accel = step.allow_hw_accel and not step.force_software
+    profile.description = step.hint
+    return profile
+
+
+def apply_cli_quality_ladder(
+    profile: CompressionProfile,
+    profile_flag: str,
+    *,
+    codec_overridden: bool,
+    crf_overridden: bool,
+    preset_overridden: bool,
+    hw_overridden: bool,
+) -> None:
+    """Retarget CRF/preset when --profile is a rung and --codec changes lane.
+
+    Explicit --crf / --preset still win. SVT-AV1 always forces software.
+    Switching onto HEVC Max (``--profile max --codec hevc``) restores that
+    lane's hardware default unless the user passed --no-hw-accel.
+    """
+
+    rung = PROFILE_FLAG_RUNGS.get(profile_flag)
+    if rung is None:
+        return
+    try:
+        step = get_step(profile.video_codec, rung)
+    except KeyError:
+        return
+    if not crf_overridden:
+        profile.crf = step.crf
+    if not preset_overridden:
+        profile.preset = step.preset
+    if step.force_software:
+        profile.use_hw_accel = False
+    elif codec_overridden and not hw_overridden:
+        profile.use_hw_accel = step.allow_hw_accel
+
+
+def profile_video_ffmpeg_args(profile: CompressionProfile) -> List[str]:
+    """Software video args for a profile, with audio stripped off."""
+
+    settings = profile.to_codec_settings()
+    settings.disable_audio = True
+    args = settings.to_ffmpeg_args(hw_encoder=None)
+    if args[-1:] == ["-an"]:
+        args = args[:-1]
+    return args
