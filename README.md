@@ -35,7 +35,7 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 |---------|-------------|----------|
 | **Fast** | H.264 Quick rung (CRF 26, fast) | Time-sensitive encoding |
 | **Balanced** | HEVC Balanced rung (CRF 28, medium) | General use |
-| **Max / Archival** | SVT-AV1 Max rung (CRF 35, preset 6) in MKV, hardware off | Archive-friendly files |
+| **Max / Archival** | SVT-AV1 Max rung (CRF 36, preset 6) in MKV, hardware off | Archive-friendly files |
 | **YouTube / social upload** | Video file for YouTube and other social uploads (`--profile youtube`) | Social file uploads |
 | **Mobile** | Smaller files for mobile | Mobile viewing |
 | **Streaming upload** | Video file for Twitch, YouTube, or OBS upload (`--profile streaming`) | Upload-ready files |
@@ -51,7 +51,7 @@ Quick, Balanced, and Max share one CRF/preset table. The GUI compression control
 |------|-------|----------|-----|
 | **H.264** (Quick Lite) | CRF 26, fast — fastest Quick Compress rung | CRF 28, medium | CRF 32, slow |
 | **HEVC** (Quick Compress) | CRF 24, veryfast | CRF 28, medium | CRF 30, slow — **HEVC Max** |
-| **SVT-AV1** (archival, hardware off) | CRF 32, preset 10 | CRF 35, preset 8 | CRF 35, preset 6 — **Max / Archival** |
+| **SVT-AV1** (archival, hardware off) | CRF 32, preset 10 | CRF 35, preset 8 | CRF 36, preset 6 — **Max / Archival** |
 | **AV1 (libaom)** | CRF 26, cpu-used 8 | CRF 30, cpu-used 6 | CRF 34, cpu-used 4 |
 
 Quick finishes sooner and makes larger files. Balanced is the default tradeoff. Max is the best compression in that lane. When a profile matches a rung and a hardware encoder is selected, the command uses that rung's CQ and vendor preset (NVENC, then QSV, then AMF). SVT-AV1 stays on the software encoder. The encode-speed slider keeps the numeric SVT-AV1 and libaom preset instead of applying an x264 name.

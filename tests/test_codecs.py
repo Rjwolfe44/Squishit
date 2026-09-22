@@ -213,7 +213,7 @@ def test_max_profile_command_uses_svt_av1_numeric_preset(monkeypatch, tmp_path):
 
     assert "libsvtav1" in cmd
     assert cmd[cmd.index("-preset") + 1] == "6"
-    assert cmd[cmd.index("-crf") + 1] == "35"
+    assert cmd[cmd.index("-crf") + 1] == "36"
     assert "libopus" in cmd
 
 

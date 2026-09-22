@@ -38,7 +38,7 @@ Ordering, also soft:
   switched onto a slow AV1 preset) without pinning a stopwatch.
 * Lite's file is at least 1.25× either Max. Quick stays the larger file on
   this clip. The two Max sizes may sit close together; they stay distinct by
-  codec, CRF, and preset (HEVC CRF 30 slow versus SVT-AV1 CRF 35 preset 6),
+  codec, CRF, and preset (HEVC CRF 30 slow versus SVT-AV1 CRF 36 preset 6),
   not by an exact byte gap.
 """
 
@@ -339,7 +339,7 @@ def test_lite_and_dual_max_software_time_size_ssim(ladder_case, tmp_path):
     assert product["hevc_max"].use_hw_accel is True
 
     assert product["archival"].video_codec is VideoCodec.SVT_AV1
-    assert (product["archival"].crf, product["archival"].preset) == (35, "6")
+    assert (product["archival"].crf, product["archival"].preset) == (36, "6")
     assert product["archival"].use_hw_accel is False
     assert product["archival"].name != product["hevc_max"].name
 
@@ -363,7 +363,7 @@ def test_lite_and_dual_max_software_time_size_ssim(ladder_case, tmp_path):
     assert samples["archival"].encoder == "libsvtav1", detail
     assert samples["archival"].codec == "svt-av1", detail
     assert samples["archival"].probed_codec == "av1", detail
-    assert (samples["archival"].crf, samples["archival"].preset) == (35, "6"), detail
+    assert (samples["archival"].crf, samples["archival"].preset) == (36, "6"), detail
 
     assert samples["hevc_max"].encoder != samples["archival"].encoder, detail
     assert samples["hevc_max"].probed_codec != samples["archival"].probed_codec, detail
