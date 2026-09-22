@@ -7,6 +7,11 @@ from video_compressor.core.updater import GITHUB_API_URL, ISSUES_URL, RELEASES_U
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAN_SUFFIXES = {".py", ".md", ".bat", ".yml", ".yaml", ".iss", ".toml", ".sh", ".txt", ".spec"}
+# These tests name the old releases repo only to assert that it is absent.
+ALLOWED_MENTIONS = {
+    "tests/test_release_targets.py",
+    "tests/test_ui_copy.py",
+}
 
 
 def test_updater_points_at_this_repository():
@@ -29,7 +34,8 @@ def test_tracked_sources_do_not_name_the_old_releases_repo():
     for path in ROOT.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES:
             continue
-        if path.name == "test_release_targets.py":
+        relative = path.relative_to(ROOT).as_posix()
+        if relative in ALLOWED_MENTIONS:
             continue
         if any(part in {".git", ".venv", "venv", "__pycache__", "dist", "build"} for part in path.parts):
             continue
