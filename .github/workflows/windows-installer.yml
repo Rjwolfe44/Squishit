@@ -3,6 +3,10 @@ name: windows-installer
 # Builds the Inno Setup installer on a Windows runner and, for a v* tag,
 # publishes it to GitHub Releases on this repository.
 # The in-app updater uses the first .exe asset on the latest release.
+#
+# Tag publishes are refused unless the tag version (leading v stripped)
+# matches MyAppVersion, video_compressor/__init__.py, and pyproject.toml.
+# That stops SquishIt-Setup-v2.0.0.exe from being attached to a different tag.
 
 on:
   workflow_dispatch:
@@ -26,6 +30,91 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Assert tag version matches installer sources
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $script = Join-Path $env:RUNNER_TEMP "assert_release_version.py"
+          @'
+          import os
+          import re
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ.get("RELEASE_TAG", "").strip()
+          if not tag.startswith("v") or len(tag) == 1:
+              print(f"Refusing to publish: tag {tag!r} is not vX.Y.Z.", file=sys.stderr)
+              sys.exit(1)
+          tag_version = tag[1:]
+
+          def fail(message: str) -> None:
+              print(message, file=sys.stderr)
+              sys.exit(1)
+
+          def read_text(path: str) -> str:
+              file = Path(path)
+              if not file.is_file():
+                  fail(f"Refusing to publish: missing {path}.")
+              return file.read_text(encoding="utf-8")
+
+          iss_match = re.search(
+              r'#define\s+MyAppVersion\s+"([^"]+)"',
+              read_text("tools/squishit.iss"),
+          )
+          if not iss_match:
+              fail("Refusing to publish: could not read MyAppVersion from tools/squishit.iss.")
+          iss_version = iss_match.group(1).strip()
+
+          init_version = ""
+          for line in read_text("video_compressor/__init__.py").splitlines():
+              if line.startswith("__version__"):
+                  init_version = line.split("=", 1)[1].strip().strip('"').strip("'")
+                  break
+          if not init_version:
+              fail("Refusing to publish: could not read __version__ from video_compressor/__init__.py.")
+
+          try:
+              pyproject = tomllib.loads(read_text("pyproject.toml"))
+          except tomllib.TOMLDecodeError as exc:
+              fail(f"Refusing to publish: could not parse pyproject.toml ({exc}).")
+          project_version = str(pyproject.get("project", {}).get("version", "")).strip()
+          if not project_version:
+              fail("Refusing to publish: could not read version from pyproject.toml.")
+
+          found = {
+              "tools/squishit.iss MyAppVersion": iss_version,
+              "video_compressor/__init__.py __version__": init_version,
+              "pyproject.toml version": project_version,
+          }
+          if any(value != tag_version for value in found.values()):
+              lines = "\n".join(f"  {name}: {value}" for name, value in found.items())
+              fail(
+                  "Refusing to publish: tag version does not match the installer sources.\n"
+                  f"  tag {tag}: {tag_version}\n"
+                  f"{lines}\n"
+                  "The built installer is named from MyAppVersion "
+                  f"(SquishIt-Setup-v{iss_version}.exe) and must not be attached to {tag}.\n"
+                  "Set MyAppVersion, __version__, and pyproject.toml version "
+                  f"to {tag_version} before tagging."
+              )
+
+          print(
+              f"Tag {tag} matches tools/squishit.iss, video_compressor/__init__.py, "
+              f"and pyproject.toml ({tag_version})."
+          )
+          '@ | Set-Content -LiteralPath $script -Encoding utf8NoBOM
+          python $script
+          if ($LASTEXITCODE -ne 0) { throw "Refusing to publish: tag version does not match installer sources." }
+
+      # Pip packages mirror pyproject.toml [project].dependencies, plus
+      # pyinstaller from the dev extra. Windows environment markers are
+      # installed unconditionally because this job only runs on Windows.
+      # Nothing checks this list against pyproject.toml; update both together
+      # when dependencies change.
       - name: Install build dependencies
         shell: pwsh
         run: |
@@ -123,7 +212,21 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($notes)) { throw "Tag $tag has no annotation; refusing to publish empty notes" }
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
           [System.IO.File]::WriteAllText($notesPath, $notes.Trim() + "`n")
-          $installer = Get-ChildItem dist -Filter "SquishIt-Setup-*.exe" | Select-Object -First 1
+          if ($tag -notmatch '^v(.+)$' -or [string]::IsNullOrWhiteSpace($Matches[1])) {
+            throw "Tag '$tag' is not vX.Y.Z. Refusing to publish."
+          }
+          $version = $Matches[1]
+          $installerName = "SquishIt-Setup-v$version.exe"
+          $installer = Get-Item -LiteralPath (Join-Path "dist" $installerName) -ErrorAction SilentlyContinue
+          if (-not $installer) {
+            $found = @(Get-ChildItem -Path "dist" -Filter "SquishIt-Setup-*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            $foundList = if ($found.Count -gt 0) { $found -join ", " } else { "(none)" }
+            throw "Refusing to publish ${tag}: expected dist/${installerName} so a differently versioned installer is not attached. Found: $foundList"
+          }
+          # Ops: gh release create fails if a GitHub Release for this tag
+          # already exists. It does not update that release or replace its
+          # assets. Delete the existing release, or push a new tag. Do not
+          # retag a version that was already published.
           gh release create $tag $installer.FullName `
             --repo "${{ github.repository }}" `
             --title "SquishIt $tag" `
