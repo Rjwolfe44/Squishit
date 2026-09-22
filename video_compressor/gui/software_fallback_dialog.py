@@ -135,6 +135,28 @@ def finish_software_fallback_prompt(
         done.set()
 
 
+def handle_software_fallback_queue_message(window: Any, message: tuple) -> bool:
+    """Handle one main-window queue item when it is the software-fallback ask.
+
+    ``MainWindow._handle`` delegates here before any other queue kind. The
+    ask runs on this thread through :func:`finish_software_fallback_prompt`.
+    Yes retries on the software encoder. No, dismiss, or a dialog error keeps
+    the hardware result. Returns False when ``message`` is some other item.
+    """
+
+    if not message or message[0] != SOFTWARE_FALLBACK_QUEUE_KIND:
+        return False
+    _, request, holder, done = message
+    try:
+        window._set_software_fallback_wait(request, True)
+    finally:
+        try:
+            finish_software_fallback_prompt(window, request, holder, done)
+        finally:
+            window._set_software_fallback_wait(request, False)
+    return True
+
+
 def declined_software_fallback_notice(result: object) -> str:
     """Text for a result whose software retry was declined. Empty when not declined."""
 

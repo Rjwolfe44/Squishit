@@ -19,6 +19,7 @@ from video_compressor.gui.software_fallback_dialog import (
     declined_software_fallback_notice,
     detail_without_fallback_message,
     finish_software_fallback_prompt,
+    handle_software_fallback_queue_message,
     show_software_fallback_dialog,
     software_fallback_prompt,
     with_declined_fallback_summary,
@@ -306,6 +307,19 @@ def test_quick_compress_presets_are_not_target_size_jobs():
         assert profile.target_reduction_percent is None
 
 
+def test_queue_handler_leaves_other_messages_for_the_window(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "video_compressor.gui.software_fallback_dialog.show_software_fallback_dialog",
+        lambda *_args, **_kwargs: calls.append(True) or True,
+    )
+    window = _Window()
+    window._set_software_fallback_wait = lambda *_args: None
+
+    assert handle_software_fallback_queue_message(window, ("result", object())) is False
+    assert calls == []
+
+
 def test_main_window_installs_the_dialog_and_quick_compress_does_not():
     main = (_ROOT / "video_compressor" / "gui" / "main_window.py").read_text(
         encoding="utf-8"
@@ -318,8 +332,7 @@ def test_main_window_installs_the_dialog_and_quick_compress_does_not():
     )
 
     assert "bind_main_window_software_fallback" in main
-    assert "SOFTWARE_FALLBACK_QUEUE_KIND" in main
-    assert "finish_software_fallback_prompt" in main
+    assert "handle_software_fallback_queue_message" in main
     assert "with_declined_fallback_summary" in main
     assert "declined_software_fallback_notice" in widgets
     assert "detail_without_fallback_message" in widgets
