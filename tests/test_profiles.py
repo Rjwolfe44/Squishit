@@ -43,7 +43,7 @@ def test_builtin_profile_defaults(manager):
     assert balanced.audio_bitrate == 128_000
 
     assert archival.video_codec is VideoCodec.SVT_AV1
-    assert archival.crf == 35
+    assert archival.crf == 38
     assert archival.preset == "6"
     assert archival.video_container == "mkv"
     assert archival.audio_codec is AudioCodec.OPUS

@@ -12,7 +12,7 @@ AMF) and otherwise uses libx264. AV1 is not that rung.
 
 Quick is the fast, larger-file end of a lane (faster preset, lower CRF).
 Balanced is the default tradeoff. Max is the best compression that lane
-exposes: a slower preset and a CRF at least as high as Balanced.
+exposes: a slower preset and a CRF higher than Balanced.
 """
 
 from __future__ import annotations
@@ -187,9 +187,9 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
         QualityRung.MAX: _step(
             VideoCodec.SVT_AV1,
             QualityRung.MAX,
-            35,
+            38,
             "6",
-            "Max / Archival: best SVT-AV1 compression (CRF 35, preset 6). "
+            "Max / Archival: best SVT-AV1 compression (CRF 38, preset 6). "
             "Hardware stays off. Not Quick Compress Max (HEVC).",
             force_software=True,
         ),
