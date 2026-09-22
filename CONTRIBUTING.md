@@ -32,4 +32,6 @@ python -m pytest
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).
+SquishIt is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Copyright (c) 2026 Rjwolfe44.
+
+By contributing, you license your contribution under those terms for noncommercial use, and you grant Rjwolfe44 the exclusive right to sell, sublicense, and otherwise commercially exploit your contribution as part of SquishIt. Third parties receive no right to profit from the work, including by selling it, rebranding it for commercial use, or offering a commercial product or service based on it.
