@@ -3,12 +3,17 @@
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 import logging
 
 from video_compressor.core.compressor import VideoCompressor, CompressionResult
-from video_compressor.core.profiles import ProfileManager, CompressionProfile
+from video_compressor.core.profiles import (
+    ProfileManager,
+    CompressionProfile,
+    apply_cli_quality_ladder,
+)
 from video_compressor.core.hardware import get_hardware_detector
 from video_compressor.core.codecs import VideoCodec, AudioCodec, ImageFormat, CodecManager
 from video_compressor.core.utils import (
@@ -48,8 +53,14 @@ Examples:
   # Batch compress all videos in a folder
   %(prog)s *.mp4 --output ./compressed/
   
-    # Compress to stronger HEVC output
-    %(prog)s video.mp4 --codec hevc --preset slow
+  # Compress to stronger HEVC output
+  %(prog)s video.mp4 --codec hevc --preset slow
+
+  # Max / Archival: SVT-AV1, hardware off
+  %(prog)s video.mp4 --profile max
+
+  # Quick Compress Max: HEVC, not archival SVT-AV1
+  %(prog)s video.mp4 --profile max --codec hevc
         """
     )
     
@@ -81,16 +92,24 @@ Examples:
         type=str,
         choices=['fast', 'balanced', 'max', 'youtube', 'mobile', 'streaming'],
         default='balanced',
-        help='Compression profile to use (default: balanced)'
+        help=(
+            'Compression profile (default: balanced). '
+            'max is Max / Archival (SVT-AV1, hardware off). '
+            'Quick Compress Max is HEVC: --profile max --codec hevc. '
+            'Those are two different Max settings.'
+        ),
     )
     
     # Codec options
     parser.add_argument(
         '-c', '--codec',
         type=str,
-        choices=['hevc', 'h264', 'vp9'],
+        choices=['hevc', 'h264', 'vp9', 'svt-av1', 'av1'],
         default=None,
-        help='Video codec (default: depends on profile)'
+        help=(
+            'Video codec (default: depends on profile). '
+            'AV1 is available as svt-av1 (archival lane) or av1 (libaom).'
+        ),
     )
 
     parser.add_argument(
@@ -154,7 +173,11 @@ Examples:
         type=str,
         choices=['auto', 'fast', 'balanced', 'strict', 'exact'],
         default=None,
-        help='How target-size mode should chase the requested MB; exact will force software, degrade aggressively, and pad when needed'
+        help=(
+            'How target-size mode should chase the requested MB. '
+            'Exact tries hardware first, then may lower audio, frame rate, and resolution, and pads when under target. '
+            'A software retry requires --allow-software-fallback'
+        )
     )
 
     parser.add_argument(
@@ -192,6 +215,16 @@ Examples:
         '--no-hw-accel',
         action='store_true',
         help='Disable hardware acceleration'
+    )
+
+    parser.add_argument(
+        '--allow-software-fallback',
+        action='store_true',
+        help=(
+            'Target-size mode: retry on the software encoder when hardware misses '
+            'the size band or the hardware encode fails. Without this flag the '
+            'hardware result is kept and the run reports that confirmation is required'
+        )
     )
     
     # Processing options
@@ -307,7 +340,12 @@ def get_profile(
         raise ValueError(f"Profile {profile_name!r} is not available")
 
     profile = CompressionProfile.from_dict(base_profile.to_dict())
-    
+
+    codec_overridden = args.codec is not None
+    crf_overridden = args.crf is not None
+    preset_overridden = bool(args.preset)
+    hw_overridden = bool(args.no_hw_accel)
+
     # Apply overrides
     if args.codec:
         profile.video_codec = VideoCodec(args.codec)
@@ -342,6 +380,15 @@ def get_profile(
         profile.resource_governor = args.resource_governor
     if args.no_hw_accel:
         profile.use_hw_accel = False
+
+    apply_cli_quality_ladder(
+        profile,
+        args.profile,
+        codec_overridden=codec_overridden,
+        crf_overridden=crf_overridden,
+        preset_overridden=preset_overridden,
+        hw_overridden=hw_overridden,
+    )
 
     # Keep the CLI profile on a container/audio pair the encoder can actually mux.
     codec_manager = CodecManager()
@@ -508,7 +555,8 @@ def process_file(
     suffix: str,
     profile: CompressionProfile,
     compressor: VideoCompressor,
-    dry_run: bool = False
+    dry_run: bool = False,
+    parallel_jobs: int = 1,
 ) -> Optional[CompressionResult]:
     """Process a single file."""
     media_type = detect_media_type(input_path)
@@ -551,7 +599,8 @@ def process_file(
     result = compressor.compress(
         input_file=input_path,
         output_file=output_path,
-        profile=profile
+        profile=profile,
+        parallel_jobs=max(1, int(parallel_jobs or 1)),
     )
     
     if result.success:
@@ -565,10 +614,20 @@ def process_file(
         print(f"    Time: {format_time(result.encoding_time)}")
         if result.note:
             print(f"    Note: {result.note}")
+        if result.software_fallback_required:
+            print(
+                "    Software fallback was not run. "
+                "Re-run with --allow-software-fallback to confirm it."
+            )
         if result.output_format:
             print(f"    Output: {result.output_format.upper()}")
     else:
         print(f"  ✗ Failed: {result.error_message}")
+        if result.software_fallback_required:
+            print(
+                "    Software fallback was not run. "
+                "Re-run with --allow-software-fallback to confirm it."
+            )
     
     return result
 
@@ -588,6 +647,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # Initialize compressor
     compressor = VideoCompressor()
+    if args.allow_software_fallback:
+        compressor.set_software_fallback_callback(lambda _request: True)
     
     # Handle info commands
     if args.hardware:
@@ -674,22 +735,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Profile: {profile.name}")
     print(f"Codec: {profile.video_codec.value}")
     
+    existing_files = [filepath for filepath in input_files if filepath.exists()]
     for filepath in input_files:
-        if not filepath.exists():
+        if filepath not in existing_files:
             print(f"Warning: File not found: {filepath}")
-            continue
-        
-        result = process_file(
+
+    slots = 1
+    if existing_files and not args.dry_run:
+        slots = compressor.queue_slots(
+            profile,
+            requested_parallel=max(1, int(args.jobs or 1)),
+            queued_files=len(existing_files),
+        )
+
+    def _run_one(filepath: Path) -> Optional[CompressionResult]:
+        return process_file(
             input_path=filepath,
             output_dir=output_dir,
             suffix=args.suffix,
             profile=profile,
             compressor=compressor,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
+            parallel_jobs=slots,
         )
-        
-        if result:
-            results.append(result)
+
+    if slots <= 1 or args.dry_run:
+        for filepath in existing_files:
+            result = _run_one(filepath)
+            if result:
+                results.append(result)
+    else:
+        with ThreadPoolExecutor(max_workers=slots) as pool:
+            for result in pool.map(_run_one, existing_files):
+                if result:
+                    results.append(result)
     
     # Summary
     if results and not args.dry_run:

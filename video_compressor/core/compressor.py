@@ -38,6 +38,14 @@ from .profiles import (
     resolve_requested_target_size_mb,
 )
 from .hardware import HardwareDetector, get_hardware_detector
+from .governor import (
+    EncodeCancelled,
+    EncodeResourceGovernor,
+    MachineResources,
+    apply_thread_policy,
+    threads_for_job,
+)
+from .quality_ladder import apply_hardware_ladder, ordered_hw_vendors
 from .utils import (
     format_size, format_time, format_bitrate,
     validate_video_file, validate_image_file, detect_media_type,
@@ -140,6 +148,38 @@ class ImageInfo:
 MediaInfo = Union[VideoInfo, ImageInfo]
 
 
+class SoftwareFallbackReason(Enum):
+    """Why a target-size job is asking before it leaves hardware."""
+
+    ENCODE_FAILED = "encode_failed"
+    SIZE_MISS = "size_miss"
+
+
+@dataclass(frozen=True)
+class SoftwareFallbackRequest:
+    """Ask the GUI or CLI before a target-size software retry.
+
+    Install a decider with ``VideoCompressor.set_software_fallback_callback``.
+    Return True to retry the same job on ``software_encoder``. Return False,
+    or leave the callback unset, to keep the hardware outcome.
+
+    ``reason`` is ``encode_failed`` when FFmpeg rejected the hardware encoder,
+    or ``size_miss`` when that encoder finished outside the target band and
+    will not be retried. A declined ask sets
+    ``CompressionResult.software_fallback_required`` and does not change
+    encoders. CLI confirmation is ``--allow-software-fallback``.
+    """
+
+    reason: SoftwareFallbackReason
+    codec: str
+    hw_encoder: str
+    software_encoder: str
+    message: str
+    target_size_mb: Optional[int] = None
+    actual_size_bytes: Optional[int] = None
+    error_message: str = ""
+
+
 @dataclass
 class CompressionResult:
     """Result of a compression job."""
@@ -163,6 +203,9 @@ class CompressionResult:
     encoder_name: str = ""
     threads_used: int = 0
     attempt_count: int = 0
+    software_fallback_required: bool = False
+    software_fallback_reason: str = ""
+    software_fallback_message: str = ""
     
     @property
     def reduction(self) -> str:
@@ -197,6 +240,10 @@ class CompressionJob:
     threads_used: int = 0
     attempt_count: int = 0
     parallel_jobs: int = 1
+    software_fallback_required: bool = False
+    software_fallback_reason: str = ""
+    software_fallback_message: str = ""
+    software_fallback_settled: bool = False
     
     def __post_init__(self):
         if isinstance(self.input_file, str):
@@ -232,6 +279,7 @@ class VideoCompressor:
             hw_detector: Hardware detector instance (optional)
         """
         self.hw_detector = hw_detector or get_hardware_detector()
+        self.governor = EncodeResourceGovernor(self._machine_resources)
         self._ffmpeg_path = self._find_ffmpeg()
         self._ffprobe_path = self._find_ffprobe()
         self._cjxl_path = self._find_cjxl()
@@ -245,6 +293,9 @@ class VideoCompressor:
         
         # Progress callback
         self._progress_callback: Optional[Callable] = None
+        # Target-size ask before a hardware encoder is replaced with software.
+        # None declines. See set_software_fallback_callback.
+        self._software_fallback_callback: Optional[Callable[[SoftwareFallbackRequest], bool]] = None
     
     def _find_ffmpeg(self) -> str:
         """Find FFmpeg executable."""
@@ -333,6 +384,25 @@ class VideoCompressor:
     def set_progress_callback(self, callback: Callable):
         """Set callback for progress updates."""
         self._progress_callback = callback
+
+    def set_software_fallback_callback(
+        self,
+        callback: Optional[Callable[[SoftwareFallbackRequest], bool]],
+    ) -> None:
+        """Register the ask-before-software callback for target-size jobs.
+
+        The callback receives a :class:`SoftwareFallbackRequest` and returns
+        True to retry that job on the software encoder. ``None``, the default,
+        declines. A decline sets ``CompressionResult.software_fallback_required``
+        and leaves the hardware encoder in place.
+
+        The CLI flag ``--allow-software-fallback`` installs a callback that
+        always returns True. A GUI can read ``software_fallback_required`` and
+        ``software_fallback_message`` on the result, then re-run with a
+        confirming callback.
+        """
+
+        self._software_fallback_callback = callback
     
     def _report_progress(self, job: CompressionJob):
         """Report progress to callback."""
@@ -526,7 +596,7 @@ class VideoCompressor:
         return max(1, int((target_size_mb * 8 * 1_000_000) / duration_seconds))
 
     def _pick_exact_target_codec(self, media_info: VideoInfo, prefer_two_pass: bool = False) -> VideoCodec:
-        """Pick a software codec for exact mode, preferring efficiency over speed."""
+        """Pick a software codec for exact mode when hardware is not available."""
 
         preferred_codecs = [VideoCodec.HEVC, VideoCodec.VP9, VideoCodec.H264]
 
@@ -646,11 +716,18 @@ class VideoCompressor:
         )
         exact_audio_policy = (prepared.exact_audio_policy or "reduce").lower()
         prepared.disable_audio = False
-        prepared.use_hw_accel = False
-        prepared.video_codec = self._pick_exact_target_codec(
-            media_info,
-            prefer_two_pass=bool(prepared.exact_two_pass),
-        )
+        # Try the requested hardware encoder before any software codec change.
+        # When that encoder is missing, pick the software exact-size codec and
+        # turn hardware off. That is not a fallback after a failed hardware
+        # attempt, so it does not ask.
+        hw_encoder = self._select_hw_encoder(prepared.video_codec) if prepared.use_hw_accel else None
+        if not hw_encoder:
+            prepared.video_codec = self._pick_exact_target_codec(
+                media_info,
+                prefer_two_pass=bool(prepared.exact_two_pass),
+            )
+            if not (prepared.use_hw_accel and self._select_hw_encoder(prepared.video_codec)):
+                prepared.use_hw_accel = False
 
         if exact_audio_policy != "keep" and self.codec_manager.is_encoder_available(AudioCodec.OPUS.ffmpeg_encoder):
             prepared.audio_codec = AudioCodec.OPUS
@@ -1030,31 +1107,167 @@ class VideoCompressor:
             attempt_count=0,
         )
 
+    _HW_ENCODER_TOKENS = ("nvenc", "qsv", "amf", "videotoolbox")
+
     def _select_hw_encoder(self, codec: VideoCodec) -> Optional[str]:
-        """Pick the best available hardware encoder for a codec."""
+        """Pick a hardware encoder: NVENC, then QSV, then AMF, then any other.
+
+        This is the only encoder picker for the H.264 and HEVC lanes. Quick
+        Lite and Quick Max call it from ``_build_video_ffmpeg_command`` when
+        hardware is allowed. ``preferred_hw_encoder`` is not consulted, so
+        GPU probe order cannot swap QSV and AMF.
+
+        A GPU must advertise support for the codec and FFmpeg must provide
+        that vendor's encoder. None means the caller keeps the software
+        encoder (libx264 on Quick Lite, libx265 on Quick Max). SVT-AV1 has
+        no hardware encoder here, so Max / Archival stays on libsvtav1.
+        """
         info = self.hw_detector.info
         if not info.gpus:
             return None
 
-        preferred_vendor = info.preferred_hw_encoder
-        vendors: List[str] = []
-        if preferred_vendor:
-            vendors.append(preferred_vendor)
-
+        supported: List[str] = []
         for gpu in info.gpus:
             vendor_name = gpu.vendor.value
-            if vendor_name not in vendors:
-                vendors.append(vendor_name)
-
-        for vendor in vendors:
-            encoder = self.codec_manager.get_hw_encoder(codec, vendor)
-            if not encoder:
+            if vendor_name in supported:
                 continue
-            for gpu in info.gpus:
-                if gpu.vendor.value == vendor and gpu.encoder_support.get(codec.value, False):
-                    return encoder
+            if gpu.encoder_support.get(codec.value, False):
+                supported.append(vendor_name)
+
+        for vendor in ordered_hw_vendors(supported):
+            encoder = self.codec_manager.get_hw_encoder(codec, vendor)
+            if encoder:
+                return encoder
 
         return None
+
+    @classmethod
+    def _is_hardware_encoder(cls, encoder_name: Optional[str]) -> bool:
+        name = encoder_name or ""
+        return any(token in name for token in cls._HW_ENCODER_TOKENS)
+
+    def _confirm_software_fallback(self, request: SoftwareFallbackRequest) -> bool:
+        callback = self._software_fallback_callback
+        if callback is None:
+            return False
+        try:
+            return bool(callback(request))
+        except Exception:
+            logger.exception(
+                "Software fallback callback failed; keeping the hardware encoder"
+            )
+            return False
+
+    def _offer_target_software_fallback(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        *,
+        reason: SoftwareFallbackReason,
+        target_plan: Optional[TargetSizePlan],
+        actual_size_bytes: Optional[int] = None,
+        error_message: str = "",
+    ) -> bool:
+        """Ask before a target-size job replaces hardware with software.
+
+        Returns True only after the callback confirms a software retry.
+        Returns False without changing encoders when there is nothing to ask,
+        or when the callback declines. A decline records
+        ``software_fallback_required`` on the job.
+        """
+
+        if job.software_fallback_settled:
+            return False
+        if target_plan is None or not profile.use_hw_accel:
+            return False
+        hw_encoder = job.encoder_name
+        if not self._is_hardware_encoder(hw_encoder):
+            return False
+        if (
+            reason is SoftwareFallbackReason.SIZE_MISS
+            and actual_size_bytes is not None
+            and is_within_target_size_tolerance(actual_size_bytes, target_plan)
+        ):
+            return False
+
+        software_encoder = profile.video_codec.ffmpeg_encoder
+        if reason is SoftwareFallbackReason.ENCODE_FAILED:
+            message = (
+                f"Hardware encoder {hw_encoder} failed for this target-size job. "
+                f"Confirm before retrying with {software_encoder}."
+            )
+        else:
+            actual_mb = (actual_size_bytes or 0) / 1_000_000
+            message = (
+                f"Hardware encoder {hw_encoder} missed the {target_plan.target_size_mb} MB target "
+                f"(finished at {actual_mb:.1f} MB). "
+                f"Confirm before retrying with {software_encoder}."
+            )
+
+        request = SoftwareFallbackRequest(
+            reason=reason,
+            codec=profile.video_codec.value,
+            hw_encoder=hw_encoder,
+            software_encoder=software_encoder,
+            message=message,
+            target_size_mb=target_plan.target_size_mb,
+            actual_size_bytes=actual_size_bytes,
+            error_message=error_message,
+        )
+        job.software_fallback_settled = True
+        if self._confirm_software_fallback(request):
+            logger.info(
+                "Software fallback confirmed for %s (%s -> %s)",
+                job.input_file,
+                hw_encoder,
+                software_encoder,
+            )
+            profile.use_hw_accel = False
+            return True
+
+        job.software_fallback_required = True
+        job.software_fallback_reason = reason.value
+        job.software_fallback_message = message
+        logger.info("Software fallback not confirmed for %s: %s", job.input_file, message)
+        return False
+
+    def _arm_software_target_retry(
+        self,
+        profile: CompressionProfile,
+        media_info: VideoInfo,
+        job: CompressionJob,
+    ) -> Tuple[Optional[TargetSizePlan], Optional[int], Optional[TargetSizeSearchState]]:
+        """Rebuild the target-size search after a confirmed software retry."""
+
+        plan = self._resolve_target_size_plan(profile, media_info)
+        bitrate = plan.video_bitrate if plan else None
+        job.progress = 0.0
+        job.speed = 0.0
+        job.eta = 0.0
+        job.current_frame = 0
+        if job.output_file.exists():
+            job.output_file.unlink(missing_ok=True)
+        self._report_progress(job)
+        return plan, bitrate, TargetSizeSearchState() if plan else None
+
+    def _copy_software_fallback_result(
+        self,
+        result: CompressionResult,
+        job: CompressionJob,
+    ) -> CompressionResult:
+        """Copy the ask-before-software flag onto a finished result."""
+
+        result.software_fallback_required = job.software_fallback_required
+        result.software_fallback_reason = job.software_fallback_reason
+        result.software_fallback_message = job.software_fallback_message
+        message = job.software_fallback_message
+        if not message:
+            return result
+        if result.success and message not in (result.note or ""):
+            result.note = f"{result.note} {message}".strip()
+        elif not result.success and message not in (result.error_message or ""):
+            result.error_message = f"{result.error_message}\n{message}".strip()
+        return result
 
     def _build_scale_filter(self, width: int, height: int, max_resolution: Optional[int], scale: float) -> Optional[str]:
         """Build a scale filter for video or image resizing."""
@@ -1084,37 +1297,68 @@ class VideoCompressor:
 
         target_mode = self._resolve_effective_target_mode(optimized, media_info)
 
-        if target_mode == TargetSizeMode.EXACT:
-            optimized.use_hw_accel = False
-
         if optimized.video_codec == VideoCodec.SVT_AV1:
             optimized.use_hw_accel = False
 
-        if optimized.video_codec == VideoCodec.AV1:
+        if optimized.video_codec == VideoCodec.AV1 and target_mode not in {
+            TargetSizeMode.STRICT,
+            TargetSizeMode.EXACT,
+        }:
             hw_av1 = self._select_hw_encoder(VideoCodec.AV1) if optimized.use_hw_accel else None
-
-            if target_mode not in {TargetSizeMode.STRICT, TargetSizeMode.EXACT}:
-                if hw_av1:
-                    optimized.use_hw_accel = True
-                elif self.codec_manager.is_codec_available(VideoCodec.SVT_AV1):
-                    optimized.video_codec = VideoCodec.SVT_AV1
-                    optimized.use_hw_accel = False
-                    if optimized.preset in {"slow", "slower", "veryslow"}:
-                        optimized.preset = "medium"
-            elif optimized.use_hw_accel and optimized.crf >= 32 and self.codec_manager.is_codec_available(VideoCodec.AV1):
-                # Strict target mode can trade speed for better size efficiency when needed.
+            if hw_av1:
+                optimized.use_hw_accel = True
+            elif self.codec_manager.is_codec_available(VideoCodec.SVT_AV1):
+                optimized.video_codec = VideoCodec.SVT_AV1
                 optimized.use_hw_accel = False
+                if optimized.preset in {"slow", "slower", "veryslow"}:
+                    optimized.preset = "medium"
 
-        hw_vendor = self.hw_detector.info.preferred_hw_encoder if optimized.use_hw_accel else None
-        fallback_hw_vendor = None if target_mode == TargetSizeMode.EXACT else hw_vendor
-
-        if not self.codec_manager.is_codec_usable(optimized.video_codec, hw_vendor=fallback_hw_vendor):
+        # Usable means the ordered hardware picker found an encoder, or the
+        # software encoder exists. preferred_hw_encoder is not a second path.
+        selected_hw = self._select_hw_encoder(optimized.video_codec) if optimized.use_hw_accel else None
+        if not selected_hw and not self.codec_manager.is_codec_available(optimized.video_codec):
             optimized.video_codec = self.codec_manager.get_best_codec(
                 prefer_efficiency=target_mode == TargetSizeMode.EXACT or optimized.profile_type.value != "fast",
-                hw_vendor=fallback_hw_vendor,
+                hw_vendor=None,
             )
+            if optimized.video_codec == VideoCodec.SVT_AV1:
+                optimized.use_hw_accel = False
 
         return optimized
+
+    def _machine_resources(self) -> MachineResources:
+        info = self.hw_detector.info
+        return MachineResources(
+            cpu_threads=max(1, int(info.cpu_threads or 1)),
+            cpu_cores=max(1, int(info.cpu_cores or 1)),
+            total_ram_gb=float(info.total_ram_gb or 0.0),
+        )
+
+    def queue_slots(
+        self,
+        profile: CompressionProfile,
+        *,
+        requested_parallel: int,
+        queued_files: int,
+        media_info: Optional[VideoInfo] = None,
+    ) -> int:
+        """How many jobs with this profile may encode at once.
+
+        Hardware sessions and the CPU cap can be lower than the requested
+        parallelism. The returned count is the wave size callers should pass
+        as ``parallel_jobs`` so every job in the wave shares one budget.
+        """
+
+        requested = max(1, int(requested_parallel or 1))
+        queued = max(1, int(queued_files or 1))
+        if profile.output_mode == "audio":
+            return self.governor.max_concurrent(requested, hw_encoder=None, queued=queued)
+
+        optimized = self._optimize_video_profile(profile, media_info)
+        hw_encoder = None
+        if optimized.use_hw_accel:
+            hw_encoder = self._select_hw_encoder(optimized.video_codec)
+        return self.governor.max_concurrent(requested, hw_encoder=hw_encoder, queued=queued)
 
     def _get_thread_count(
         self,
@@ -1125,48 +1369,41 @@ class VideoCompressor:
         media_info: Optional[VideoInfo] = None,
     ) -> int:
         """Pick a practical thread count for the selected codec and hardware path."""
-        max_threads: Optional[int] = None
-        if not hw_encoder and codec == VideoCodec.HEVC:
-            # libx265 rejects very high frame-thread counts on some systems.
-            max_threads = 16
 
-        if profile.threads:
-            requested = max(1, profile.threads)
-            return min(requested, max_threads) if max_threads is not None else requested
+        info = self._machine_resources()
+        return threads_for_job(
+            cpu_threads=info.cpu_threads,
+            cpu_cores=info.cpu_cores,
+            total_ram_gb=info.total_ram_gb,
+            profile_threads=profile.threads,
+            resource_governor=profile.resource_governor,
+            codec=codec.value,
+            hw_encoder=hw_encoder,
+            parallel_jobs=max(1, parallel_jobs),
+            frame_height=getattr(media_info, "height", profile.max_resolution or 0) or 0,
+        )
 
-        try:
-            cpu_threads = max(
-                1,
-                self.hw_detector.recommend_threads_for_job(
-                    n_parallel=max(1, parallel_jobs),
-                    governor=profile.resource_governor,
-                    codec=codec.value,
-                    hw_encoder=hw_encoder,
-                    frame_height=getattr(media_info, "height", profile.max_resolution or 0) or 0,
-                ),
-            )
-        except TypeError:
-            cpu_threads = max(1, self.hw_detector.info.recommended_threads)
-        physical_cores = max(1, min(self.hw_detector.info.cpu_cores, cpu_threads))
+    def _reserve_encode_slot(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        *,
+        codec: str,
+        hw_encoder: Optional[str],
+        frame_height: int = 0,
+    ):
+        """Take a CPU or hardware-session slot for this job, or wait for one."""
 
-        if hw_encoder:
-            return max(2 if cpu_threads >= 2 else 1, min(cpu_threads, max(2, physical_cores)))
-        if codec == VideoCodec.SVT_AV1:
-            requested = max(2, cpu_threads)
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.AV1:
-            requested = max(2, min(cpu_threads, max(physical_cores, int(cpu_threads * 0.85))))
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.HEVC:
-            requested = max(physical_cores, int(cpu_threads * 0.75))
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.H264:
-            requested = max(1, int(cpu_threads * 0.9))
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.VP9:
-            requested = max(1, min(cpu_threads, 12))
-            return min(requested, max_threads) if max_threads is not None else requested
-        return min(cpu_threads, max_threads) if max_threads is not None else cpu_threads
+        return self.governor.reserve(
+            job.id,
+            declared_parallel=max(1, int(job.parallel_jobs or 1)),
+            hw_encoder=hw_encoder,
+            codec=codec,
+            frame_height=frame_height,
+            explicit_threads=profile.threads,
+            resource_governor=profile.resource_governor,
+            cancel_check=lambda: self._cancelled.get(job.id, False),
+        )
 
     def _select_target_rate_control(
         self,
@@ -1206,12 +1443,26 @@ class VideoCompressor:
             hw_encoder = self._select_hw_encoder(profile.video_codec)
 
         codec_settings = profile.to_codec_settings()
+        media = video_info if isinstance(video_info, VideoInfo) else None
+        parallel_jobs = max(1, int(job.parallel_jobs or 1))
+        if self.governor.holds(job.id):
+            # Refresh the slot (hardware to software, or a new neighbor) and
+            # size threads for that wave. _get_thread_count stays the single
+            # thread decision so previews and tests share it.
+            lease = self._reserve_encode_slot(
+                job,
+                profile,
+                codec=profile.video_codec.value,
+                hw_encoder=hw_encoder,
+                frame_height=getattr(media, "height", profile.max_resolution or 0) or 0,
+            )
+            parallel_jobs = lease.parallel_jobs
         codec_settings.threads = self._get_thread_count(
             profile,
             profile.video_codec,
             hw_encoder,
-            parallel_jobs=job.parallel_jobs,
-            media_info=video_info if isinstance(video_info, VideoInfo) else None,
+            parallel_jobs=parallel_jobs,
+            media_info=media,
         )
         job.encoder_name = hw_encoder or profile.video_codec.ffmpeg_encoder
         job.threads_used = codec_settings.threads or 0
@@ -1240,6 +1491,9 @@ class VideoCompressor:
             )
             if target_rate_control is not None:
                 codec_settings.rate_control = target_rate_control
+
+        if hw_encoder and codec_settings.crf is not None and not codec_settings.video_bitrate:
+            apply_hardware_ladder(codec_settings, hw_encoder)
 
         codec_args = codec_settings.to_ffmpeg_args(hw_encoder)
         cmd.extend(codec_args)
@@ -1273,7 +1527,11 @@ class VideoCompressor:
             cmd.extend(extra_args)
 
         cmd.append(str(job.output_file))
-        return cmd
+        return apply_thread_policy(
+            cmd,
+            threads=job.threads_used or threads,
+            encoder=job.encoder_name,
+        )
 
     def _build_input_command(self, job: CompressionJob, profile: CompressionProfile) -> List[str]:
         """Build the shared FFmpeg input and optional trim arguments."""
@@ -1977,6 +2235,12 @@ class VideoCompressor:
                 job.output_file = job.output_file.with_suffix(f".{output_ext}")
                 job.output_file.parent.mkdir(parents=True, exist_ok=True)
 
+                self._reserve_encode_slot(
+                    job,
+                    profile,
+                    codec="audio",
+                    hw_encoder=None,
+                )
                 cmd = self._build_audio_ffmpeg_command(job, profile)
                 logger.info(f"FFmpeg audio extraction command: {' '.join(cmd)}")
 
@@ -2059,6 +2323,17 @@ class VideoCompressor:
 
             if target_plan and target_plan.warning:
                 logger.info("Target-size warning for %s: %s", job.input_file, target_plan.warning)
+
+            initial_hw = None
+            if optimized_profile.use_hw_accel:
+                initial_hw = self._select_hw_encoder(optimized_profile.video_codec)
+            self._reserve_encode_slot(
+                job,
+                optimized_profile,
+                codec=optimized_profile.video_codec.value,
+                hw_encoder=initial_hw,
+                frame_height=getattr(media_info, "height", 0) or 0,
+            )
 
             retry_count = 0
             oversized_retry_done = False
@@ -2186,6 +2461,26 @@ class VideoCompressor:
                                         job.output_file.unlink(missing_ok=True)
                                     self._report_progress(job)
                                     continue
+                            if self._offer_target_software_fallback(
+                                job,
+                                optimized_profile,
+                                reason=SoftwareFallbackReason.SIZE_MISS,
+                                target_plan=target_plan,
+                                actual_size_bytes=compressed_size,
+                            ):
+                                (
+                                    target_plan,
+                                    target_video_bitrate,
+                                    target_search_state,
+                                ) = self._arm_software_target_retry(
+                                    optimized_profile,
+                                    media_info,
+                                    job,
+                                )
+                                stage_attempt = 0
+                                target_floor_limited = False
+                                retry_count = 0
+                                continue
                             logger.info(
                                 "Target-size mode exhausted %s attempts for %s; keeping best result",
                                 target_plan.max_attempts,
@@ -2227,6 +2522,26 @@ class VideoCompressor:
                                         job.output_file.unlink(missing_ok=True)
                                     self._report_progress(job)
                                     continue
+                            if self._offer_target_software_fallback(
+                                job,
+                                optimized_profile,
+                                reason=SoftwareFallbackReason.SIZE_MISS,
+                                target_plan=target_plan,
+                                actual_size_bytes=compressed_size,
+                            ):
+                                (
+                                    target_plan,
+                                    target_video_bitrate,
+                                    target_search_state,
+                                ) = self._arm_software_target_retry(
+                                    optimized_profile,
+                                    media_info,
+                                    job,
+                                )
+                                stage_attempt = 0
+                                target_floor_limited = False
+                                retry_count = 0
+                                continue
                             target_floor_limited = bool(
                                 target_plan.minimum_size_bytes > target_plan.target_size_bytes
                                 and (target_video_bitrate or 0) <= target_plan.min_video_bitrate
@@ -2290,6 +2605,33 @@ class VideoCompressor:
                     optimized_profile.preset = "veryfast"
                     continue
 
+                if self._offer_target_software_fallback(
+                    job,
+                    optimized_profile,
+                    reason=SoftwareFallbackReason.ENCODE_FAILED,
+                    target_plan=target_plan,
+                    error_message=stderr_text,
+                ):
+                    (
+                        target_plan,
+                        target_video_bitrate,
+                        target_search_state,
+                    ) = self._arm_software_target_retry(
+                        optimized_profile,
+                        media_info,
+                        job,
+                    )
+                    stage_attempt = 0
+                    target_floor_limited = False
+                    retry_count = 0
+                    continue
+
+                if job.software_fallback_required:
+                    detail = job.software_fallback_message
+                    if stderr_text:
+                        detail = f"{detail}\n{stderr_text}"
+                    raise ValueError(detail)
+
                 if stderr_text:
                     raise ValueError(stderr_text)
                 raise ValueError(f"FFmpeg failed with code {returncode}")
@@ -2343,13 +2685,16 @@ class VideoCompressor:
 
             if compressed_size >= media_info.size:
                 logger.info("Encoded output for %s was larger than the source; preserving original", job.input_file)
-                result = self._keep_original_result(
-                    job=job,
-                    media_info=media_info,
-                    encoding_time=encoding_time,
-                    video_codec=optimized_profile.video_codec.value,
-                    audio_codec=media_info.audio_codec or self._effective_audio_codec_name(optimized_profile),
-                    media_type="video",
+                result = self._copy_software_fallback_result(
+                    self._keep_original_result(
+                        job=job,
+                        media_info=media_info,
+                        encoding_time=encoding_time,
+                        video_codec=optimized_profile.video_codec.value,
+                        audio_codec=media_info.audio_codec or self._effective_audio_codec_name(optimized_profile),
+                        media_type="video",
+                    ),
+                    job,
                 )
                 job.status = JobStatus.COMPLETED
                 job.progress = 100
@@ -2376,6 +2721,7 @@ class VideoCompressor:
                 threads_used=job.threads_used,
                 attempt_count=max(1, job.attempt_count),
             )
+            result = self._copy_software_fallback_result(result, job)
             
             job.status = JobStatus.COMPLETED
             job.progress = 100
@@ -2383,7 +2729,9 @@ class VideoCompressor:
             self._report_progress(job)
             
             return result
-            
+
+        except EncodeCancelled:
+            return self._cancel_result(job)
         except Exception as e:
             if self._cancelled.get(job_id, False):
                 return self._cancel_result(job)
@@ -2392,14 +2740,20 @@ class VideoCompressor:
             job.error = str(e)
             self._report_progress(job)
             
-            return CompressionResult(
-                success=False,
-                input_file=job.input_file,
-                error_message=str(e)
+            return self._copy_software_fallback_result(
+                CompressionResult(
+                    success=False,
+                    input_file=job.input_file,
+                    error_message=str(e),
+                    encoder_name=job.encoder_name,
+                    attempt_count=job.attempt_count,
+                ),
+                job,
             )
         
         finally:
             # Cleanup
+            self.governor.release(job_id)
             self._processes.pop(job_id, None)
             self._paused.pop(job_id, None)
             self._cancelled.pop(job_id, None)
@@ -2502,6 +2856,12 @@ class BatchProcessor:
         self._results: Dict[str, CompressionResult] = {}
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
+        self._worker_threads: List[threading.Thread] = []
+        self._inflight = 0
+        self._submitted = 0
+        self._worker_limit = 1
+        self._announced_parallel = 1
+        self._slot_lock = threading.Lock()
     
     def add_job(
         self,
@@ -2513,38 +2873,78 @@ class BatchProcessor:
         """Add a job to the batch queue."""
         import uuid
         job_id = job_id or str(uuid.uuid4())[:8]
-        
+
         self._queue.put((job_id, input_file, output_file, profile))
+        with self._slot_lock:
+            self._submitted += 1
+            if self._running:
+                self._announced_parallel = max(
+                    1,
+                    min(self._worker_limit, self._submitted),
+                )
         return job_id
     
     def start(self, max_concurrent: int = 1):
-        """Start processing the batch queue."""
+        """Start processing the batch queue.
+
+        ``max_concurrent`` is the requested wave size. The encode governor can
+        lower it when the CPU or a hardware encoder cannot host that many
+        sessions. Each job is told that wave size so threads are split once.
+        """
         if self._running:
             return
-        
+
         self._running = True
-        
+        self._worker_limit = max(1, int(max_concurrent or 1))
+        with self._slot_lock:
+            self._announced_parallel = max(1, min(self._worker_limit, max(1, self._submitted)))
+
         def worker():
             while self._running:
                 try:
-                    job_id, input_file, output_file, profile = self._queue.get(timeout=1)
-                    result = self.compressor.compress(
-                        input_file, output_file, profile, job_id
-                    )
-                    self._results[job_id] = result
-                    self._queue.task_done()
+                    job_id, input_file, output_file, profile = self._queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
+                try:
+                    with self._slot_lock:
+                        self._inflight += 1
+                        planned = self._announced_parallel
+                    try:
+                        planned = self.compressor.queue_slots(
+                            profile,
+                            requested_parallel=planned,
+                            queued_files=planned,
+                        )
+                    except Exception:
+                        logger.debug("Batch slot plan fell back to the worker limit", exc_info=True)
+                    result = self.compressor.compress(
+                        input_file,
+                        output_file,
+                        profile,
+                        job_id,
+                        parallel_jobs=planned,
+                    )
+                    self._results[job_id] = result
                 except Exception as e:
                     logger.error(f"Batch processing error: {e}")
-        
-        self._worker_thread = threading.Thread(target=worker, daemon=True)
-        self._worker_thread.start()
-    
+                finally:
+                    with self._slot_lock:
+                        self._inflight = max(0, self._inflight - 1)
+                    self._queue.task_done()
+
+        self._worker_threads = []
+        for _ in range(self._worker_limit):
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            self._worker_threads.append(thread)
+        self._worker_thread = self._worker_threads[0]
+
     def stop(self):
         """Stop batch processing."""
         self._running = False
-        if self._worker_thread:
+        for thread in self._worker_threads:
+            thread.join(timeout=2)
+        if self._worker_thread and self._worker_thread not in self._worker_threads:
             self._worker_thread.join(timeout=2)
     
     def get_result(self, job_id: str) -> Optional[CompressionResult]:

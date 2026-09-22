@@ -104,5 +104,5 @@ target-version = "py310"
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "smoke: short real FFmpeg encode; skipped when ffmpeg is not installed",
+    "smoke: short real FFmpeg encodes, including the VideoCompressor Lite and dual-Max time/size/SSIM ladder; skipped when ffmpeg is not installed",
 ]
