@@ -1,0 +1,34 @@
+# Video Compressor Dependencies
+# GUI Framework
+customtkinter>=5.2.0
+tkinterdnd2>=0.4.3
+Pillow>=10.0.0
+pystray>=0.19.5
+
+# Video Processing
+ffmpeg-python>=0.2.0
+
+# System utilities
+psutil>=5.9.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: Hardware detection enhancements
+pyopencl>=2024.0; platform_system != "Darwin"
+WMI>=1.5.1; platform_system == "Windows"
+
+# Logging enhancements
+colorlog>=6.8.0
+
+# Progress bars for CLI mode
+rich>=13.7.0
+
+# Windows toast notifications
+winotify>=1.1.0; platform_system == "Windows"
+pytest>=7.0.0
+pytest-mock>=3.14.0
+
+# Dev/build tooling
+ruff>=0.11.0
+pyinstaller>=6.0.0
