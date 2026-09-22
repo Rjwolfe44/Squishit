@@ -20,6 +20,7 @@ from ..core.profiles import (
 )
 from ..core.codecs import VideoCodec
 from ..config import APP_NAME, get_config_manager
+from .copy import QUICK_COMPRESS_SUBTITLE, QUICK_COMPRESS_TITLE
 from .scaling import apply_tk_scaling, center_window, resolve_ui_scale, scaled
 
 # Quick Lite (H.264) / Balanced (HEVC) / HEVC Max. CRF and preset come from the ladder.
@@ -62,7 +63,7 @@ class QuickCompressWindow(tk.Tk):
         )
         self._preset_var = tk.StringVar(value=saved)
 
-        self.title(f"{APP_NAME} Quick Compress")
+        self.title(f"{APP_NAME} {QUICK_COMPRESS_TITLE}")
         width, height = self._scaled_window_size()
         self.geometry(f"{width}x{height}")
         self.resizable(False, False)
@@ -72,6 +73,7 @@ class QuickCompressWindow(tk.Tk):
 
         self._build_ui()
         center_window(self, width=width, height=height)
+        self._update_wraplengths()
         self._refresh_preview()
         self.bind("<Configure>", lambda _event: self._update_wraplengths())
         self._pump_after_id = self.after(100, self._pump)
@@ -80,8 +82,24 @@ class QuickCompressWindow(tk.Tk):
         outer = tk.Frame(self, padx=16, pady=14)
         outer.pack(fill="both", expand=True)
 
+        title_size = max(13, int(round(13 * self._ui_scale)))
+        tk.Label(
+            outer,
+            text=QUICK_COMPRESS_TITLE,
+            font=("Segoe UI", title_size, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        self._subtitle_label = tk.Label(
+            outer,
+            text=QUICK_COMPRESS_SUBTITLE,
+            anchor="w",
+            justify="left",
+            fg="#555555",
+        )
+        self._subtitle_label.pack(fill="x", pady=(2, 0))
+
         # File name
-        tk.Label(outer, text=self.input_file.name, font=("Segoe UI", max(11, int(round(11 * self._ui_scale))), "bold"), anchor="w").pack(fill="x")
+        tk.Label(outer, text=self.input_file.name, font=("Segoe UI", max(11, int(round(11 * self._ui_scale))), "bold"), anchor="w").pack(fill="x", pady=(10, 0))
 
         # Preset selector row
         preset_row = tk.Frame(outer)
@@ -146,13 +164,14 @@ class QuickCompressWindow(tk.Tk):
         screen_w = max(1, self.winfo_screenwidth())
         screen_h = max(1, self.winfo_screenheight())
         scale = max(0.95, self._ui_scale)
-        width = max(560, min(scaled(620, scale), screen_w - 80))
-        height = max(300, min(scaled(320, scale), screen_h - 80))
+        width = max(560, min(scaled(640, scale), screen_w - 80))
+        height = max(340, min(scaled(400, scale), screen_h - 80))
         return width, height
 
     def _update_wraplengths(self) -> None:
         wraplength = max(320, self.winfo_width() - 48)
         try:
+            self._subtitle_label.configure(wraplength=wraplength)
             self._hint_label.configure(wraplength=wraplength)
             self._destination_label.configure(wraplength=wraplength)
         except Exception:

@@ -32,9 +32,9 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 | **Fast** | H.264 Quick rung (CRF 26, fast) | Time-sensitive encoding |
 | **Balanced** | HEVC Balanced rung (CRF 28, medium) | General use |
 | **Max / Archival** | SVT-AV1 Max rung (CRF 35, preset 6) in MKV, hardware off | Archive-friendly files |
-| **YouTube Upload** | Optimized for social media | Content creators |
+| **YouTube / social upload** | Video file for YouTube and other social uploads (`--profile youtube`) | Social file uploads |
 | **Mobile** | Smaller files for mobile | Mobile viewing |
-| **Streaming** | Fast encoding for live streams | Streamers |
+| **Streaming upload** | Video file for Twitch, YouTube, or OBS upload (`--profile streaming`) | Upload-ready files |
 
 **Max / Archival** and **Quick Compress Max** are different settings. Archival Max is SVT-AV1 with hardware off. Quick Compress Max is the HEVC Max rung (CRF 30, slow) and is labeled **HEVC Max** in the context-menu window. **Quick Lite** is the fastest context-menu rung: H.264 CRF 26, preset fast, with hardware preferred in the order NVENC, then QSV, then AMF, then software libx264. AV1 is not that rung.
 

@@ -9,6 +9,7 @@ import yaml
 from pathlib import Path
 
 from .codecs import VideoCodec, AudioCodec, CodecSettings, RateControl, AudioMode
+from .descriptions import STREAMING_UPLOAD_DESCRIPTION, YOUTUBE_UPLOAD_DESCRIPTION
 from .quality_ladder import (
     ARCHIVAL_PROFILE_NAME,
     PROFILE_FLAG_RUNGS,
@@ -396,7 +397,7 @@ class ProfileManager:
         CompressionProfile(
             name="YouTube Upload",
             profile_type=ProfileType.CUSTOM,
-            description="Optimized for YouTube/Social Media - maximum compatibility",
+            description=YOUTUBE_UPLOAD_DESCRIPTION,
             video_codec=VideoCodec.H264,
             crf=23,
             preset="fast",
@@ -420,7 +421,7 @@ class ProfileManager:
         CompressionProfile(
             name="Streaming",
             profile_type=ProfileType.CUSTOM,
-            description="Fast encoding for live streaming",
+            description=STREAMING_UPLOAD_DESCRIPTION,
             video_codec=VideoCodec.HEVC,
             crf=24,
             preset="veryfast",

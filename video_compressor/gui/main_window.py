@@ -14,6 +14,7 @@ import logging
 import time
 from datetime import datetime, timezone, timedelta
 
+from .copy import EMPTY_QUEUE, PROFILE_HELPER
 from .widgets import (
     DropZone, FileQueueCard, ProgressCard,
     SettingsPanel, ProfileBar, ResultCard, COLORS, HardwareBadge,
@@ -632,7 +633,7 @@ class MainWindow(tkinterdnd2.Tk):
 
         self._queue_lbl = ctk.CTkLabel(
             left,
-            text="No files added",
+            text="",
             font=ctk.CTkFont(size=12),
             text_color=COLORS["text_muted"],
         )
@@ -644,26 +645,39 @@ class MainWindow(tkinterdnd2.Tk):
             scrollbar_button_hover_color=COLORS["border"],
         )
         self._list.pack(fill="both", expand=True)
+        self._empty_queue = None
+        self._refresh_label()
 
     def _build_right(self, parent):
         right = ctk.CTkFrame(
             parent,
-            fg_color=COLORS["surface"],
+            fg_color=COLORS["bg"],
             corner_radius=14,
-            width=320,
+            border_width=1,
+            border_color=COLORS["border"],
+            width=440,
         )
         right.pack(side="right", fill="y", padx=(16, 0))
         right.pack_propagate(False)
 
         inner = ctk.CTkFrame(right, fg_color="transparent")
-        inner.pack(fill="both", expand=True, padx=16, pady=16)
+        inner.pack(fill="both", expand=True, padx=14, pady=14)
 
         ctk.CTkLabel(
             inner,
             text="PROFILE",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color=COLORS["text_muted"],
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COLORS["text_dim"],
         ).pack(anchor="w")
+
+        ctk.CTkLabel(
+            inner,
+            text=PROFILE_HELPER,
+            font=ctk.CTkFont(size=12),
+            text_color=COLORS["text_dim"],
+            anchor="w",
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(4, 0))
 
         self._profile_bar = ProfileBar(
             inner,
@@ -674,14 +688,14 @@ class MainWindow(tkinterdnd2.Tk):
 
         ctk.CTkButton(
             inner,
-            text="✎ Custom Profiles",
-            height=26, corner_radius=6,
-            fg_color=COLORS["surface_raised"],
-            hover_color=COLORS["border"],
-            text_color=COLORS["accent"],
-            font=ctk.CTkFont(size=11, weight="bold"),
+            text="Custom Profiles",
+            height=24, corner_radius=6,
+            fg_color="transparent",
+            hover_color=COLORS["surface"],
+            text_color=COLORS["text_muted"],
+            font=ctk.CTkFont(size=11),
             command=self._open_profile_editor,
-        ).pack(fill="x", pady=(6, 0))
+        ).pack(anchor="w", pady=(6, 0))
 
         ctk.CTkFrame(inner, height=1, fg_color=COLORS["border"]).pack(
             fill="x", pady=14
@@ -690,7 +704,7 @@ class MainWindow(tkinterdnd2.Tk):
         ctk.CTkLabel(
             inner,
             text="SETTINGS",
-            font=ctk.CTkFont(size=10, weight="bold"),
+            font=ctk.CTkFont(size=9),
             text_color=COLORS["text_muted"],
         ).pack(anchor="w")
 
@@ -807,15 +821,58 @@ class MainWindow(tkinterdnd2.Tk):
             del self.video_files[key]
         self._refresh_label()
 
+    def _ensure_queue_label(self):
+        if not self._queue_lbl.winfo_manager():
+            self._queue_lbl.pack(anchor="w", pady=(12, 6), before=self._list)
+
+    def _show_empty_queue(self):
+        current = getattr(self, "_empty_queue", None)
+        if current is not None:
+            try:
+                if current.winfo_exists():
+                    return
+            except Exception:
+                pass
+        hold = ctk.CTkFrame(self._list, fg_color="transparent")
+        hold.pack(fill="x", pady=(18, 0))
+        ctk.CTkLabel(
+            hold,
+            text=EMPTY_QUEUE,
+            font=ctk.CTkFont(size=14),
+            text_color=COLORS["text_dim"],
+            anchor="w",
+        ).pack(anchor="w")
+        self._empty_queue = hold
+
+    def _hide_empty_queue(self):
+        widget = getattr(self, "_empty_queue", None)
+        self._empty_queue = None
+        if widget is None:
+            return
+        try:
+            if widget.winfo_exists():
+                widget.destroy()
+        except Exception:
+            pass
+
     def _refresh_label(self):
         n = len(self.video_files)
         if n == 0:
-            self._queue_lbl.configure(text="No files added")
-            self._drop_zone.set_compact(False)
+            if not self.is_compressing and not self.results:
+                self._queue_lbl.pack_forget()
+                self._show_empty_queue()
+                self._drop_zone.set_compact(False)
+            else:
+                self._hide_empty_queue()
+                self._ensure_queue_label()
         elif n == 1:
+            self._hide_empty_queue()
+            self._ensure_queue_label()
             self._queue_lbl.configure(text="1 file queued")
             self._drop_zone.set_compact(True)
         else:
+            self._hide_empty_queue()
+            self._ensure_queue_label()
             self._queue_lbl.configure(text=f"{n} files queued")
             self._drop_zone.set_compact(True)
 
@@ -1367,7 +1424,13 @@ class MainWindow(tkinterdnd2.Tk):
         kind = msg[0]
         if kind == SOFTWARE_FALLBACK_QUEUE_KIND:
             _, request, holder, done = msg
-            finish_software_fallback_prompt(self, request, holder, done)
+            try:
+                self._set_software_fallback_wait(request, True)
+            finally:
+                try:
+                    finish_software_fallback_prompt(self, request, holder, done)
+                finally:
+                    self._set_software_fallback_wait(request, False)
             return
         if kind == "update_available":
             _, info = msg
@@ -1525,9 +1588,39 @@ class MainWindow(tkinterdnd2.Tk):
         except Exception:
             pass
 
+    def _set_software_fallback_wait(self, request, waiting: bool) -> None:
+        """Mark the matching progress card while the existing ask dialog is open."""
+
+        hw = str(getattr(request, "hw_encoder", "") or "")
+        cards = []
+        for card in list(self.active_jobs.values()):
+            job = getattr(card, "job", None)
+            status = getattr(getattr(job, "status", None), "value", getattr(job, "status", ""))
+            if status in {"completed", "failed", "cancelled"}:
+                continue
+            encoder = str(getattr(job, "encoder_name", "") or "")
+            if not hw or encoder == hw:
+                cards.append(card)
+        if not cards:
+            for card in self.active_jobs.values():
+                job = getattr(card, "job", None)
+                status = getattr(getattr(job, "status", None), "value", getattr(job, "status", ""))
+                if status not in {"completed", "failed", "cancelled"}:
+                    cards.append(card)
+        for card in cards:
+            marker = getattr(card, "set_awaiting_software_fallback", None)
+            if marker is not None:
+                marker(waiting)
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
     def _show_results(self):
         for w in self._list.winfo_children():
             w.destroy()
+        self._empty_queue = None
+        self._ensure_queue_label()
 
         ok = sum(1 for r in self.results if r.success and not getattr(r, "skipped", False))
         skipped = sum(1 for r in self.results if getattr(r, "skipped", False))
@@ -1575,8 +1668,8 @@ class MainWindow(tkinterdnd2.Tk):
         self.video_files.clear()
         self.active_jobs.clear()
         self.results.clear()
-        self._queue_lbl.configure(text="No files added")
-        self._drop_zone.set_compact(False)
+        self._empty_queue = None
+        self._refresh_label()
 
     def _pick_output_folder(self):
         folder = filedialog.askdirectory(

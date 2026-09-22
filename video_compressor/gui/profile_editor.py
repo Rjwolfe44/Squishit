@@ -10,6 +10,7 @@ import yaml
 
 import customtkinter as ctk
 
+from .copy import profile_ui_text
 from .scaling import apply_dialog_geometry
 from .widgets import COLORS, _lbl
 from ..core.codecs import VideoCodec, AudioCodec, RateControl, AudioMode, ENCODER_REGISTRY
@@ -194,9 +195,10 @@ class ProfileEditorDialog(ctk.CTkToplevel):
         for p in self._pm.get_all_profiles():
             is_builtin = p.profile_type in _BUILTIN_TYPES
             prefix = "🔒 " if is_builtin else ""
+            label, _blurb = profile_ui_text(p.name, p.description)
             btn = ctk.CTkButton(
                 self._list_frame,
-                text=f"{prefix}{p.name}",
+                text=f"{prefix}{label}",
                 height=30, corner_radius=6, anchor="w",
                 fg_color="transparent", hover_color=COLORS["surface_raised"],
                 text_color=COLORS["text_dim"], font=ctk.CTkFont(size=12),

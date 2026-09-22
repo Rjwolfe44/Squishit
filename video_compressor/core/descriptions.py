@@ -217,6 +217,16 @@ SETTING_DESCRIPTIONS: Dict[str, Dict[str, Any]] = {
 }
 
 
+# File-upload profile presentation. Stored profile ids stay "YouTube Upload"
+# and "Streaming" so CLI flags keep working. These strings are labels only.
+YOUTUBE_UPLOAD_LABEL = "YouTube / social upload"
+YOUTUBE_UPLOAD_DESCRIPTION = (
+    "Video file for YouTube and other social uploads, with wide playback compatibility."
+)
+STREAMING_UPLOAD_LABEL = "Streaming upload"
+STREAMING_UPLOAD_DESCRIPTION = "Video file for Twitch, YouTube, or OBS upload."
+
+
 def get_description(key: str, encoder: str | None = None) -> str:
     """Return the tooltip text for a setting, optionally specialized for an encoder."""
     entry = SETTING_DESCRIPTIONS.get(key)
