@@ -165,9 +165,11 @@ class SoftwareFallbackRequest:
 
     ``reason`` is ``encode_failed`` when FFmpeg rejected the hardware encoder,
     or ``size_miss`` when that encoder finished outside the target band and
-    will not be retried. A declined ask sets
-    ``CompressionResult.software_fallback_required`` and does not change
-    encoders. CLI confirmation is ``--allow-software-fallback``.
+    will not be retried. An exact-size hardware file that finished under the
+    target is also ``size_miss``: padding it up to the exact byte count is
+    ask-gated. Declining that ask keeps the unpadded hardware file. A declined
+    ask sets ``CompressionResult.software_fallback_required`` and does not
+    change encoders. CLI confirmation is ``--allow-software-fallback``.
     """
 
     reason: SoftwareFallbackReason
@@ -1167,6 +1169,7 @@ class VideoCompressor:
         target_plan: Optional[TargetSizePlan],
         actual_size_bytes: Optional[int] = None,
         error_message: str = "",
+        allow_short_hardware_pad: bool = False,
     ) -> bool:
         """Ask before a target-size job replaces hardware with software.
 
@@ -1174,6 +1177,11 @@ class VideoCompressor:
         Returns False without changing encoders when there is nothing to ask,
         or when the callback declines. A decline records
         ``software_fallback_required`` on the job.
+
+        ``allow_short_hardware_pad`` is the exact-size path that would pad a
+        hardware file that finished under the target, including one already
+        inside the size band. That pad is ask-gated. In-band results that
+        would not be padded still skip the ask.
         """
 
         if job.software_fallback_settled:
@@ -1183,21 +1191,36 @@ class VideoCompressor:
         hw_encoder = job.encoder_name
         if not self._is_hardware_encoder(hw_encoder):
             return False
+        short_hardware_pad = bool(
+            allow_short_hardware_pad
+            and target_plan.mode == TargetSizeMode.EXACT
+            and actual_size_bytes is not None
+            and 0 < actual_size_bytes < target_plan.target_size_bytes
+        )
         if (
-            reason is SoftwareFallbackReason.SIZE_MISS
+            not short_hardware_pad
+            and reason is SoftwareFallbackReason.SIZE_MISS
             and actual_size_bytes is not None
             and is_within_target_size_tolerance(actual_size_bytes, target_plan)
         ):
             return False
 
         software_encoder = profile.video_codec.ffmpeg_encoder
+        actual_mb = (actual_size_bytes or 0) / 1_000_000
         if reason is SoftwareFallbackReason.ENCODE_FAILED:
             message = (
                 f"Hardware encoder {hw_encoder} failed for this target-size job. "
                 f"Confirm before retrying with {software_encoder}."
             )
+        elif short_hardware_pad:
+            message = (
+                f"Hardware encoder {hw_encoder} finished under the "
+                f"{target_plan.target_size_mb} MB target "
+                f"(finished at {actual_mb:.1f} MB). "
+                "Padding would make up the difference. "
+                f"Confirm before retrying with {software_encoder}."
+            )
         else:
-            actual_mb = (actual_size_bytes or 0) / 1_000_000
             message = (
                 f"Hardware encoder {hw_encoder} missed the {target_plan.target_size_mb} MB target "
                 f"(finished at {actual_mb:.1f} MB). "
@@ -1230,6 +1253,34 @@ class VideoCompressor:
         job.software_fallback_message = message
         logger.info("Software fallback not confirmed for %s: %s", job.input_file, message)
         return False
+
+    def _offer_exact_hardware_pad_fallback(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        target_plan: TargetSizePlan,
+        compressed_size: int,
+    ) -> bool:
+        """Ask before padding a short exact-size file from a hardware encoder.
+
+        Returns True only when the caller should retry on the software encoder.
+        A decline keeps the hardware bytes and sets the same flags as any other
+        size miss. Software encodes and files that are not short return False
+        without asking, so those files can still be padded.
+        """
+
+        if target_plan.mode != TargetSizeMode.EXACT:
+            return False
+        if compressed_size <= 0 or compressed_size >= target_plan.target_size_bytes:
+            return False
+        return self._offer_target_software_fallback(
+            job,
+            profile,
+            reason=SoftwareFallbackReason.SIZE_MISS,
+            target_plan=target_plan,
+            actual_size_bytes=compressed_size,
+            allow_short_hardware_pad=True,
+        )
 
     def _arm_software_target_retry(
         self,
@@ -2342,6 +2393,23 @@ class VideoCompressor:
             total_attempts = 0
             target_video_bitrate = target_plan.video_bitrate if target_plan else None
             target_search_state = TargetSizeSearchState() if target_plan else None
+
+            def _continue_on_software() -> None:
+                nonlocal target_plan, target_video_bitrate, target_search_state
+                nonlocal stage_attempt, target_floor_limited, retry_count
+                (
+                    target_plan,
+                    target_video_bitrate,
+                    target_search_state,
+                ) = self._arm_software_target_retry(
+                    optimized_profile,
+                    media_info,
+                    job,
+                )
+                stage_attempt = 0
+                target_floor_limited = False
+                retry_count = 0
+
             while True:
                 stage_attempt += 1
                 total_attempts += 1
@@ -2427,12 +2495,28 @@ class VideoCompressor:
                             and compressed_size <= target_plan.target_size_bytes
                         )
                         if exact_under_target and is_within_target_size_tolerance(compressed_size, target_plan):
+                            if self._offer_exact_hardware_pad_fallback(
+                                job,
+                                optimized_profile,
+                                target_plan,
+                                compressed_size,
+                            ):
+                                _continue_on_software()
+                                continue
                             break
                         if target_plan.mode != TargetSizeMode.EXACT and is_within_target_size_tolerance(compressed_size, target_plan):
                             break
 
                         if stage_attempt >= target_plan.max_attempts:
                             if exact_under_target:
+                                if self._offer_exact_hardware_pad_fallback(
+                                    job,
+                                    optimized_profile,
+                                    target_plan,
+                                    compressed_size,
+                                ):
+                                    _continue_on_software()
+                                    continue
                                 logger.info(
                                     "Exact target search for %s stopped after %s attempts because the file is already under target",
                                     job.input_file,
@@ -2496,6 +2580,14 @@ class VideoCompressor:
                         )
                         if next_bitrate == attempted_bitrate:
                             if exact_under_target:
+                                if self._offer_exact_hardware_pad_fallback(
+                                    job,
+                                    optimized_profile,
+                                    target_plan,
+                                    compressed_size,
+                                ):
+                                    _continue_on_software()
+                                    continue
                                 logger.info(
                                     "Exact target search for %s stopped because bitrate refinement converged under target",
                                     job.input_file,
@@ -2642,7 +2734,14 @@ class VideoCompressor:
             
             compressed_size = job.output_file.stat().st_size
             padding_bytes = 0
-            if target_plan and target_plan.mode == TargetSizeMode.EXACT and compressed_size <= target_plan.target_size_bytes:
+            # A declined pad-after-HW ask keeps the hardware file. Padding it
+            # would report an exact hit the encode did not produce.
+            if (
+                target_plan
+                and target_plan.mode == TargetSizeMode.EXACT
+                and compressed_size <= target_plan.target_size_bytes
+                and not job.software_fallback_required
+            ):
                 padding_bytes = self._pad_output_to_target_size(job.output_file, target_plan.target_size_bytes)
                 compressed_size = job.output_file.stat().st_size
             encoding_time = time.time() - start_time
@@ -2657,6 +2756,15 @@ class VideoCompressor:
                     )
                     if exact_changes:
                         result_note += f" Adjustments: {exact_changes}."
+                elif (
+                    job.software_fallback_required
+                    and target_plan.mode == TargetSizeMode.EXACT
+                    and compressed_size < target_plan.target_size_bytes
+                ):
+                    result_note = (
+                        f"Exact target kept the hardware file at {actual_size_mb:.1f} MB "
+                        f"after {job.attempt_count} attempt(s) without padding."
+                    )
                 elif is_within_target_size_tolerance(compressed_size, target_plan):
                     result_note = (
                         f"Target mode {target_plan.mode.value} hit {actual_size_mb:.1f} MB "

@@ -28,7 +28,7 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 - Intel Quick Sync Video (QSV)
 - AMD AMF (H.264, HEVC — including RX 9070 XT)
 - Software libx264 when Quick Lite has no matching hardware encoder
-- Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band or fails, SquishIt does not switch to software until the caller confirms. The main window asks with a Yes/No dialog; No or dismissing it keeps the hardware result and shows that on the result card. The CLI confirms with `--allow-software-fallback`. Quick Compress presets are not target-size jobs, so they do not ask. Leaving the callback unset also keeps the hardware result.
+- Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band, fails, or finishes under an exact target where padding would apply, SquishIt does not switch to software until the caller confirms. Padding that short hardware file is ask-gated: the main window asks with the same Yes/No dialog; No or dismissing it keeps the unpadded hardware result and shows that on the result card. The CLI confirms with `--allow-software-fallback`. Quick Compress presets are not target-size jobs, so they do not ask. Leaving the callback unset also keeps the hardware result.
 
 ### Compression Profiles
 | Profile | Description | Use Case |
@@ -136,7 +136,7 @@ python cli.py --hardware
 | `-r, --resolution` | Max resolution (4k/1440p/1080p/720p/480p) |
 | `-f, --fps` | Target frame rate |
 | `--no-hw-accel` | Disable hardware acceleration |
-| `--allow-software-fallback` | Target-size only: confirm a software retry after hardware misses the size or fails. Omitted, the hardware result stays |
+| `--allow-software-fallback` | Target-size only: confirm a software retry after hardware misses the size, fails, or would need padding to hit an exact target. Omitted, the unpadded hardware result stays |
 | `-o, --output` | Output directory |
 
 ---

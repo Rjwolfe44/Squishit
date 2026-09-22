@@ -1063,8 +1063,10 @@ class SettingsPanel(ctk.CTkFrame):
             self._hw_hint.configure(
                 text=(
                     "Exact target tries a hardware encoder first when one is available. "
-                    "If that encode misses the size or fails, SquishIt asks before a "
-                    "software retry. It may still lower audio, FPS, or resolution, then pad the file."
+                    "If that encode misses the size, fails, or is short enough that "
+                    "padding would hit the exact target, SquishIt asks before a "
+                    "software retry. No keeps the hardware file and does not pad it. "
+                    "A software retry may still lower audio, FPS, or resolution, then pad."
                 )
             )
             return
