@@ -217,7 +217,7 @@ class CompressionProfile:
     def from_dict(cls, data: Dict[str, Any]) -> 'CompressionProfile':
         """Create profile from dictionary."""
         video_codec = normalize_profile_video_codec(data.get("video_codec", "hevc"))
-        audio_codec = AudioCodec(data.get("audio_codec", "aac"))
+        audio_codec = AudioCodec(data.get("audio_codec", AudioCodec.OPUS.value))
         return cls(
             name=data["name"],
             profile_type=ProfileType(data.get("profile_type", "custom")),
@@ -227,7 +227,7 @@ class CompressionProfile:
             preset=normalize_profile_preset(data.get("preset", "medium")),
             video_bitrate=data.get("video_bitrate"),
             audio_codec=audio_codec,
-            audio_bitrate=data.get("audio_bitrate", 192_000),
+            audio_bitrate=data.get("audio_bitrate", 128_000),
             output_mode=data.get("output_mode", "video"),
             max_resolution=data.get("max_resolution"),
             resolution_scale=data.get("resolution_scale", 1.0),
@@ -366,6 +366,42 @@ class ProfileManager:
             use_hw_accel=False,
             image_quality=90,
         ),
+        CompressionProfile(
+            name="YouTube Upload",
+            profile_type=ProfileType.CUSTOM,
+            description="Optimized for YouTube/Social Media - maximum compatibility",
+            video_codec=VideoCodec.H264,
+            crf=23,
+            preset="fast",
+            audio_codec=AudioCodec.AAC,
+            audio_bitrate=128_000,
+            video_container="mp4",
+            use_hw_accel=True,
+        ),
+        CompressionProfile(
+            name="Mobile",
+            profile_type=ProfileType.CUSTOM,
+            description="Smaller files for mobile viewing",
+            video_codec=VideoCodec.HEVC,
+            crf=26,
+            preset="fast",
+            audio_codec=AudioCodec.AAC,
+            audio_bitrate=128_000,
+            video_container="mp4",
+            use_hw_accel=True,
+        ),
+        CompressionProfile(
+            name="Streaming",
+            profile_type=ProfileType.CUSTOM,
+            description="Fast encoding for live streaming",
+            video_codec=VideoCodec.HEVC,
+            crf=24,
+            preset="veryfast",
+            audio_codec=AudioCodec.AAC,
+            audio_bitrate=128_000,
+            video_container="mp4",
+            use_hw_accel=True,
+        ),
     ]
     
     def __init__(self, config_dir: Optional[Path] = None):
@@ -450,7 +486,9 @@ class ProfileManager:
         if not profile:
             return False
         
-        # Don't delete default profiles
+        # Built-ins stay available even when their type is custom (YouTube, Mobile, Streaming).
+        if profile.created_by == "system":
+            return False
         if profile.profile_type in [ProfileType.FAST, ProfileType.BALANCED, ProfileType.MAX]:
             return False
         

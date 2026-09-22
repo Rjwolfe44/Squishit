@@ -300,6 +300,7 @@ def get_video_extension(codec: str, container: Optional[str] = None) -> str:
     # AV1 and HEVC work best in MKV or MP4
     extension_map = {
         "av1": "mkv",
+        "svt-av1": "mkv",
         "hevc": "mp4",
         "h265": "mp4",
         "h264": "mp4",

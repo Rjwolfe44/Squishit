@@ -1217,10 +1217,10 @@ class VideoCompressor:
         job.threads_used = codec_settings.threads or 0
 
         if not codec_settings.disable_audio:
-            if profile.video_container == "webm" and codec_settings.audio_codec != AudioCodec.OPUS:
-                codec_settings.audio_codec = AudioCodec.OPUS
-            elif profile.video_container == "avi" and codec_settings.audio_codec == AudioCodec.OPUS:
-                codec_settings.audio_codec = AudioCodec.MP3
+            codec_settings.audio_codec = self.codec_manager.coerce_audio_codec(
+                codec_settings.audio_codec,
+                profile.video_container,
+            )
 
         effective_target_plan = target_plan
         if effective_target_plan is None and isinstance(video_info, VideoInfo):

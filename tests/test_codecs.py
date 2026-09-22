@@ -4,13 +4,16 @@ from video_compressor.core.codecs import (
     AudioCodec,
     CodecManager,
     CodecSettings,
+    CONTAINER_AUDIO_MATRIX,
+    CONTAINER_VIDEO_MATRIX,
     ENCODER_REGISTRY,
     RateControl,
     VideoCodec,
     VideoContainer,
 )
+from video_compressor.core.utils import get_video_extension
 from video_compressor.core.compressor import CompressionJob, VideoCompressor, VideoInfo
-from video_compressor.core.profiles import CompressionProfile, ProfileType
+from video_compressor.core.profiles import CompressionProfile, ProfileManager, ProfileType
 
 
 def test_container_compatibility_matrix_matches_expected_pairs():
@@ -21,6 +24,46 @@ def test_container_compatibility_matrix_matches_expected_pairs():
     assert manager.is_video_container_supported(VideoCodec.VP9, VideoContainer.WEBM)
     assert not manager.is_video_container_supported(VideoCodec.VP9, VideoContainer.AVI)
     assert not manager.is_video_container_supported(VideoCodec.HEVC, VideoContainer.WEBM)
+
+
+@pytest.mark.parametrize("container", list(VideoContainer))
+def test_every_codec_container_pair_matches_the_matrix(container):
+    manager = CodecManager()
+    allowed = CONTAINER_VIDEO_MATRIX[container]
+
+    for codec in VideoCodec:
+        assert manager.is_video_container_supported(codec, container) is (codec in allowed)
+        assert manager.is_video_container_supported(codec, container.value) is (codec in allowed)
+
+
+def test_incompatible_container_falls_back_to_the_codec_default():
+    manager = CodecManager()
+
+    assert manager.get_compatible_container(VideoCodec.HEVC, "avi") == VideoContainer.MP4
+    assert manager.get_compatible_container(VideoCodec.SVT_AV1, "mov") == VideoContainer.MKV
+    assert manager.get_compatible_container(VideoCodec.AV1, "avi") == VideoContainer.MKV
+    assert manager.get_compatible_container(VideoCodec.VP9, "mp4") == VideoContainer.WEBM
+    assert manager.get_compatible_container(VideoCodec.H264, "not-a-container") == VideoContainer.MP4
+
+
+def test_audio_codec_is_coerced_when_the_container_rejects_it():
+    manager = CodecManager()
+
+    assert manager.coerce_audio_codec(AudioCodec.AAC, "webm") is AudioCodec.OPUS
+    assert manager.coerce_audio_codec(AudioCodec.OPUS, "avi") is AudioCodec.MP3
+    assert manager.coerce_audio_codec(AudioCodec.OPUS, "mov") is AudioCodec.AAC
+    assert manager.coerce_audio_codec(AudioCodec.OPUS, "mkv") is AudioCodec.OPUS
+    assert manager.coerce_audio_codec(AudioCodec.FLAC, "mp4") is AudioCodec.FLAC
+    assert AudioCodec.AAC not in CONTAINER_AUDIO_MATRIX[VideoContainer.WEBM]
+    assert AudioCodec.OPUS not in CONTAINER_AUDIO_MATRIX[VideoContainer.AVI]
+
+
+def test_extension_helper_follows_codec_defaults_and_explicit_containers():
+    assert get_video_extension("svt-av1") == "mkv"
+    assert get_video_extension("av1") == "mkv"
+    assert get_video_extension("vp9") == "webm"
+    assert get_video_extension("hevc", "mkv") == "mkv"
+    assert get_video_extension("h264", "avi") == "avi"
 
 
 def test_default_container_falls_back_to_codec_safe_option():
@@ -88,6 +131,90 @@ def test_bitrate_driven_codec_settings_emit_bitrate_args_for_all_encoders(encode
     assert "-b:v" in args
     if preferred in {RateControl.CBR, RateControl.VBR}:
         assert args[args.index("-b:v") + 1] in {"600000", "600k"}
+
+
+def test_command_builder_rewrites_audio_the_container_cannot_mux(monkeypatch, tmp_path):
+    monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
+    monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
+
+    compressor = VideoCompressor()
+    profile = CompressionProfile(
+        name="AVI Opus",
+        profile_type=ProfileType.CUSTOM,
+        video_codec=VideoCodec.H264,
+        audio_codec=AudioCodec.OPUS,
+        audio_bitrate=96_000,
+        video_container="avi",
+        use_hw_accel=False,
+    )
+    input_file = tmp_path / "input.mp4"
+    input_file.write_bytes(b"0")
+    job = CompressionJob(
+        id="job-audio",
+        input_file=input_file,
+        output_file=tmp_path / "output.avi",
+        profile=profile,
+        parallel_jobs=1,
+    )
+    job.video_info = VideoInfo(
+        filepath=input_file,
+        duration=10.0,
+        size=5_000_000,
+        width=1280,
+        height=720,
+        fps=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        video_bitrate=2_000_000,
+        audio_bitrate=128_000,
+        total_bitrate=2_128_000,
+        frame_count=300,
+    )
+
+    cmd = compressor._build_video_ffmpeg_command(job, profile)
+
+    assert "libmp3lame" in cmd
+    assert "libopus" not in cmd
+
+
+def test_max_profile_command_uses_svt_av1_numeric_preset(monkeypatch, tmp_path):
+    monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
+    monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
+
+    compressor = VideoCompressor()
+    profile = ProfileManager(config_dir=tmp_path).get_profile("Max / Archival")
+    input_file = tmp_path / "input.mp4"
+    input_file.write_bytes(b"0")
+    job = CompressionJob(
+        id="job-max",
+        input_file=input_file,
+        output_file=tmp_path / "output.mkv",
+        profile=profile,
+        parallel_jobs=1,
+    )
+    job.video_info = VideoInfo(
+        filepath=input_file,
+        duration=10.0,
+        size=5_000_000,
+        width=1920,
+        height=1080,
+        fps=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        video_bitrate=3_000_000,
+        audio_bitrate=128_000,
+        total_bitrate=3_128_000,
+        frame_count=300,
+    )
+
+    cmd = compressor._build_video_ffmpeg_command(job, profile)
+
+    assert "libsvtav1" in cmd
+    assert cmd[cmd.index("-preset") + 1] == "6"
+    assert cmd[cmd.index("-crf") + 1] == "35"
+    assert "libopus" in cmd
 
 
 def test_libx265_command_clamps_threads_and_avoids_duplicate_thread_flags(monkeypatch, tmp_path):

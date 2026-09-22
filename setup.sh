@@ -91,7 +91,7 @@ echo "To run the application:"
 echo "  1. Activate the virtual environment:"
 echo "     source venv/bin/activate"
 echo "  2. Run the app:"
-echo "     python -m squishit"
+echo "     python -m video_compressor"
 echo ""
 echo "Or use the provided run.sh script."
 echo ""
@@ -100,7 +100,7 @@ echo ""
 read -p "Start SquishIt now? (Y/n): " START_APP
 if [[ ! "$START_APP" =~ ^[Nn]$ ]]; then
     echo "[INFO] Starting SquishIt..."
-    python -m squishit
+    python -m video_compressor
 fi
 
 deactivate

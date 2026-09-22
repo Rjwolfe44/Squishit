@@ -134,7 +134,7 @@ class AppConfig:
     def from_dict(cls, data: dict) -> 'AppConfig':
         """Create from dictionary."""
         return cls(
-            default_output_dir=Path(data.get("default_output_dir", Path.home() / "Videos" / "Compressed")),
+            default_output_dir=Path(data.get("default_output_dir", Path.home() / "Videos" / "SquishIt")),
             default_profile=data.get("default_profile", "Balanced"),
             output_suffix=data.get("output_suffix", "_compressed"),
             default_video_container=data.get("default_video_container", "mp4"),

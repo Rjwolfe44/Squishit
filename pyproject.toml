@@ -75,6 +75,9 @@ video-compressor-cli = "cli:main"
 squishit-gui = "video_compressor.gui.main_window:run_app"
 video-compressor-gui = "video_compressor.gui.main_window:run_app"
 
+[tool.setuptools]
+py-modules = ["cli"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["video_compressor*"]
@@ -99,3 +102,4 @@ target-version = "py310"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

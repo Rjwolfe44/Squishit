@@ -375,6 +375,15 @@ CONTAINER_AUDIO_MATRIX: Dict[VideoContainer, Set[AudioCodec]] = {
     VideoContainer.AVI: {AudioCodec.MP3, AudioCodec.PCM_S16LE, AudioCodec.PCM_S24LE, AudioCodec.PCM_F32LE, AudioCodec.AC3},
 }
 
+# Stable fallbacks when a profile's audio codec cannot live in the chosen container.
+AUDIO_CONTAINER_FALLBACKS: Dict[VideoContainer, Tuple[AudioCodec, ...]] = {
+    VideoContainer.MP4: (AudioCodec.AAC, AudioCodec.OPUS, AudioCodec.MP3),
+    VideoContainer.MKV: (AudioCodec.OPUS, AudioCodec.AAC),
+    VideoContainer.WEBM: (AudioCodec.OPUS, AudioCodec.VORBIS),
+    VideoContainer.MOV: (AudioCodec.AAC, AudioCodec.ALAC, AudioCodec.AC3),
+    VideoContainer.AVI: (AudioCodec.MP3, AudioCodec.AC3, AudioCodec.PCM_S16LE),
+}
+
 
 # ---------------------------------------------------------------------------
 # CodecSettings
@@ -928,6 +937,17 @@ class CodecManager:
             except ValueError:
                 pass
         return self.get_default_container(codec)
+
+    def coerce_audio_codec(self, audio_codec: AudioCodec, container) -> AudioCodec:
+        """Return an audio codec the container can actually mux."""
+        normalized = self.normalize_container(container)
+        supported = CONTAINER_AUDIO_MATRIX.get(normalized, set())
+        if audio_codec in supported:
+            return audio_codec
+        for candidate in AUDIO_CONTAINER_FALLBACKS.get(normalized, ()):
+            if candidate in supported:
+                return candidate
+        return next(iter(supported), audio_codec)
 
     def get_compatible_audio_codecs(self, container) -> List[AudioCodec]:
         """Return audio codecs supported by a given container."""

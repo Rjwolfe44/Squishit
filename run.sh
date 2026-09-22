@@ -13,6 +13,6 @@ fi
 source venv/bin/activate
 
 # Start the application
-python -m squishit "$@"
+python -m video_compressor "$@"
 
 deactivate

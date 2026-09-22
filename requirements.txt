@@ -26,6 +26,7 @@ rich>=13.7.0
 
 # Windows toast notifications
 winotify>=1.1.0; platform_system == "Windows"
+pytest>=7.0.0
 pytest-mock>=3.14.0
 
 # Dev/build tooling
