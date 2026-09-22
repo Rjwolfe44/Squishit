@@ -792,3 +792,247 @@ def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
         "4",
         str(hevc_out),
     ]
+
+
+_SOFTWARE_ENCODERS = {
+    "libx264",
+    "libx265",
+    "libsvtav1",
+    "aac",
+    "libopus",
+}
+
+
+def _ladder_compressor(monkeypatch, *, gpus, preferred_hw, encoders):
+    """Compressor whose encoder list and GPUs are fixed for argv checks."""
+
+    monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
+    monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
+    monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
+    monkeypatch.setattr(VideoCompressor, "_get_thread_count", lambda *args, **kwargs: 4)
+
+    compressor = VideoCompressor()
+    compressor.codec_manager._available_encoders = set(encoders)
+    compressor.hw_detector._info = HardwareInfo(
+        os_name="Linux",
+        os_version="test",
+        cpu_name="cpu",
+        cpu_cores=4,
+        cpu_threads=8,
+        total_ram_gb=16,
+        preferred_hw_encoder=preferred_hw,
+        gpus=gpus,
+        recommended_threads=4,
+    )
+    return compressor
+
+
+def _compress_argv(compressor, profile, source, output):
+    """Run compress() with FFmpeg stubbed and return the argv it would execute."""
+
+    captured = []
+
+    def fake_run(cmd, *, job, job_id, media_info, start_time, **kwargs):
+        captured.append(list(cmd))
+        job.output_file.parent.mkdir(parents=True, exist_ok=True)
+        job.output_file.write_bytes(b"encoded")
+        return 0, []
+
+    compressor._run_ffmpeg_process = fake_run
+    compressor.analyze_media = lambda path: _sample_video_info(path)
+    result = compressor.compress(source, output, profile, job_id=output.stem)
+    assert result.success, result.error_message or result.note
+    assert result.attempt_count == 1
+    assert len(captured) == 1
+    return captured[0], result
+
+
+def _encoder(cmd):
+    return cmd[cmd.index("-c:v") + 1]
+
+
+def _flag(cmd, name):
+    return cmd[cmd.index(name) + 1]
+
+
+def test_compress_keeps_quick_lite_h264_and_distinct_maxes(monkeypatch, tmp_path):
+    """Quick Lite stays H.264, and the two Max lanes do not share one argv.
+
+    No GPU is advertised, so hardware-on profiles fall through to software.
+    Archival stays on SVT-AV1 with hardware off.
+    """
+
+    compressor = _ladder_compressor(
+        monkeypatch,
+        gpus=[],
+        preferred_hw=None,
+        encoders=_SOFTWARE_ENCODERS,
+    )
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profiles = build_quick_compress_profiles()
+    archival = ProfileManager(config_dir=tmp_path / "profiles").get_profile(
+        ARCHIVAL_PROFILE_NAME
+    )
+
+    lite_out = tmp_path / "lite.mp4"
+    hevc_out = tmp_path / "hevc-max.mkv"
+    archival_out = tmp_path / "archival.mkv"
+    lite_cmd, lite_result = _compress_argv(
+        compressor, profiles["Quick Lite"], source, lite_out
+    )
+    hevc_cmd, hevc_result = _compress_argv(
+        compressor, profiles["HEVC Max"], source, hevc_out
+    )
+    archival_cmd, archival_result = _compress_argv(
+        compressor, archival, source, archival_out
+    )
+
+    assert lite_result.video_codec == "h264"
+    assert lite_result.encoder_name == "libx264"
+    assert _encoder(lite_cmd) == "libx264"
+    assert "libx265" not in lite_cmd
+    assert "hevc" not in " ".join(lite_cmd)
+    assert lite_cmd == [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(source),
+        "-c:v",
+        "libx264",
+        "-crf",
+        "26",
+        "-preset",
+        "fast",
+        "-threads",
+        "4",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128000",
+        "-movflags",
+        "+faststart",
+        str(lite_out),
+    ]
+
+    assert hevc_result.video_codec == "hevc"
+    assert hevc_result.encoder_name == "libx265"
+    assert hevc_cmd == [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(source),
+        "-c:v",
+        "libx265",
+        "-crf",
+        "30",
+        "-preset",
+        "slow",
+        "-threads",
+        "4",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96000",
+        str(hevc_out),
+    ]
+
+    assert archival_result.video_codec == "svt-av1"
+    assert archival_result.encoder_name == "libsvtav1"
+    assert archival.use_hw_accel is False
+    assert archival_cmd == [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-i",
+        str(source),
+        "-c:v",
+        "libsvtav1",
+        "-crf",
+        "35",
+        "-preset",
+        "6",
+        "-svtav1-params",
+        "lp=4",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96000",
+        "-threads",
+        "4",
+        str(archival_out),
+    ]
+    assert not any(
+        token in " ".join(archival_cmd)
+        for token in ("nvenc", "qsv", "amf", "videotoolbox")
+    )
+    assert hevc_cmd != archival_cmd
+    assert _encoder(hevc_cmd) != _encoder(archival_cmd)
+    assert (_flag(hevc_cmd, "-crf"), _flag(hevc_cmd, "-preset")) != (
+        _flag(archival_cmd, "-crf"),
+        _flag(archival_cmd, "-preset"),
+    )
+
+
+def test_compress_hardware_keeps_lite_on_h264_and_maxes_apart(monkeypatch, tmp_path):
+    """With NVENC available, Quick Lite still is not HEVC, and Archival stays software."""
+
+    compressor = _ladder_compressor(
+        monkeypatch,
+        gpus=[
+            GPUInfo(
+                "NVIDIA",
+                GPUVendor.NVIDIA,
+                encoder_support={"h264": True, "hevc": True},
+            )
+        ],
+        preferred_hw="nvidia",
+        encoders=_SOFTWARE_ENCODERS | {"h264_nvenc", "hevc_nvenc"},
+    )
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profiles = build_quick_compress_profiles()
+    archival = ProfileManager(config_dir=tmp_path / "profiles").get_profile(
+        ARCHIVAL_PROFILE_NAME
+    )
+
+    lite_cmd, lite_result = _compress_argv(
+        compressor, profiles["Quick Lite"], source, tmp_path / "lite.mp4"
+    )
+    hevc_cmd, hevc_result = _compress_argv(
+        compressor, profiles["HEVC Max"], source, tmp_path / "hevc-max.mkv"
+    )
+    archival_cmd, archival_result = _compress_argv(
+        compressor, archival, source, tmp_path / "archival.mkv"
+    )
+
+    assert lite_result.encoder_name == "h264_nvenc"
+    assert _encoder(lite_cmd) == "h264_nvenc"
+    assert "libx265" not in lite_cmd
+    assert "hevc_nvenc" not in lite_cmd
+    assert _flag(lite_cmd, "-preset") == "p3"
+    assert _flag(lite_cmd, "-cq") == "26"
+
+    assert hevc_result.encoder_name == "hevc_nvenc"
+    assert _encoder(hevc_cmd) == "hevc_nvenc"
+    assert _flag(hevc_cmd, "-preset") == "p7"
+    assert _flag(hevc_cmd, "-cq") == "30"
+
+    assert archival_result.encoder_name == "libsvtav1"
+    assert _encoder(archival_cmd) == "libsvtav1"
+    assert _flag(archival_cmd, "-crf") == "35"
+    assert _flag(archival_cmd, "-preset") == "6"
+    assert not any(
+        token in " ".join(archival_cmd)
+        for token in ("nvenc", "qsv", "amf", "videotoolbox")
+    )
+    assert hevc_cmd != archival_cmd
+    assert lite_cmd != hevc_cmd

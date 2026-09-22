@@ -139,7 +139,7 @@ python cli.py --hardware
 
 ## Dev Tooling
 
-GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI. CI installs FFmpeg, then runs the unit tests and a separate `smoke` step (`pytest -m smoke`). That smoke test encodes about one second of generated video with `libx264` and checks that FFmpeg exits 0 and writes a non-empty MP4. Locally it skips when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
+GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI. CI installs FFmpeg, then runs the unit tests and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, and that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC). Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
 
 All dev commands go through `dev.bat`:
 
@@ -206,7 +206,7 @@ tests/                      # Test suite (pytest; no display required)
 ├── test_codecs.py
 ├── test_config.py
 ├── test_eta.py
-├── test_ffmpeg_smoke.py    # Real short libx264 encode (marker: smoke)
+├── test_ffmpeg_smoke.py    # Real FFmpeg and VideoCompressor encodes (marker: smoke)
 ├── test_profiles.py
 └── test_target_size.py
 ```
