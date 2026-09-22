@@ -187,9 +187,9 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
         QualityRung.MAX: _step(
             VideoCodec.SVT_AV1,
             QualityRung.MAX,
-            38,
+            36,
             "6",
-            "Max / Archival: best SVT-AV1 compression (CRF 38, preset 6). "
+            "Max / Archival: best SVT-AV1 compression (CRF 36, preset 6). "
             "Hardware stays off. Not Quick Compress Max (HEVC).",
             force_software=True,
         ),

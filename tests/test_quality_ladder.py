@@ -89,7 +89,7 @@ EXPECTED_SOFTWARE_ARGS = {
         "-c:v",
         "libsvtav1",
         "-crf",
-        "38",
+        "36",
         "-preset",
         "6",
         "-pix_fmt",
@@ -293,8 +293,8 @@ def test_archival_max_is_svt_av1_with_hardware_off():
     )
 
     assert quick.crf < balanced.crf < step.crf
-    assert step.crf == 38
-    assert "CRF 38" in step.hint
+    assert step.crf == 36
+    assert "CRF 36" in step.hint
     assert step.preset == "6"
     assert step.force_software is True
     assert step.allow_hw_accel is False
@@ -582,7 +582,7 @@ def test_x264_preset_names_do_not_replace_numeric_av1_presets():
     )
 
     assert svt_named.preset == "6"
-    assert svt_named.crf == 38
+    assert svt_named.crf == 36
     assert svt_named.force_software is True
     assert svt_slow.preset == "6"
     assert svt_numeric.preset == "4"
@@ -610,7 +610,7 @@ def test_quick_max_switch_keeps_archival_hardware_off(tmp_path):
     assert hevc_choice.force_software is False
     assert archival.use_hw_accel is False
     assert archival.video_codec is VideoCodec.SVT_AV1
-    assert archival_choice.crf == 38
+    assert archival_choice.crf == 36
     assert archival_choice.preset == "6"
     assert archival_choice.force_software is True
 
@@ -768,7 +768,7 @@ def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
         "-c:v",
         "libsvtav1",
         "-crf",
-        "38",
+        "36",
         "-preset",
         "6",
         "-svtav1-params",
@@ -986,7 +986,7 @@ def test_compress_keeps_quick_lite_h264_and_distinct_maxes(monkeypatch, tmp_path
         "-c:v",
         "libsvtav1",
         "-crf",
-        "38",
+        "36",
         "-preset",
         "6",
         "-svtav1-params",
@@ -1058,7 +1058,7 @@ def test_compress_hardware_keeps_lite_on_h264_and_maxes_apart(monkeypatch, tmp_p
 
     assert archival_result.encoder_name == "libsvtav1"
     assert _encoder(archival_cmd) == "libsvtav1"
-    assert _flag(archival_cmd, "-crf") == "38"
+    assert _flag(archival_cmd, "-crf") == "36"
     assert _flag(archival_cmd, "-preset") == "6"
     assert not any(
         token in " ".join(archival_cmd)
