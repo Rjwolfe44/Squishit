@@ -7,7 +7,7 @@ name = "squishit"
 version = "2.0.0"
 description = "Power-user desktop media compression with modern codecs, containers, and Windows integration"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "PolyForm-Noncommercial-1.0.0"}
 requires-python = ">=3.10"
 authors = [
     {name = "Vlad"}
@@ -28,7 +28,7 @@ classifiers = [
     "Environment :: Win32 (MS Windows)",
     "Environment :: MacOS X",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

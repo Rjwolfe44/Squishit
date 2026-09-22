@@ -242,7 +242,11 @@ Development setup and pull requests: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[MIT License](LICENSE). Copyright (c) 2026 Rjwolfe44.
+SquishIt is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). Copyright (c) 2026 Rjwolfe44.
+
+You may view this source and use, copy, and modify it for personal and other noncommercial purposes, including noncommercial distribution of those changes. Commercial rights are reserved exclusively to the copyright holder, Rjwolfe44. That includes selling or sublicensing SquishIt, hosting it as a paid or commercial service, and selling or commercially distributing derivatives, rebranded builds, or competing products and services based on this code.
+
+FFmpeg, which SquishIt uses to encode media, remains under its own LGPL/GPL terms. Those terms apply to FFmpeg only and are separate from the license for this repository.
 
 ---
 
