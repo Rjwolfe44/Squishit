@@ -638,6 +638,33 @@ def test_hevc_missing_fallback_retargets_crf_and_preset():
     )
 
 
+def test_preferred_hw_vendor_follows_nvenc_then_qsv_then_amf():
+    """Detector order is NVIDIA, AMD, Intel. Preference is not that order."""
+
+    detector_cls = __import__(
+        "video_compressor.core.hardware", fromlist=["HardwareDetector"]
+    ).HardwareDetector
+    detector = detector_cls()
+    has_hw, vendor = detector._check_hw_encoders(
+        [
+            GPUInfo("AMD", GPUVendor.AMD, encoder_support={"h264": True, "hevc": True}),
+            GPUInfo("Intel", GPUVendor.INTEL, encoder_support={"h264": True, "hevc": True}),
+        ]
+    )
+
+    assert has_hw is True
+    assert vendor == "intel"
+
+    has_hw, vendor = detector._check_hw_encoders(
+        [
+            GPUInfo("AMD", GPUVendor.AMD, encoder_support={"h264": True, "hevc": True}),
+            GPUInfo("Intel", GPUVendor.INTEL, encoder_support={"h264": True, "hevc": True}),
+            GPUInfo("NVIDIA", GPUVendor.NVIDIA, encoder_support={"h264": True, "hevc": True}),
+        ]
+    )
+    assert vendor == "nvidia"
+
+
 def test_select_hw_encoder_prefers_nvenc_then_qsv_then_amf(monkeypatch):
     monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
     monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
@@ -1036,3 +1063,106 @@ def test_compress_hardware_keeps_lite_on_h264_and_maxes_apart(monkeypatch, tmp_p
     )
     assert hevc_cmd != archival_cmd
     assert lite_cmd != hevc_cmd
+
+
+def _support(gpu, codec_key, enabled):
+    gpu.encoder_support[codec_key] = enabled
+
+
+def test_compress_argv_follows_nvenc_then_qsv_then_amf(monkeypatch, tmp_path):
+    """Vendor choice is NVENC, then QSV, then AMF, even if detection preferred AMD.
+
+    Quick Lite stays on the H.264 encoder for that vendor. Quick Max stays on
+    the HEVC encoder. Max / Archival stays on libsvtav1 with hardware off.
+    """
+
+    gpus = [
+        GPUInfo("AMD", GPUVendor.AMD, encoder_support={"h264": True, "hevc": True}),
+        GPUInfo("Intel", GPUVendor.INTEL, encoder_support={"h264": True, "hevc": True}),
+        GPUInfo("NVIDIA", GPUVendor.NVIDIA, encoder_support={"h264": True, "hevc": True}),
+    ]
+    compressor = _ladder_compressor(
+        monkeypatch,
+        gpus=gpus,
+        preferred_hw="amd",
+        encoders=_SOFTWARE_ENCODERS
+        | {
+            "h264_nvenc",
+            "h264_qsv",
+            "h264_amf",
+            "hevc_nvenc",
+            "hevc_qsv",
+            "hevc_amf",
+        },
+    )
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profiles = build_quick_compress_profiles()
+    archival = ProfileManager(config_dir=tmp_path / "profiles").get_profile(
+        ARCHIVAL_PROFILE_NAME
+    )
+
+    def encode(profile, name):
+        cmd, result = _compress_argv(compressor, profile, source, tmp_path / name)
+        return cmd, result
+
+    lite_cmd, _lite = encode(profiles["Quick Lite"], "lite-nv.mp4")
+    hevc_cmd, _hevc = encode(profiles["HEVC Max"], "hevc-nv.mkv")
+    archival_cmd, archival_result = encode(archival, "archival-nv.mkv")
+
+    assert _encoder(lite_cmd) == "h264_nvenc"
+    assert _flag(lite_cmd, "-preset") == "p3"
+    assert _flag(lite_cmd, "-cq") == "26"
+    assert _encoder(hevc_cmd) == "hevc_nvenc"
+    assert _flag(hevc_cmd, "-preset") == "p7"
+    assert _flag(hevc_cmd, "-cq") == "30"
+    assert archival_result.encoder_name == "libsvtav1"
+    assert _encoder(archival_cmd) == "libsvtav1"
+    assert not any(
+        token in " ".join(archival_cmd) for token in ("nvenc", "qsv", "amf", "videotoolbox")
+    )
+
+    for gpu in gpus:
+        if gpu.vendor is GPUVendor.NVIDIA:
+            _support(gpu, "h264", False)
+            _support(gpu, "hevc", False)
+
+    lite_cmd, _lite = encode(profiles["Quick Lite"], "lite-qsv.mp4")
+    hevc_cmd, _hevc = encode(profiles["HEVC Max"], "hevc-qsv.mkv")
+    assert _encoder(lite_cmd) == "h264_qsv"
+    assert _flag(lite_cmd, "-preset") == "veryfast"
+    assert _flag(lite_cmd, "-global_quality") == "26"
+    assert _encoder(hevc_cmd) == "hevc_qsv"
+    assert _flag(hevc_cmd, "-preset") == "slow"
+    assert _flag(hevc_cmd, "-global_quality") == "30"
+    assert _encoder(encode(archival, "archival-qsv.mkv")[0]) == "libsvtav1"
+
+    for gpu in gpus:
+        if gpu.vendor is GPUVendor.INTEL:
+            _support(gpu, "h264", False)
+            _support(gpu, "hevc", False)
+
+    lite_cmd, _lite = encode(profiles["Quick Lite"], "lite-amf.mp4")
+    hevc_cmd, _hevc = encode(profiles["HEVC Max"], "hevc-amf.mkv")
+    assert _encoder(lite_cmd) == "h264_amf"
+    assert _flag(lite_cmd, "-quality") == "speed"
+    assert _encoder(hevc_cmd) == "hevc_amf"
+    assert _flag(hevc_cmd, "-quality") == "quality"
+    assert _encoder(encode(archival, "archival-amf.mkv")[0]) == "libsvtav1"
+
+    for gpu in gpus:
+        if gpu.vendor is GPUVendor.AMD:
+            _support(gpu, "h264", False)
+            _support(gpu, "hevc", False)
+
+    lite_cmd, lite_result = encode(profiles["Quick Lite"], "lite-sw.mp4")
+    hevc_cmd, hevc_result = encode(profiles["HEVC Max"], "hevc-sw.mkv")
+    archival_cmd, archival_result = encode(archival, "archival-sw.mkv")
+    assert lite_result.encoder_name == "libx264"
+    assert _encoder(lite_cmd) == "libx264"
+    assert _flag(lite_cmd, "-preset") == "fast"
+    assert hevc_result.encoder_name == "libx265"
+    assert _encoder(hevc_cmd) == "libx265"
+    assert _flag(hevc_cmd, "-preset") == "slow"
+    assert archival_result.encoder_name == "libsvtav1"
+    assert _encoder(archival_cmd) == "libsvtav1"

@@ -172,7 +172,11 @@ Examples:
         type=str,
         choices=['auto', 'fast', 'balanced', 'strict', 'exact'],
         default=None,
-        help='How target-size mode should chase the requested MB; exact will force software, degrade aggressively, and pad when needed'
+        help=(
+            'How target-size mode should chase the requested MB. '
+            'Exact tries hardware first, then may lower audio, frame rate, and resolution, and pads when under target. '
+            'A software retry requires --allow-software-fallback'
+        )
     )
 
     parser.add_argument(
@@ -210,6 +214,16 @@ Examples:
         '--no-hw-accel',
         action='store_true',
         help='Disable hardware acceleration'
+    )
+
+    parser.add_argument(
+        '--allow-software-fallback',
+        action='store_true',
+        help=(
+            'Target-size mode: retry on the software encoder when hardware misses '
+            'the size band or the hardware encode fails. Without this flag the '
+            'hardware result is kept and the run reports that confirmation is required'
+        )
     )
     
     # Processing options
@@ -597,10 +611,20 @@ def process_file(
         print(f"    Time: {format_time(result.encoding_time)}")
         if result.note:
             print(f"    Note: {result.note}")
+        if result.software_fallback_required:
+            print(
+                "    Software fallback was not run. "
+                "Re-run with --allow-software-fallback to confirm it."
+            )
         if result.output_format:
             print(f"    Output: {result.output_format.upper()}")
     else:
         print(f"  ✗ Failed: {result.error_message}")
+        if result.software_fallback_required:
+            print(
+                "    Software fallback was not run. "
+                "Re-run with --allow-software-fallback to confirm it."
+            )
     
     return result
 
@@ -620,6 +644,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # Initialize compressor
     compressor = VideoCompressor()
+    if args.allow_software_fallback:
+        compressor.set_software_fallback_callback(lambda _request: True)
     
     # Handle info commands
     if args.hardware:

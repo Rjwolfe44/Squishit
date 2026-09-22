@@ -839,7 +839,13 @@ class SettingsPanel(ctk.CTkFrame):
             self._hw_hint.configure(text="Hardware acceleration off. SquishIt will use a software encoder.")
             return
         if target_mode == "exact":
-            self._hw_hint.configure(text="Exact target mode uses a software exact-size path and may lower audio, FPS, or resolution before padding the final file.")
+            self._hw_hint.configure(
+                text=(
+                    "Exact target tries a hardware encoder first when one is available. "
+                    "If that encode misses the size or fails, SquishIt asks before a "
+                    "software retry. It may still lower audio, FPS, or resolution, then pad the file."
+                )
+            )
             return
         if not self.codec_manager or not self.hw_vendor:
             self._hw_hint.configure(text="No supported GPU encoder detected for this system.")

@@ -13,6 +13,8 @@ from typing import Optional, List, Dict, Tuple
 from enum import Enum
 import multiprocessing
 
+from .quality_ladder import ordered_hw_vendors
+
 try:
     import psutil
     HAS_PSUTIL = True
@@ -367,18 +369,23 @@ class HardwareDetector:
         return None
     
     def _check_hw_encoders(self, gpus: List[GPUInfo]) -> Tuple[bool, Optional[str]]:
-        """Check for available hardware encoders."""
+        """Pick the preferred vendor in NVENC → QSV → AMF order.
+
+        GPU probes append NVIDIA, then AMD, then Intel. That detection
+        order must not choose the winner: Intel QSV outranks AMD AMF when
+        both are present, and NVIDIA outranks both.
+        """
+        vendors: List[str] = []
         for gpu in gpus:
-            if gpu.vendor == GPUVendor.NVIDIA:
-                return True, "nvidia"
-            elif gpu.vendor == GPUVendor.AMD:
-                return True, "amd"
-            elif gpu.vendor == GPUVendor.INTEL:
-                return True, "intel"
-            elif gpu.vendor == GPUVendor.APPLE:
-                return True, "apple"
-        
-        return False, None
+            vendor_name = gpu.vendor.value
+            if vendor_name in vendors:
+                continue
+            if gpu.encoder_support.get("h264") or gpu.encoder_support.get("hevc"):
+                vendors.append(vendor_name)
+        ordered = ordered_hw_vendors(vendors)
+        if not ordered:
+            return False, None
+        return True, ordered[0]
 
     def _get_windows_video_controllers(self) -> List[Dict[str, int | str]]:
         """Get Windows display controllers with names and memory where possible."""
