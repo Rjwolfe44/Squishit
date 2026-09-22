@@ -7,8 +7,9 @@
 ::   --version X.Y.Z        override version
 ::   --help                 show all options
 ::
-:: Auth: set GH_TOKEN=ghp_... in your environment,
+:: Auth: set GH_TOKEN in your environment,
 ::       or place your token in .github_token at the project root.
+::       .github_token is gitignored. Never commit it.
 
 setlocal
 cd /D "%~dp0.."

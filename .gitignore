@@ -46,9 +46,19 @@ logs/
 # Config (user-specific, not version-controlled)
 config.yaml
 
-# GitHub token — NEVER commit this
+# Secrets — never commit tokens, env files, or private keys
 .github_token
 tools/.github_token
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+credentials.json
+secrets/
 
 # Test artifacts
 .pytest_cache/

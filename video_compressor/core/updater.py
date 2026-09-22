@@ -1,6 +1,6 @@
 """Auto-update support via GitHub Releases.
 
-Checks https://github.com/Rjwolfe44/squishit-releases for the latest release,
+Checks https://github.com/Rjwolfe44/Squishit for the latest release,
 downloads the setup installer, and runs it silently to update the app.
 """
 
@@ -18,9 +18,10 @@ from urllib.error import URLError
 
 logger = logging.getLogger(__name__)
 
-GITHUB_API_URL = (
-    "https://api.github.com/repos/Rjwolfe44/squishit-releases/releases/latest"
-)
+GITHUB_REPO = "Rjwolfe44/Squishit"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+ISSUES_URL = f"https://github.com/{GITHUB_REPO}/issues"
 _REQUEST_TIMEOUT = 8  # seconds
 
 

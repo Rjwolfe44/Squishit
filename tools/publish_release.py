@@ -6,9 +6,11 @@ What it does
 ────────────
   1. Reads the current version from video_compressor/__init__.py
   2. Finds the built installer in dist/
-  3. Creates a new release on Rjwolfe44/squishit-releases with your release notes
+  3. Creates a new release on Rjwolfe44/Squishit with your release notes
   4. Uploads the installer .exe as a downloadable asset
-  5. Regenerates the releases-repo README.md with a full version history table
+
+The product README in this repository is maintained in git. This script does
+not rewrite it.
 
 Usage
 ─────
@@ -21,20 +23,19 @@ Usage
 
 Authentication
 ──────────────
-  Option 1 (recommended): set environment variable
-      GH_TOKEN=ghp_xxxxxxxxxxxxxxxx
+  Option 1 (recommended): set the GH_TOKEN environment variable.
 
   Option 2: create a file named  .github_token  in the project root
       containing only your Personal Access Token on one line.
+      That file is gitignored.
 
-  Create a token at: https://github.com/settings/tokens/new?scopes=public_repo
-  (Only "public_repo" scope is needed — the releases repo is public.)
+  Create a token at: https://github.com/settings/tokens/new?scopes=repo
+  The token needs permission to create releases on Rjwolfe44/Squishit.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -52,7 +53,7 @@ from urllib.parse import quote
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OWNER = "Rjwolfe44"
-REPO = "squishit-releases"
+REPO = "Squishit"
 API = "https://api.github.com"
 
 # ── Rich (optional, already a project dep) ───────────────────────────────────
@@ -114,11 +115,12 @@ def _load_token(cli_token: Optional[str]) -> str:
     if not token:
         _die(
             "No GitHub token found.\n\n"
-            "  Option 1 (recommended): set the GH_TOKEN environment variable\n"
-            "    GH_TOKEN=ghp_...\n\n"
+            "  Option 1 (recommended): set the GH_TOKEN environment variable.\n\n"
             "  Option 2: create a file  .github_token  in the project root\n"
-            "    containing only your Personal Access Token on one line.\n\n"
-            "  Create a token:  https://github.com/settings/tokens/new?scopes=public_repo"
+            "    containing only your Personal Access Token on one line.\n"
+            "    That file is gitignored.\n\n"
+            "  Create a token:  https://github.com/settings/tokens/new?scopes=repo\n"
+            "  It needs permission to create releases on Rjwolfe44/Squishit."
         )
     return token  # type: ignore[return-value]
 
@@ -180,21 +182,6 @@ def _gh_post_binary(url: str, token: str, data: bytes) -> dict:
         _die(f"Asset upload failed → HTTP {exc.code}: {body[:400]}")
     except URLError as exc:
         _die(f"Network error during upload: {exc.reason}")
-
-
-def _gh_put_json(url: str, token: str, payload: dict) -> None:
-    """PUT JSON to a GitHub API URL (used for file updates)."""
-    data = json.dumps(payload).encode()
-    headers = {**_base_headers(token), "Content-Type": "application/json"}
-    req = request.Request(url, data=data, headers=headers, method="PUT")
-    try:
-        with request.urlopen(req, timeout=30) as resp:
-            resp.read()
-    except HTTPError as exc:
-        body = exc.read().decode(errors="replace")
-        _die(f"PUT {url}\n  → HTTP {exc.code}: {body[:500]}")
-    except URLError as exc:
-        _die(f"Network error: {exc.reason}")
 
 
 # ── Version / installer auto-detection ──────────────────────────────────────
@@ -275,117 +262,6 @@ def _notes_from_editor(tag: str) -> str:
         return "\n".join(lines).strip()
     finally:
         tmp_path.unlink(missing_ok=True)
-
-
-# ── README generator ──────────────────────────────────────────────────────────
-
-
-def _exe_asset(rel: dict) -> Optional[dict]:
-    return next(
-        (a for a in rel.get("assets", []) if a["name"].lower().endswith(".exe")),
-        None,
-    )
-
-
-def _build_readme(releases: list) -> str:
-    lines: list[str] = [
-        "# SquishIt — Releases",
-        "",
-        "Power-user desktop media compression for Windows.  ",
-        "Modern codecs (AV1, HEVC, H.264) · Hardware acceleration · Explorer right-click integration",
-        "",
-        "---",
-        "",
-    ]
-
-    if releases:
-        latest = releases[0]  # GitHub returns newest-first
-        exe = _exe_asset(latest)
-        dl_url = exe["browser_download_url"] if exe else latest["html_url"]
-        dl_name = exe["name"] if exe else latest["tag_name"]
-        pub_date = (latest.get("published_at") or "")[:10]
-        notes_preview = (latest.get("body") or "").strip()
-
-        lines += [
-            "## ⬇ Latest Download",
-            "",
-            f"**[{dl_name}]({dl_url})**"
-            f" &nbsp;·&nbsp; {latest['tag_name']}"
-            f" &nbsp;·&nbsp; Released {pub_date}",
-            "",
-        ]
-        if notes_preview:
-            # Show first 4 non-empty lines as a block-quote preview
-            preview = [ln for ln in notes_preview.splitlines() if ln.strip()][:4]
-            lines.append("> " + "  \n> ".join(preview))
-            lines.append("")
-
-    # ── All releases table ────────────────────────────────────────────────────
-    lines += ["---", "", "## All Releases", ""]
-    lines.append("| Version | Released | Download |")
-    lines.append("|---------|----------|----------|")
-    for rel in releases:
-        tag = rel["tag_name"]
-        pub = (rel.get("published_at") or "")[:10]
-        exe = _exe_asset(rel)
-        if exe:
-            link = f"[{exe['name']}]({exe['browser_download_url']})"
-        else:
-            link = f"[Release page]({rel['html_url']})"
-        draft_flag = " *(draft)*" if rel.get("draft") else ""
-        lines.append(f"| **{tag}**{draft_flag} | {pub} | {link} |")
-
-    # ── Per-release notes ─────────────────────────────────────────────────────
-    lines += ["", "---", "", "## Release Notes", ""]
-    for rel in releases:
-        tag = rel["tag_name"]
-        pub = (rel.get("published_at") or "")[:10]
-        notes = (rel.get("body") or "").strip()
-        lines += [
-            f"### {tag} — {pub}",
-            "",
-            notes if notes else "*(No release notes provided.)*",
-            "",
-        ]
-
-    # ── Footer ────────────────────────────────────────────────────────────────
-    lines += [
-        "---",
-        "",
-        "## System Requirements",
-        "",
-        "- Windows 10 / 11 (64-bit)",
-        "- ~50 MB disk space",
-        "- No additional runtime or dependencies required",
-        "",
-        "## Installation",
-        "",
-        "1. Download the setup installer above.",
-        "2. Run it — no elevated privileges required for a per-user install.",
-        "3. During setup, optionally enable the Explorer right-click context menu.",
-        "",
-        "---",
-        "",
-        "*This repository contains only release builds. Source code is private.*",
-    ]
-
-    return "\n".join(lines) + "\n"
-
-
-# ── README update ─────────────────────────────────────────────────────────────
-
-
-def _update_readme(token: str, content: str) -> None:
-    """Create or update README.md on the releases repo."""
-    url = f"{API}/repos/{OWNER}/{REPO}/contents/README.md"
-    existing = _gh_get(url, token)
-    payload: dict = {
-        "message": "docs: regenerate release list",
-        "content": base64.b64encode(content.encode("utf-8")).decode(),
-    }
-    if existing and "sha" in existing:
-        payload["sha"] = existing["sha"]
-    _gh_put_json(url, token, payload)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -478,21 +354,6 @@ def main() -> None:
     asset = _gh_post_binary(upload_url, token, installer.read_bytes())
     download_url = asset.get("browser_download_url", "")
     _ok(f"Asset uploaded  →  {download_url}")
-
-    # ── Regenerate README ─────────────────────────────────────────────────────
-    _info(f"Fetching all releases from {OWNER}/{REPO}…")
-    all_releases = _gh_get(
-        f"{API}/repos/{OWNER}/{REPO}/releases?per_page=100", token
-    )
-    if not isinstance(all_releases, list):
-        all_releases = [release]  # fallback: at least include the one we just created
-
-    _info("Building README.md…")
-    readme_content = _build_readme(all_releases)
-
-    _info("Updating README.md on releases repo…")
-    _update_readme(token, readme_content)
-    _ok("README updated.")
 
     # ── Done ──────────────────────────────────────────────────────────────────
     if _RICH:

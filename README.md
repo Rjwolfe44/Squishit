@@ -1,6 +1,10 @@
 # SquishIt
 
-A modern Windows desktop media compression app with a sleek dark-themed GUI. Built with Python, FFmpeg, and CustomTkinter.
+SquishIt compresses video and images on Windows. Drop in a file, pick a preset, and FFmpeg does the encode — HEVC, AV1, and H.264, with hardware encoders when the preset allows them.
+
+**[Download the installer](https://github.com/Rjwolfe44/Squishit/releases)** from GitHub Releases on this repository.
+
+Found a bug or want a feature? Open a [GitHub Issue](https://github.com/Rjwolfe44/Squishit/issues).
 
 ## Features
 
@@ -35,6 +39,8 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 | **YouTube / social upload** | Video file for YouTube and other social uploads (`--profile youtube`) | Social file uploads |
 | **Mobile** | Smaller files for mobile | Mobile viewing |
 | **Streaming upload** | Video file for Twitch, YouTube, or OBS upload (`--profile streaming`) | Upload-ready files |
+
+**Streaming upload** encodes a finished video file for Twitch, YouTube, or OBS. It does not start a live RTMP broadcast.
 
 **Max / Archival** and **Quick Compress Max** are different settings. Archival Max is SVT-AV1 with hardware off. Quick Compress Max is the HEVC Max rung (CRF 30, slow) and is labeled **HEVC Max** in the context-menu window. **Quick Lite** is the fastest context-menu rung: H.264 CRF 26, preset fast, with hardware preferred in the order NVENC, then QSV, then AMF, then software libx264. AV1 is not that rung.
 
@@ -92,7 +98,7 @@ run.bat
 ```
 
 ### Option B — Installer
-Download `SquishIt-Setup-vX.X.X.exe`, install, and launch from Start Menu or Desktop shortcut.
+Download `SquishIt-Setup-vX.X.X.exe` from [GitHub Releases](https://github.com/Rjwolfe44/Squishit/releases), install, and launch from the Start Menu or Desktop shortcut.
 
 ---
 
@@ -226,9 +232,17 @@ tests/                      # Test suite (pytest; no display required)
 
 ---
 
+## Help
+
+Bugs, questions, and feature requests: [GitHub Issues](https://github.com/Rjwolfe44/Squishit/issues).
+
+Development setup and pull requests: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
 ## License
 
-MIT License
+[MIT License](LICENSE). Copyright (c) 2026 Rjwolfe44.
 
 ---
 
