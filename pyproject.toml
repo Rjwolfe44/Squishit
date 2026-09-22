@@ -103,3 +103,6 @@ target-version = "py310"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "smoke: short real FFmpeg encode; skipped when ffmpeg is not installed",
+]
