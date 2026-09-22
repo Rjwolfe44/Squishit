@@ -17,7 +17,13 @@ from .quality_ladder import (
     QualityRung,
     get_step,
 )
-from ..config import PROFILES_DIR
+from ..config import PROFILES_DIR, AppConfig
+
+# Blank profiles and incomplete YAML share these with a fresh AppConfig and
+# CodecSettings. Built-in presets that want Opus set the codec and bitrate
+# themselves; missing keys must not silently switch to that preset.
+_DEFAULT_AUDIO_CODEC = CodecSettings.__dataclass_fields__["audio_codec"].default
+_DEFAULT_AUDIO_BITRATE = AppConfig.__dataclass_fields__["default_audio_bitrate"].default
 
 
 class ProfileType(Enum):
@@ -83,9 +89,10 @@ class CompressionProfile:
     preset: str = "medium"
     video_bitrate: Optional[int] = None  # Target bitrate in bits/sec
     
-    # Audio settings
-    audio_codec: AudioCodec = AudioCodec.OPUS
-    audio_bitrate: int = 128_000
+    # Audio settings. Partial profiles inherit these, which match a new
+    # AppConfig bitrate and CodecSettings codec (AAC at 192 kbps).
+    audio_codec: AudioCodec = _DEFAULT_AUDIO_CODEC
+    audio_bitrate: int = _DEFAULT_AUDIO_BITRATE
     output_mode: str = "video"
     
     # Resolution settings
@@ -223,9 +230,20 @@ class CompressionProfile:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'CompressionProfile':
-        """Create profile from dictionary."""
+        """Create profile from dictionary.
+
+        Missing audio keys use the same defaults as ``CompressionProfile()``
+        (AAC at the app-config bitrate). Keys that are present win, including
+        an explicit bitrate of 0.
+        """
         video_codec = normalize_profile_video_codec(data.get("video_codec", "hevc"))
-        audio_codec = AudioCodec(data.get("audio_codec", AudioCodec.OPUS.value))
+        default_audio_codec = cls.__dataclass_fields__["audio_codec"].default
+        raw_audio_codec = data.get("audio_codec", default_audio_codec)
+        if isinstance(raw_audio_codec, AudioCodec):
+            audio_codec = raw_audio_codec
+        else:
+            audio_codec = AudioCodec(raw_audio_codec)
+        default_audio_bitrate = cls.__dataclass_fields__["audio_bitrate"].default
         return cls(
             name=data["name"],
             profile_type=ProfileType(data.get("profile_type", "custom")),
@@ -235,7 +253,7 @@ class CompressionProfile:
             preset=normalize_profile_preset(data.get("preset", "medium")),
             video_bitrate=data.get("video_bitrate"),
             audio_codec=audio_codec,
-            audio_bitrate=data.get("audio_bitrate", 128_000),
+            audio_bitrate=data.get("audio_bitrate", default_audio_bitrate),
             output_mode=data.get("output_mode", "video"),
             max_resolution=data.get("max_resolution"),
             resolution_scale=data.get("resolution_scale", 1.0),

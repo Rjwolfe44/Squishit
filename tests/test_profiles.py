@@ -1,6 +1,7 @@
 import pytest
 
-from video_compressor.core.codecs import AudioCodec, VideoCodec
+from video_compressor.config import AppConfig
+from video_compressor.core.codecs import AudioCodec, CodecSettings, VideoCodec
 from video_compressor.core.profiles import CompressionProfile, ProfileManager, ProfileType
 
 
@@ -82,14 +83,82 @@ def test_profile_round_trip_preserves_defaults(manager):
 
 
 def test_from_dict_uses_profile_field_defaults_when_keys_are_absent():
+    fresh = CompressionProfile(name="Fresh", profile_type=ProfileType.CUSTOM)
     restored = CompressionProfile.from_dict({"name": "Partial"})
 
     assert restored.profile_type is ProfileType.CUSTOM
     assert restored.video_codec is VideoCodec.HEVC
-    assert restored.audio_codec is AudioCodec.OPUS
-    assert restored.audio_bitrate == 128_000
+    assert restored.audio_codec is fresh.audio_codec is AudioCodec.AAC
+    assert restored.audio_codec is CodecSettings().audio_codec
+    assert restored.audio_bitrate == fresh.audio_bitrate == 192_000
+    assert restored.audio_bitrate == AppConfig().default_audio_bitrate
+    assert restored.audio_bitrate == AppConfig.from_dict({}).default_audio_bitrate
+    assert restored.output_mode == fresh.output_mode
+    assert restored.audio_mode == fresh.audio_mode
+    assert restored.disable_audio is fresh.disable_audio
+    assert restored.exact_audio_policy == fresh.exact_audio_policy
     assert restored.crf == 23
     assert restored.video_container == "mp4"
+
+
+def test_partial_profile_audio_keys_fill_only_what_is_missing():
+    """Present audio keys win. Each missing key stays on the locked default."""
+    fresh = CompressionProfile(name="Fresh", profile_type=ProfileType.CUSTOM)
+
+    codec_only = CompressionProfile.from_dict({
+        "name": "Codec only",
+        "audio_codec": "opus",
+    })
+    assert codec_only.audio_codec is AudioCodec.OPUS
+    assert codec_only.audio_bitrate == fresh.audio_bitrate == 192_000
+    assert codec_only.disable_audio is False
+
+    bitrate_only = CompressionProfile.from_dict({
+        "name": "Bitrate only",
+        "audio_bitrate": 96_000,
+    })
+    assert bitrate_only.audio_codec is AudioCodec.AAC
+    assert bitrate_only.audio_bitrate == 96_000
+
+    explicit_zero = CompressionProfile.from_dict({
+        "name": "Zero bitrate",
+        "audio_bitrate": 0,
+    })
+    assert explicit_zero.audio_codec is AudioCodec.AAC
+    assert explicit_zero.audio_bitrate == 0
+
+    both = CompressionProfile.from_dict({
+        "name": "Both",
+        "audio_codec": AudioCodec.MP3,
+        "audio_bitrate": 256_000,
+        "disable_audio": True,
+        "audio_mode": "reencode",
+    })
+    assert both.audio_codec is AudioCodec.MP3
+    assert both.audio_bitrate == 256_000
+    assert both.disable_audio is True
+    assert both.audio_mode == "reencode"
+    assert both.output_mode == fresh.output_mode
+
+
+def test_incomplete_yaml_profile_uses_locked_audio_defaults(tmp_path):
+    profile_file = tmp_path / "incomplete.yaml"
+    profile_file.write_text("name: Incomplete\ncrf: 20\n", encoding="utf-8")
+
+    loaded = ProfileManager(config_dir=tmp_path).get_profile("Incomplete")
+
+    assert loaded is not None
+    assert loaded.crf == 20
+    assert loaded.audio_codec is AudioCodec.AAC
+    assert loaded.audio_bitrate == AppConfig().default_audio_bitrate == 192_000
+
+
+def test_new_custom_profile_matches_fresh_audio_defaults(manager):
+    created = manager.create_custom_profile("Blank")
+    fresh = CompressionProfile(name="Blank", profile_type=ProfileType.CUSTOM)
+
+    assert created.audio_codec is fresh.audio_codec is AudioCodec.AAC
+    assert created.audio_bitrate == fresh.audio_bitrate == AppConfig().default_audio_bitrate
 
 
 def test_system_profiles_cannot_be_deleted(manager):
