@@ -137,7 +137,7 @@ python cli.py --hardware
 
 ## Dev Tooling
 
-GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI. CI installs FFmpeg, then runs the unit tests and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, and that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC). Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
+GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI. CI installs FFmpeg, then runs the unit tests and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC), and that Quick Lite plus both Max lanes (`libx265` and `libsvtav1`) stay inside soft encode-time, file-size, and SSIM bounds. Those bounds are documented in `tests/test_encode_ladder_regression.py`. Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
 
 All dev commands go through `dev.bat`:
 
