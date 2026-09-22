@@ -973,11 +973,13 @@ class CodecManager:
         return result
 
     def get_codec_recommendations(self, use_case: str) -> Dict[str, Any]:
+        from .descriptions import STREAMING_UPLOAD_DESCRIPTION, YOUTUBE_UPLOAD_DESCRIPTION
+
         recommendations = {
             "upload": {
                 "video_codec": VideoCodec.H264, "audio_codec": AudioCodec.AAC,
                 "preset": "fast", "crf": 23,
-                "description": "Optimized for YouTube/Social Media â€” maximum compatibility",
+                "description": YOUTUBE_UPLOAD_DESCRIPTION,
             },
             "archive": {
                 "video_codec": VideoCodec.SVT_AV1, "audio_codec": AudioCodec.OPUS,
@@ -992,7 +994,7 @@ class CodecManager:
             "streaming": {
                 "video_codec": VideoCodec.HEVC, "audio_codec": AudioCodec.AAC,
                 "preset": "veryfast", "crf": 24,
-                "description": "Fast encoding for live streaming",
+                "description": STREAMING_UPLOAD_DESCRIPTION,
             },
             "editing": {
                 "video_codec": VideoCodec.H264, "audio_codec": AudioCodec.AAC,

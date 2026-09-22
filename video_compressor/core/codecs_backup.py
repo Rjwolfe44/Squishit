@@ -619,7 +619,7 @@ class CodecManager:
                 "audio_codec": AudioCodec.AAC,
                 "preset": "veryfast",
                 "crf": 24,
-                "description": "Fast encoding for live streaming"
+                "description": "Video file for Twitch, YouTube, or OBS upload."
             },
             "editing": {
                 "video_codec": VideoCodec.H264,
