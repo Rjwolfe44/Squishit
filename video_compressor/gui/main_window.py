@@ -12,9 +12,11 @@ import threading
 import queue
 import logging
 import time
+import webbrowser
 from datetime import datetime, timezone, timedelta
+from tkinter import Menu as TkMenu
 
-from .copy import EMPTY_QUEUE, PROFILE_HELPER
+from .copy import EMPTY_QUEUE, PROFILE_HELPER, help_menu_items
 from .widgets import (
     DropZone, FileQueueCard, ProgressCard,
     SettingsPanel, ProfileBar, ResultCard, COLORS, HardwareBadge,
@@ -505,6 +507,18 @@ class MainWindow(tkinterdnd2.Tk):
             font=ctk.CTkFont(size=12),
             command=self._open_stats,
         ).pack(side="left", padx=(8, 0))
+
+        self._help_btn = ctk.CTkButton(
+            actions_row,
+            text="Help",
+            width=64, height=30, corner_radius=8,
+            fg_color=COLORS["surface_raised"],
+            hover_color=COLORS["border"],
+            text_color=COLORS["text_dim"],
+            font=ctk.CTkFont(size=12),
+            command=self._open_help_menu,
+        )
+        self._help_btn.pack(side="left", padx=(8, 0))
 
         ctk.CTkFrame(shell, height=1, fg_color=COLORS["border"]).pack(fill="x", pady=(8, 8))
 
@@ -1680,6 +1694,31 @@ class MainWindow(tkinterdnd2.Tk):
             self.output_folder = Path(folder)
             self.output_folder.mkdir(parents=True, exist_ok=True)
             self._output_lbl.configure(text=f"\u2192 {self.output_folder.name}/")
+
+    def _open_help_menu(self):
+        """Help menu: bug reports and feature requests on the source repo."""
+
+        menu = TkMenu(
+            self,
+            tearoff=0,
+            bg=COLORS["surface_raised"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#ffffff",
+            relief="flat",
+            bd=0,
+        )
+        for label, url in help_menu_items():
+            menu.add_command(
+                label=label,
+                command=lambda target=url: webbrowser.open(target),
+            )
+        try:
+            x = self._help_btn.winfo_rootx()
+            y = self._help_btn.winfo_rooty() + self._help_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     def _open_about(self):
         AboutDialog(self, hw_info=self._hw_info)

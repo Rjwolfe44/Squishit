@@ -31,6 +31,11 @@ MORE_PROFILES_TOOLTIP = (
     "Streaming upload is a video file for Twitch, YouTube, or OBS upload."
 )
 WAITING_FOR_SOFTWARE_FALLBACK = "Waiting for software fallback answer…"
+GITHUB_REPO_URL = "https://github.com/Rjwolfe44/Squishit"
+BUG_REPORT_URL = f"{GITHUB_REPO_URL}/issues/new?labels=bug"
+FEATURE_REQUEST_URL = f"{GITHUB_REPO_URL}/issues/new?labels=enhancement"
+HELP_REPORT_BUG = "Report a bug"
+HELP_SUGGEST_FEATURE = "Suggest a feature"
 PROGRESS_PHASES: Sequence[str] = ("Queued", "Encoding", "Finishing")
 FINISHING_PROGRESS = 92.0
 
@@ -51,6 +56,7 @@ __all__ = [
     "YOUTUBE_UPLOAD_DESCRIPTION",
     "YOUTUBE_UPLOAD_LABEL",
     "encoder_family_label",
+    "help_menu_items",
     "human_progress_status",
     "job_status_value",
     "profile_ui_text",
@@ -58,6 +64,15 @@ __all__ = [
     "progress_phase",
     "secondary_menu_entries",
 ]
+
+
+def help_menu_items() -> list[tuple[str, str]]:
+    """Help menu rows: label and the GitHub new-issue URL it opens."""
+
+    return [
+        (HELP_REPORT_BUG, BUG_REPORT_URL),
+        (HELP_SUGGEST_FEATURE, FEATURE_REQUEST_URL),
+    ]
 
 
 def profile_ui_text(name: str, description: str = "") -> tuple[str, str]:

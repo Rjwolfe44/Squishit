@@ -7,6 +7,7 @@ built-in profiles stay on the values the ladder tests already lock.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from types import SimpleNamespace
 
 from video_compressor.core.codecs import CodecManager, VideoCodec
@@ -25,6 +26,7 @@ from video_compressor.gui.copy import (
     QUICK_COMPRESS_SUBTITLE,
     QUICK_COMPRESS_TITLE,
     WAITING_FOR_SOFTWARE_FALLBACK,
+    help_menu_items,
     human_progress_status,
     profile_ui_text,
     progress_detail,
@@ -166,3 +168,23 @@ def test_progress_phases_and_human_status(tmp_path):
     assert "24.0 fps" in detail
     assert "→" in detail
     _assert_file_upload_copy(detail, human_progress_status(job))
+
+
+def test_help_menu_opens_source_repo_issues():
+    items = dict(help_menu_items())
+    bug = "https://github.com/Rjwolfe44/Squishit/issues/new?labels=bug"
+    feature = "https://github.com/Rjwolfe44/Squishit/issues/new?labels=enhancement"
+    assert items["Report a bug"] == bug
+    assert items["Suggest a feature"] == feature
+    assert "squishit-releases" not in bug
+    assert "squishit-releases" not in feature
+    _assert_file_upload_copy(*items, *items.values())
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "video_compressor"
+        / "gui"
+        / "main_window.py"
+    ).read_text(encoding="utf-8")
+    assert "help_menu_items" in source
+    assert "webbrowser.open" in source
