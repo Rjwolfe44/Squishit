@@ -247,6 +247,8 @@ def test_exact_size_miss_yes_retries_through_the_gui_handler(monkeypatch, tmp_pa
         "libx264",
         "Hardware encode missed the target size",
     )
+    assert "missed the 1 MB target" in seen[0]["body"]
+    assert "Padding would make up the difference." not in seen[0]["body"]
     assert _encoder_name(commands[0]) == "h264_nvenc"
     assert _encoder_name(commands[-1]) == "libx264"
     assert result.success is True
@@ -348,3 +350,98 @@ def test_quick_compress_crf_failure_never_asks(monkeypatch, tmp_path):
     assert result.software_fallback_required is False
     assert "Confirm before retrying" not in (result.error_message or "")
     assert "libx264" not in result.encoder_name
+
+
+# Inside the 0.5% exact band, but short of the 1_000_000 byte target, so the
+# hardware path would pad instead of searching again.
+_EXACT_SHORT_BYTES = 996_000
+
+
+def test_pad_after_hw_yes_retries_software_and_may_pad_that_file(monkeypatch, tmp_path):
+    """Yes leaves hardware. A later short software file can still be padded."""
+
+    profile = _profile("Quick Lite", target_size_mb=1, mode="exact")
+    commands, result, seen, window, handled = _run_through_handler(
+        monkeypatch,
+        tmp_path,
+        profile,
+        lambda encoder: _EXACT_SHORT_BYTES,
+        True,
+        job_name="pad-yes",
+    )
+
+    assert handled == 1
+    _assert_dialog_shown(
+        seen,
+        window,
+        "libx264",
+        "Hardware encode missed the target size",
+    )
+    assert "Padding would make up the difference." in seen[0]["body"]
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc", "libx264"]
+    assert result.success is True
+    assert result.software_fallback_required is False
+    assert result.encoder_name == "libx264"
+    assert result.compressed_size == 1_000_000
+    assert result.output_file is not None
+    assert result.output_file.stat().st_size == 1_000_000
+    assert "padded" in result.note.lower()
+
+
+@pytest.mark.parametrize("answer", [False, None, "error"])
+def test_pad_after_hw_no_or_dismiss_keeps_unpadded_hardware(
+    monkeypatch, tmp_path, answer
+):
+    """No, dismiss, and a dialog error keep the short hardware file."""
+
+    profile = _profile("Quick Lite", target_size_mb=1, mode="exact")
+    commands, result, seen, window, handled = _run_through_handler(
+        monkeypatch,
+        tmp_path,
+        profile,
+        lambda encoder: _EXACT_SHORT_BYTES,
+        answer,
+        job_name=f"pad-{answer}",
+    )
+
+    assert handled == 1
+    _assert_dialog_shown(
+        seen,
+        window,
+        "libx264",
+        "Hardware encode missed the target size",
+    )
+    assert "Padding would make up the difference." in seen[0]["body"]
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc"]
+    assert result.success is True
+    assert result.software_fallback_required is True
+    assert result.software_fallback_reason == SoftwareFallbackReason.SIZE_MISS.value
+    assert result.encoder_name == "h264_nvenc"
+    assert result.compressed_size == _EXACT_SHORT_BYTES
+    assert result.output_file is not None
+    assert result.output_file.stat().st_size == _EXACT_SHORT_BYTES
+    assert "without padding" in result.note
+    assert "Confirm before retrying with libx264" in result.note
+    assert "libx264" not in result.encoder_name
+
+
+def test_quick_compress_short_file_never_asks(monkeypatch, tmp_path):
+    """Quick Compress has no exact target, so a short file is not a pad ask."""
+
+    profile = _profile("Quick Lite", target_size_mb=None, mode=None)
+    commands, result, seen, window, handled = _run_through_handler(
+        monkeypatch,
+        tmp_path,
+        profile,
+        lambda encoder: _EXACT_SHORT_BYTES,
+        True,
+        job_name="quick-short",
+    )
+
+    assert handled == 0
+    assert seen == []
+    assert window.waits == []
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc"]
+    assert result.success is True
+    assert result.compressed_size == _EXACT_SHORT_BYTES
+    assert result.software_fallback_required is False

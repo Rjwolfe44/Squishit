@@ -175,7 +175,8 @@ Examples:
         default=None,
         help=(
             'How target-size mode should chase the requested MB. '
-            'Exact tries hardware first, then may lower audio, frame rate, and resolution, and pads when under target. '
+            'Exact tries hardware first, then may lower audio, frame rate, and resolution. '
+            'Padding a short hardware file is ask-gated and is not a silent exact hit. '
             'A software retry requires --allow-software-fallback'
         )
     )
@@ -222,8 +223,9 @@ Examples:
         action='store_true',
         help=(
             'Target-size mode: retry on the software encoder when hardware misses '
-            'the size band or the hardware encode fails. Without this flag the '
-            'hardware result is kept and the run reports that confirmation is required'
+            'the size band, fails, or finishes under an exact target that would '
+            'be padded. Without this flag the hardware result is kept (unpadded, '
+            'when it was short) and the run reports that confirmation is required'
         )
     )
     

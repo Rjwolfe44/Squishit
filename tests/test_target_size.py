@@ -832,3 +832,177 @@ def test_exact_target_profile_keeps_hardware_when_an_encoder_exists(monkeypatch,
     assert prepared.use_hw_accel is True
     assert prepared.video_codec == VideoCodec.HEVC
     assert compressor._select_hw_encoder(prepared.video_codec) == "hevc_nvenc"
+
+
+def test_exact_hardware_short_without_callback_keeps_unpadded_file(monkeypatch, tmp_path):
+    """No callback is a decline, same as the CLI without --allow-software-fallback."""
+
+    compressor = _hw_target_compressor(monkeypatch)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+
+    commands, result = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "unset.mp4",
+        lambda encoder: 996_000,
+    )
+
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc"]
+    assert result.success is True
+    assert result.software_fallback_required is True
+    assert result.software_fallback_reason == SoftwareFallbackReason.SIZE_MISS.value
+    assert "Padding would make up the difference." in result.software_fallback_message
+    assert result.compressed_size == 996_000
+    assert result.output_file is not None
+    assert result.output_file.stat().st_size == 996_000
+    assert "without padding" in result.note
+
+
+def test_exact_hardware_on_target_does_not_ask_or_pad(monkeypatch, tmp_path):
+    compressor = _hw_target_compressor(monkeypatch)
+    asked = []
+    compressor.set_software_fallback_callback(lambda request: asked.append(request) or True)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+
+    commands, result = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "exact-hit.mp4",
+        lambda encoder: 1_000_000,
+    )
+
+    assert asked == []
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc"]
+    assert result.success is True
+    assert result.software_fallback_required is False
+    assert result.compressed_size == 1_000_000
+
+
+def test_exact_software_under_target_pads_without_asking(monkeypatch, tmp_path):
+    compressor = _hw_target_compressor(monkeypatch)
+    asked = []
+    compressor.set_software_fallback_callback(lambda request: asked.append(request) or True)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+    profile.use_hw_accel = False
+
+    commands, result = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "software-short.mkv",
+        lambda encoder: 996_000,
+    )
+
+    assert asked == []
+    assert result.success is True
+    assert result.software_fallback_required is False
+    assert result.encoder_name == "libx265"
+    assert [_encoder_name(cmd) for cmd in commands] == ["libx265"]
+    assert result.compressed_size == 1_000_000
+    assert result.output_file is not None
+    assert result.output_file.stat().st_size == 1_000_000
+
+
+def test_exact_hardware_pad_after_attempt_cap_asks_before_padding(monkeypatch, tmp_path):
+    """A short hardware file that never enters the size band still asks."""
+
+    compressor = _hw_target_compressor(monkeypatch)
+    monkeypatch.setattr(compressor, "_apply_exact_target_fallback", lambda profile, media: None)
+    asked = []
+
+    def decline(request):
+        asked.append(request)
+        return False
+
+    compressor.set_software_fallback_callback(decline)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+
+    commands, declined = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "capped.mp4",
+        lambda encoder: 400_000,
+    )
+
+    assert len(asked) == 1
+    assert asked[0].reason is SoftwareFallbackReason.SIZE_MISS
+    assert asked[0].actual_size_bytes == 400_000
+    assert "Padding would make up the difference." in asked[0].message
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc"] * 8
+    assert len(commands) == 8
+    assert declined.success is True
+    assert declined.software_fallback_required is True
+    assert declined.compressed_size == 400_000
+    assert "without padding" in declined.note
+
+    compressor.set_software_fallback_callback(lambda _request: True)
+    commands, confirmed = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "capped-yes.mp4",
+        lambda encoder: 1_000_000 if encoder == "libx264" else 400_000,
+    )
+
+    assert _encoder_name(commands[0]) == "h264_nvenc"
+    assert _encoder_name(commands[-1]) == "libx264"
+    assert confirmed.success is True
+    assert confirmed.software_fallback_required is False
+    assert confirmed.encoder_name == "libx264"
+    assert confirmed.compressed_size == 1_000_000
+
+
+def test_exact_hardware_pad_when_bitrate_converges_under_target(monkeypatch, tmp_path):
+    compressor = _hw_target_compressor(monkeypatch)
+    monkeypatch.setattr(
+        compressor,
+        "_choose_next_target_video_bitrate",
+        lambda **kwargs: kwargs["attempted_bitrate"],
+    )
+    asked = []
+    compressor.set_software_fallback_callback(lambda request: asked.append(request) or None)
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"0")
+    profile = CompressionProfile.from_dict(build_quick_compress_profiles()["Quick Lite"].to_dict())
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+
+    commands, result = _run_target_job(
+        compressor,
+        profile,
+        source,
+        tmp_path / "converged.mp4",
+        lambda encoder: 400_000,
+    )
+
+    assert len(asked) == 1
+    assert asked[0].hw_encoder == "h264_nvenc"
+    assert asked[0].software_encoder == "libx264"
+    assert "Padding would make up the difference." in asked[0].message
+    assert [_encoder_name(cmd) for cmd in commands] == ["h264_nvenc"]
+    assert result.success is True
+    assert result.software_fallback_required is True
+    assert result.software_fallback_reason == SoftwareFallbackReason.SIZE_MISS.value
+    assert result.compressed_size == 400_000
+    assert result.output_file is not None
+    assert result.output_file.stat().st_size == 400_000
+    assert "without padding" in result.note

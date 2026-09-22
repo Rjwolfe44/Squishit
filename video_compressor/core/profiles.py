@@ -772,8 +772,9 @@ def build_target_size_plan(
     elif resolved_mode == TargetSizeMode.EXACT:
         warning = (
             "Exact mode tries hardware first and asks before a software retry. "
-            "It may lower audio bitrate, frame rate, and resolution, "
-            "and pad the final file to hit the requested size."
+            "Padding a short hardware file is ask-gated: No keeps that file "
+            "without padding. It may lower audio bitrate, frame rate, and "
+            "resolution, and a software encode may still be padded to the requested size."
         )
     elif target_size_mb <= max(8, int(round(reserved_audio_mb * 1.2))):
         warning = "Target is close to the audio budget alone; quality may drop sharply."
@@ -844,7 +845,7 @@ def describe_target_size_plan(plan: TargetSizePlan, source_size_bytes: int) -> s
         f"±{tolerance_pct}%",
     ]
     if plan.mode == TargetSizeMode.EXACT:
-        parts.append("pads exact bytes when under")
+        parts.append("pads exact bytes when under after software")
     if plan.minimum_size_bytes > plan.target_size_bytes:
         parts.append(f"floor ~{plan.minimum_size_bytes / 1_000_000:.1f} MB")
     if plan.warning:
