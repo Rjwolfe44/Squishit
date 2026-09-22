@@ -50,12 +50,8 @@ Quick, Balanced, and Max share one CRF/preset table. The GUI compression control
 
 Quick finishes sooner and makes larger files. Balanced is the default tradeoff. Max is the best compression in that lane. When a profile matches a rung and a hardware encoder is selected, the command uses that rung's CQ and vendor preset (NVENC, then QSV, then AMF). SVT-AV1 stays on the software encoder. The encode-speed slider keeps the numeric SVT-AV1 and libaom preset instead of applying an x264 name.
 
-### Smart Threading
-Per-codec CPU thread optimization:
-- HEVC: physical cores
-- H.264: 1.5× physical cores
-- VP9: capped at 8 threads
-- HW encoders: half physical cores
+### Encode resource governor
+One governor owns encode concurrency. It splits the CPU thread budget across the jobs that are actually running, and it caps how many encodes start at once: software jobs share half the logical CPUs, NVENC keeps 3 sessions, and QSV, AMF, and VideoToolbox keep 2. Each job gets one thread flag from that budget. libsvtav1 uses `lp=`. libx264 and libx265 use a single `-threads` value and do not also set `pools` or `frame-threads`. Quick Lite, HEVC Max, and Archival SVT-AV1 keep their encoder choices.
 
 ### Right-Click Context Menu
 - **Compress with SquishIt** — Quick compress with last-used profile

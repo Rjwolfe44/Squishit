@@ -775,10 +775,10 @@ def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
         "libopus",
         "-b:a",
         "96000",
-        "-threads",
-        "4",
         str(archival_out),
     ]
+    assert archival_cmd.count("-threads") == 0
+    assert archival_cmd.count("-svtav1-params") == 1
     assert "nvenc" not in " ".join(archival_cmd)
 
     hevc_max = build_quick_compress_profiles()["HEVC Max"]
@@ -993,10 +993,9 @@ def test_compress_keeps_quick_lite_h264_and_distinct_maxes(monkeypatch, tmp_path
         "libopus",
         "-b:a",
         "96000",
-        "-threads",
-        "4",
         str(archival_out),
     ]
+    assert archival_cmd.count("-threads") == 0
     assert not any(
         token in " ".join(archival_cmd)
         for token in ("nvenc", "qsv", "amf", "videotoolbox")

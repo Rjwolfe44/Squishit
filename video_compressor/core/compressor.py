@@ -38,6 +38,13 @@ from .profiles import (
     resolve_requested_target_size_mb,
 )
 from .hardware import HardwareDetector, get_hardware_detector
+from .governor import (
+    EncodeCancelled,
+    EncodeResourceGovernor,
+    MachineResources,
+    apply_thread_policy,
+    threads_for_job,
+)
 from .quality_ladder import apply_hardware_ladder, ordered_hw_vendors
 from .utils import (
     format_size, format_time, format_bitrate,
@@ -272,6 +279,7 @@ class VideoCompressor:
             hw_detector: Hardware detector instance (optional)
         """
         self.hw_detector = hw_detector or get_hardware_detector()
+        self.governor = EncodeResourceGovernor(self._machine_resources)
         self._ffmpeg_path = self._find_ffmpeg()
         self._ffprobe_path = self._find_ffprobe()
         self._cjxl_path = self._find_cjxl()
@@ -1318,6 +1326,40 @@ class VideoCompressor:
 
         return optimized
 
+    def _machine_resources(self) -> MachineResources:
+        info = self.hw_detector.info
+        return MachineResources(
+            cpu_threads=max(1, int(info.cpu_threads or 1)),
+            cpu_cores=max(1, int(info.cpu_cores or 1)),
+            total_ram_gb=float(info.total_ram_gb or 0.0),
+        )
+
+    def queue_slots(
+        self,
+        profile: CompressionProfile,
+        *,
+        requested_parallel: int,
+        queued_files: int,
+        media_info: Optional[VideoInfo] = None,
+    ) -> int:
+        """How many jobs with this profile may encode at once.
+
+        Hardware sessions and the CPU cap can be lower than the requested
+        parallelism. The returned count is the wave size callers should pass
+        as ``parallel_jobs`` so every job in the wave shares one budget.
+        """
+
+        requested = max(1, int(requested_parallel or 1))
+        queued = max(1, int(queued_files or 1))
+        if profile.output_mode == "audio":
+            return self.governor.max_concurrent(requested, hw_encoder=None, queued=queued)
+
+        optimized = self._optimize_video_profile(profile, media_info)
+        hw_encoder = None
+        if optimized.use_hw_accel:
+            hw_encoder = self._select_hw_encoder(optimized.video_codec)
+        return self.governor.max_concurrent(requested, hw_encoder=hw_encoder, queued=queued)
+
     def _get_thread_count(
         self,
         profile: CompressionProfile,
@@ -1327,48 +1369,41 @@ class VideoCompressor:
         media_info: Optional[VideoInfo] = None,
     ) -> int:
         """Pick a practical thread count for the selected codec and hardware path."""
-        max_threads: Optional[int] = None
-        if not hw_encoder and codec == VideoCodec.HEVC:
-            # libx265 rejects very high frame-thread counts on some systems.
-            max_threads = 16
 
-        if profile.threads:
-            requested = max(1, profile.threads)
-            return min(requested, max_threads) if max_threads is not None else requested
+        info = self._machine_resources()
+        return threads_for_job(
+            cpu_threads=info.cpu_threads,
+            cpu_cores=info.cpu_cores,
+            total_ram_gb=info.total_ram_gb,
+            profile_threads=profile.threads,
+            resource_governor=profile.resource_governor,
+            codec=codec.value,
+            hw_encoder=hw_encoder,
+            parallel_jobs=max(1, parallel_jobs),
+            frame_height=getattr(media_info, "height", profile.max_resolution or 0) or 0,
+        )
 
-        try:
-            cpu_threads = max(
-                1,
-                self.hw_detector.recommend_threads_for_job(
-                    n_parallel=max(1, parallel_jobs),
-                    governor=profile.resource_governor,
-                    codec=codec.value,
-                    hw_encoder=hw_encoder,
-                    frame_height=getattr(media_info, "height", profile.max_resolution or 0) or 0,
-                ),
-            )
-        except TypeError:
-            cpu_threads = max(1, self.hw_detector.info.recommended_threads)
-        physical_cores = max(1, min(self.hw_detector.info.cpu_cores, cpu_threads))
+    def _reserve_encode_slot(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        *,
+        codec: str,
+        hw_encoder: Optional[str],
+        frame_height: int = 0,
+    ):
+        """Take a CPU or hardware-session slot for this job, or wait for one."""
 
-        if hw_encoder:
-            return max(2 if cpu_threads >= 2 else 1, min(cpu_threads, max(2, physical_cores)))
-        if codec == VideoCodec.SVT_AV1:
-            requested = max(2, cpu_threads)
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.AV1:
-            requested = max(2, min(cpu_threads, max(physical_cores, int(cpu_threads * 0.85))))
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.HEVC:
-            requested = max(physical_cores, int(cpu_threads * 0.75))
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.H264:
-            requested = max(1, int(cpu_threads * 0.9))
-            return min(requested, max_threads) if max_threads is not None else requested
-        if codec == VideoCodec.VP9:
-            requested = max(1, min(cpu_threads, 12))
-            return min(requested, max_threads) if max_threads is not None else requested
-        return min(cpu_threads, max_threads) if max_threads is not None else cpu_threads
+        return self.governor.reserve(
+            job.id,
+            declared_parallel=max(1, int(job.parallel_jobs or 1)),
+            hw_encoder=hw_encoder,
+            codec=codec,
+            frame_height=frame_height,
+            explicit_threads=profile.threads,
+            resource_governor=profile.resource_governor,
+            cancel_check=lambda: self._cancelled.get(job.id, False),
+        )
 
     def _select_target_rate_control(
         self,
@@ -1408,12 +1443,26 @@ class VideoCompressor:
             hw_encoder = self._select_hw_encoder(profile.video_codec)
 
         codec_settings = profile.to_codec_settings()
+        media = video_info if isinstance(video_info, VideoInfo) else None
+        parallel_jobs = max(1, int(job.parallel_jobs or 1))
+        if self.governor.holds(job.id):
+            # Refresh the slot (hardware to software, or a new neighbor) and
+            # size threads for that wave. _get_thread_count stays the single
+            # thread decision so previews and tests share it.
+            lease = self._reserve_encode_slot(
+                job,
+                profile,
+                codec=profile.video_codec.value,
+                hw_encoder=hw_encoder,
+                frame_height=getattr(media, "height", profile.max_resolution or 0) or 0,
+            )
+            parallel_jobs = lease.parallel_jobs
         codec_settings.threads = self._get_thread_count(
             profile,
             profile.video_codec,
             hw_encoder,
-            parallel_jobs=job.parallel_jobs,
-            media_info=video_info if isinstance(video_info, VideoInfo) else None,
+            parallel_jobs=parallel_jobs,
+            media_info=media,
         )
         job.encoder_name = hw_encoder or profile.video_codec.ffmpeg_encoder
         job.threads_used = codec_settings.threads or 0
@@ -1478,7 +1527,11 @@ class VideoCompressor:
             cmd.extend(extra_args)
 
         cmd.append(str(job.output_file))
-        return cmd
+        return apply_thread_policy(
+            cmd,
+            threads=job.threads_used or threads,
+            encoder=job.encoder_name,
+        )
 
     def _build_input_command(self, job: CompressionJob, profile: CompressionProfile) -> List[str]:
         """Build the shared FFmpeg input and optional trim arguments."""
@@ -2182,6 +2235,12 @@ class VideoCompressor:
                 job.output_file = job.output_file.with_suffix(f".{output_ext}")
                 job.output_file.parent.mkdir(parents=True, exist_ok=True)
 
+                self._reserve_encode_slot(
+                    job,
+                    profile,
+                    codec="audio",
+                    hw_encoder=None,
+                )
                 cmd = self._build_audio_ffmpeg_command(job, profile)
                 logger.info(f"FFmpeg audio extraction command: {' '.join(cmd)}")
 
@@ -2264,6 +2323,17 @@ class VideoCompressor:
 
             if target_plan and target_plan.warning:
                 logger.info("Target-size warning for %s: %s", job.input_file, target_plan.warning)
+
+            initial_hw = None
+            if optimized_profile.use_hw_accel:
+                initial_hw = self._select_hw_encoder(optimized_profile.video_codec)
+            self._reserve_encode_slot(
+                job,
+                optimized_profile,
+                codec=optimized_profile.video_codec.value,
+                hw_encoder=initial_hw,
+                frame_height=getattr(media_info, "height", 0) or 0,
+            )
 
             retry_count = 0
             oversized_retry_done = False
@@ -2659,7 +2729,9 @@ class VideoCompressor:
             self._report_progress(job)
             
             return result
-            
+
+        except EncodeCancelled:
+            return self._cancel_result(job)
         except Exception as e:
             if self._cancelled.get(job_id, False):
                 return self._cancel_result(job)
@@ -2681,6 +2753,7 @@ class VideoCompressor:
         
         finally:
             # Cleanup
+            self.governor.release(job_id)
             self._processes.pop(job_id, None)
             self._paused.pop(job_id, None)
             self._cancelled.pop(job_id, None)
@@ -2783,6 +2856,12 @@ class BatchProcessor:
         self._results: Dict[str, CompressionResult] = {}
         self._running = False
         self._worker_thread: Optional[threading.Thread] = None
+        self._worker_threads: List[threading.Thread] = []
+        self._inflight = 0
+        self._submitted = 0
+        self._worker_limit = 1
+        self._announced_parallel = 1
+        self._slot_lock = threading.Lock()
     
     def add_job(
         self,
@@ -2794,38 +2873,78 @@ class BatchProcessor:
         """Add a job to the batch queue."""
         import uuid
         job_id = job_id or str(uuid.uuid4())[:8]
-        
+
         self._queue.put((job_id, input_file, output_file, profile))
+        with self._slot_lock:
+            self._submitted += 1
+            if self._running:
+                self._announced_parallel = max(
+                    1,
+                    min(self._worker_limit, self._submitted),
+                )
         return job_id
     
     def start(self, max_concurrent: int = 1):
-        """Start processing the batch queue."""
+        """Start processing the batch queue.
+
+        ``max_concurrent`` is the requested wave size. The encode governor can
+        lower it when the CPU or a hardware encoder cannot host that many
+        sessions. Each job is told that wave size so threads are split once.
+        """
         if self._running:
             return
-        
+
         self._running = True
-        
+        self._worker_limit = max(1, int(max_concurrent or 1))
+        with self._slot_lock:
+            self._announced_parallel = max(1, min(self._worker_limit, max(1, self._submitted)))
+
         def worker():
             while self._running:
                 try:
-                    job_id, input_file, output_file, profile = self._queue.get(timeout=1)
-                    result = self.compressor.compress(
-                        input_file, output_file, profile, job_id
-                    )
-                    self._results[job_id] = result
-                    self._queue.task_done()
+                    job_id, input_file, output_file, profile = self._queue.get(timeout=0.2)
                 except queue.Empty:
                     continue
+                try:
+                    with self._slot_lock:
+                        self._inflight += 1
+                        planned = self._announced_parallel
+                    try:
+                        planned = self.compressor.queue_slots(
+                            profile,
+                            requested_parallel=planned,
+                            queued_files=planned,
+                        )
+                    except Exception:
+                        logger.debug("Batch slot plan fell back to the worker limit", exc_info=True)
+                    result = self.compressor.compress(
+                        input_file,
+                        output_file,
+                        profile,
+                        job_id,
+                        parallel_jobs=planned,
+                    )
+                    self._results[job_id] = result
                 except Exception as e:
                     logger.error(f"Batch processing error: {e}")
-        
-        self._worker_thread = threading.Thread(target=worker, daemon=True)
-        self._worker_thread.start()
-    
+                finally:
+                    with self._slot_lock:
+                        self._inflight = max(0, self._inflight - 1)
+                    self._queue.task_done()
+
+        self._worker_threads = []
+        for _ in range(self._worker_limit):
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            self._worker_threads.append(thread)
+        self._worker_thread = self._worker_threads[0]
+
     def stop(self):
         """Stop batch processing."""
         self._running = False
-        if self._worker_thread:
+        for thread in self._worker_threads:
+            thread.join(timeout=2)
+        if self._worker_thread and self._worker_thread not in self._worker_threads:
             self._worker_thread.join(timeout=2)
     
     def get_result(self, job_id: str) -> Optional[CompressionResult]:

@@ -258,3 +258,35 @@ def test_cli_accepts_compare_and_batch_flags():
     assert args.compare is True
     assert args.compare_seconds == 12
     assert args.batch_order == "largest-first"
+
+
+def test_cli_jobs_pass_one_shared_wave_size(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from video_compressor.core.compressor import CompressionResult, VideoCompressor
+
+    first = tmp_path / "a.mp4"
+    second = tmp_path / "b.mp4"
+    first.write_bytes(b"0")
+    second.write_bytes(b"0")
+    seen = []
+
+    def fake_compress(self, input_file, output_file, profile, job_id=None, parallel_jobs=1):
+        seen.append(parallel_jobs)
+        return CompressionResult(
+            success=True,
+            input_file=Path(input_file),
+            output_file=Path(output_file),
+            skipped=True,
+            original_size=10,
+            compressed_size=10,
+        )
+
+    def fake_slots(self, profile, *, requested_parallel, queued_files, media_info=None):
+        return min(int(requested_parallel), int(queued_files), 2)
+
+    monkeypatch.setattr(VideoCompressor, "compress", fake_compress)
+    monkeypatch.setattr(VideoCompressor, "queue_slots", fake_slots)
+
+    assert main([str(first), str(second), "--jobs", "8", "--quiet"]) == 0
+    assert seen == [2, 2]
