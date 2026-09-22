@@ -114,7 +114,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $tag = "${{ github.ref_name }}"
-          $notes = git tag -l --format="%(contents)" $tag
+          # actions/checkout may materialize a lightweight tag, so read the
+          # annotated tag message from the GitHub API instead of the local ref.
+          $ref = gh api "repos/${{ github.repository }}/git/ref/tags/$tag" | ConvertFrom-Json
+          if ($ref.object.type -ne "tag") { throw "Tag $tag is not annotated" }
+          $tagObj = gh api "repos/${{ github.repository }}/git/tags/$($ref.object.sha)" | ConvertFrom-Json
+          $notes = $tagObj.message
           if ([string]::IsNullOrWhiteSpace($notes)) { throw "Tag $tag has no annotation; refusing to publish empty notes" }
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
           [System.IO.File]::WriteAllText($notesPath, $notes.Trim() + "`n")
