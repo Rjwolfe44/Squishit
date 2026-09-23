@@ -84,14 +84,23 @@ def bind_main_window_software_fallback(
     ui_queue: Any,
     *,
     ui_thread: Optional[threading.Thread] = None,
+    ask: Optional[Callable[..., Any]] = None,
 ) -> None:
-    """Install the main-window confirm callback on ``compressor``."""
+    """Install the main-window confirm callback on ``compressor``.
 
+    ``ask`` replaces the Tk yes/no box. The Qt shell passes its own dialog.
+    The queued path reads ``window._software_fallback_ask`` so the worker
+    thread still gets that same dialog on the UI thread.
+    """
+
+    window._software_fallback_ask = ask
     owner = ui_thread or threading.current_thread()
 
     def callback(request: SoftwareFallbackRequest) -> bool:
         if threading.current_thread() is owner:
-            return show_software_fallback_dialog(window, request)
+            if ask is None:
+                return show_software_fallback_dialog(window, request)
+            return show_software_fallback_dialog(window, request, ask=ask)
 
         holder = {"value": False}
         done = threading.Event()
@@ -125,7 +134,11 @@ def finish_software_fallback_prompt(
     """Run on the UI thread after the queue pump receives the ask."""
 
     try:
-        holder["value"] = show_software_fallback_dialog(window, request)
+        ask = getattr(window, "_software_fallback_ask", None)
+        if ask is None:
+            holder["value"] = show_software_fallback_dialog(window, request)
+        else:
+            holder["value"] = show_software_fallback_dialog(window, request, ask=ask)
     except Exception:
         logger.exception(
             "Software fallback dialog failed; keeping the hardware encoder"

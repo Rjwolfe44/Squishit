@@ -93,9 +93,11 @@ winget install ffmpeg
 # 3. Set up the app:
 setup.bat
 
-# 4. Run:
+# 4. Run the PySide6 shell:
 run.bat
 ```
+
+`run.bat` and `python -m video_compressor` open the Qt window. Quick Compress from a file is `python -m video_compressor --quick-compress path\to\video.mp4`. The older CustomTkinter shell is still in the tree for reference. Install it with `pip install -e ".[legacy-ui]"` and start it with `set SQUISHIT_UI=ctk` before `run.bat`. The packaged app does not include that shell.
 
 ### Option B — Installer
 Download `SquishIt-Setup-vX.X.X.exe` from [GitHub Releases](https://github.com/Rjwolfe44/Squishit/releases), install, and launch from the Start Menu or Desktop shortcut.
@@ -143,7 +145,7 @@ python cli.py --hardware
 
 ## Dev Tooling
 
-GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. The suite does not open a GUI. CI installs FFmpeg, then runs the unit tests and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC), and that Quick Lite plus both Max lanes (`libx265` and `libsvtav1`) stay inside soft encode-time, file-size, and SSIM bounds. Those bounds are documented in `tests/test_encode_ladder_regression.py`. Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
+GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. CI installs FFmpeg and the Qt platform libraries, then runs the unit tests — including an offscreen PySide6 launch check — and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC), and that Quick Lite plus both Max lanes (`libx265` and `libsvtav1`) stay inside soft encode-time, file-size, and SSIM bounds. Those bounds are documented in `tests/test_encode_ladder_regression.py`. Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
 
 All dev commands go through `dev.bat`:
 
@@ -190,9 +192,11 @@ video_compressor/          # Main package (launch: python -m video_compressor)
 │   ├── profiles.py         # Compression profiles
 │   └── utils.py            # Utility functions
 └── gui/
-    ├── main_window.py      # Main application window
-    ├── quick_compress.py   # Minimal progress window for context menu
-    └── widgets.py          # Custom UI widgets
+    ├── launch.py           # Default Qt shell; SQUISHIT_UI=ctk for legacy
+    ├── qt_shell/           # PySide6 main window, Quick Compress, settings
+    ├── main_window.py      # Legacy CustomTkinter window
+    ├── quick_compress.py   # Legacy context-menu window
+    └── widgets.py          # Legacy CustomTkinter widgets
 
 tools/                      # Build & dev tools
 ├── register_context_menu.py
@@ -205,7 +209,7 @@ tools/                      # Build & dev tools
 ├── benchmark.py            # Encoder benchmark
 └── install_dev.bat         # Dev environment setup
 
-tests/                      # Test suite (pytest; no display required)
+tests/                      # Test suite (pytest; Qt launch check is offscreen)
 ├── test_cli.py
 ├── test_codecs.py
 ├── test_config.py
@@ -224,11 +228,13 @@ tests/                      # Test suite (pytest; no display required)
 - **Windows 10/11** (context menu integration is Windows-only)
 
 ### Python Dependencies
-- customtkinter, tkinterdnd2 — GUI
+- PySide6 — desktop shell (Qt for Python, LGPL, separate from SquishIt's license)
 - Pillow — Image compression
 - psutil — CPU info
 - WMI — Windows hardware detection
 - pyyaml — Configuration
+
+PySide6 replaces CustomTkinter in the installer. Qt libraries ship beside the app in the onedir build, so the installer grows by roughly the Qt runtime (on the order of 100 MB unpacked). CustomTkinter is no longer packaged.
 
 ---
 
@@ -253,4 +259,4 @@ FFmpeg, which SquishIt uses to encode media, remains under its own LGPL/GPL term
 ## Acknowledgments
 
 - [FFmpeg](https://ffmpeg.org/) — Video encoding backbone
-- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) — Modern Tkinter widgets
+- [Qt for Python (PySide6)](https://doc.qt.io/qtforpython/) — Desktop shell

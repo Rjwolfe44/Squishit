@@ -1,12 +1,15 @@
 """
-GUI module for the video compressor.
+GUI package.
 
-Submodules stay importable without CustomTkinter. The window and widgets
-load on first attribute access.
+The default shell is PySide6 (``video_compressor.gui.qt_shell``). Importing
+this package does not load Qt or CustomTkinter. ``MainWindow`` resolves to
+the Qt window. The legacy CustomTkinter widgets stay in ``widgets.py`` and
+load only when something asks for them.
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 __all__ = [
@@ -38,16 +41,17 @@ _WIDGET_EXPORTS = {
 
 def __getattr__(name: str) -> Any:
     if name == "MainWindow":
-        from .main_window import MainWindow
+        from .qt_shell.main_window import SquishItWindow
 
-        return MainWindow
+        return SquishItWindow
     if name == "run_quick_compress":
-        from .quick_compress import run_quick_compress
+        from .launch import run_quick_compress
 
         return run_quick_compress
     if name in _WIDGET_EXPORTS:
-        from . import widgets
-
+        widgets = importlib.import_module(
+            ".".join(("video_compressor", "gui", "widgets"))
+        )
         if name == "VideoCard":
             return widgets.FileQueueCard
         return getattr(widgets, name)

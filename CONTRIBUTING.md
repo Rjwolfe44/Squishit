@@ -14,7 +14,7 @@ setup.bat
 dev.bat test
 ```
 
-You need Python 3.10+ and FFmpeg on `PATH`. `dev.bat test` runs pytest. The `smoke` tests need `ffmpeg`.
+You need Python 3.10+ and FFmpeg on `PATH`. `dev.bat test` runs pytest. The `smoke` tests need `ffmpeg`. The desktop shell is PySide6, installed with the rest of the requirements. `SQUISHIT_UI=ctk` opens the previous CustomTkinter windows after `pip install -e ".[legacy-ui]"`.
 
 On Linux or macOS:
 

@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files
 
 project_root = Path.cwd()
 ffmpeg_dir = project_root / "vendor" / "ffmpeg"
@@ -13,7 +12,9 @@ for binary_name in ("ffmpeg.exe", "ffprobe.exe", "cjxl.exe"):
     if binary_path.exists():
         binaries.append((str(binary_path), "vendor/ffmpeg"))
 
-datas = collect_data_files("customtkinter") + collect_data_files("tkinterdnd2")
+# Qt plugins come from the PySide6 hook once the shell is imported.
+# CustomTkinter is not on the default import path.
+datas = []
 if icon_path.exists():
     datas.append((str(icon_path), "assets"))
 
@@ -24,11 +25,17 @@ a = Analysis(
     pathex=[str(project_root)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["pystray._win32", "PIL.ImageTk", "tkinterdnd2"],
+    hiddenimports=[
+        "PySide6.QtCore",
+        "PySide6.QtGui",
+        "PySide6.QtWidgets",
+        "pystray._win32",
+        "PIL.Image",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["customtkinter", "tkinterdnd2"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

@@ -114,6 +114,29 @@ def test_dialog_yes_no_and_dismiss():
     assert show_software_fallback_dialog(window, request, ask=ask) is False
 
 
+def test_queued_prompt_uses_the_window_ask():
+    """The Qt shell stores its dialog on the window for the worker-thread path."""
+
+    request = _request()
+    seen = {}
+
+    def ask(title, body, parent=None, default="no"):
+        seen["title"] = title
+        seen["parent"] = parent
+        seen["default"] = default
+        return False
+
+    window = SimpleNamespace(_software_fallback_ask=ask)
+    holder = {}
+    done = threading.Event()
+    finish_software_fallback_prompt(window, request, holder, done)
+    assert holder["value"] is False
+    assert seen["default"] == "no"
+    assert seen["parent"] is window
+    assert seen["title"] == "Retry with software encoder?"
+    assert done.is_set()
+
+
 def test_dialog_error_or_closed_window_declines():
     def boom(*_args, **_kwargs):
         raise RuntimeError("tk")

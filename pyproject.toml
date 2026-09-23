@@ -38,8 +38,7 @@ classifiers = [
     "Topic :: Multimedia :: Video :: Encoding",
 ]
 dependencies = [
-    "customtkinter>=5.2.0",
-    "tkinterdnd2>=0.4.3",
+    "PySide6>=6.6.0",
     "Pillow>=10.0.0",
     "pystray>=0.19.5",
     "ffmpeg-python>=0.2.0",
@@ -64,16 +63,20 @@ dev = [
 hardware = [
     "pyopencl>=2024.0",
 ]
+legacy-ui = [
+    "customtkinter>=5.2.0",
+    "tkinterdnd2>=0.4.3",
+]
 
 [project.scripts]
-squishit = "video_compressor.gui.main_window:run_app"
+squishit = "video_compressor.gui.launch:run_app"
 squishit-cli = "cli:main"
-video-compressor = "video_compressor.gui.main_window:run_app"
+video-compressor = "video_compressor.gui.launch:run_app"
 video-compressor-cli = "cli:main"
 
 [project.gui-scripts]
-squishit-gui = "video_compressor.gui.main_window:run_app"
-video-compressor-gui = "video_compressor.gui.main_window:run_app"
+squishit-gui = "video_compressor.gui.launch:run_app"
+video-compressor-gui = "video_compressor.gui.launch:run_app"
 
 [tool.setuptools]
 py-modules = ["cli"]
