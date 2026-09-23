@@ -3,13 +3,14 @@ Hardware detection and optimization for video compression.
 Detects CPU, GPU, and hardware encoder capabilities.
 """
 
+import json
 import platform
 import subprocess
 import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from enum import Enum
 import multiprocessing
 
@@ -23,6 +24,200 @@ except ImportError:
     HAS_PSUTIL = False
 
 logger = logging.getLogger(__name__)
+
+# Vendor token stored on HardwareInfo.preferred_hw_encoder. The family name
+# is the encoder API users see (NVENC / QSV / AMF).
+_HW_ENCODER_FAMILY = {
+    "nvidia": "NVENC",
+    "intel": "QSV",
+    "amd": "AMF",
+    "apple": "VideoToolbox",
+}
+
+# Windows PowerShell 5.1 writes UTF-16 to a pipe unless this is set first.
+# WMIC is gone by default on Windows 11 24H2/25H2, so CIM is the primary query.
+_CIM_VIDEO_COMMAND = (
+    "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
+    "$OutputEncoding = [Console]::OutputEncoding; "
+    "Get-CimInstance Win32_VideoController | "
+    "Select-Object Name,AdapterRAM,PNPDeviceID | "
+    "ConvertTo-Json -Compress"
+)
+
+
+def _hidden_window_flag() -> int:
+    """CREATE_NO_WINDOW on Windows. Missing on other interpreters."""
+
+    if platform.system() != "Windows":
+        return 0
+    return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _decode_command_output(payload: Any) -> str:
+    """Decode a Windows console capture.
+
+    ``powershell.exe`` and ``wmic.exe`` often write UTF-16 LE to a pipe.
+    ``text=True`` then decodes that as the ANSI code page, JSON parsing
+    fails, and the adapter list comes back empty.
+    """
+
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        if "\x00" not in payload:
+            return payload
+        try:
+            payload = payload.encode("latin-1")
+        except UnicodeEncodeError:
+            return payload.replace("\x00", "")
+    if not payload:
+        return ""
+    if payload.startswith(b"\xff\xfe") or payload.startswith(b"\xfe\xff"):
+        text = payload.decode("utf-16", errors="replace")
+    elif len(payload) >= 4 and payload[1] == 0 and payload[3] == 0:
+        text = payload.decode("utf-16-le", errors="replace")
+    else:
+        text = payload.decode("utf-8-sig", errors="replace")
+    return text.replace("\x00", "").lstrip("\ufeff").strip()
+
+
+def _adapter_ram_mb(value: Any) -> int:
+    """Megabytes from Win32_VideoController.AdapterRAM.
+
+    The property is a uint32. Values above 2 GiB often arrive as negative
+    signed integers, and nothing above 4 GiB can be represented. Callers
+    use this for display only; encoder detection does not depend on it.
+    """
+
+    if value is None or value is False:
+        return 0
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() == "null":
+            return 0
+        value = text
+    try:
+        ram = int(value)
+    except (TypeError, ValueError):
+        try:
+            ram = int(float(value))
+        except (TypeError, ValueError):
+            return 0
+    if ram < 0:
+        ram += 1 << 32
+    if ram <= 0:
+        return 0
+    return ram // (1024 * 1024)
+
+
+def _is_amd_display(name: str, pnp: str = "") -> bool:
+    """True for an AMD display adapter, including RX 9070 XT / Navi 48.
+
+    Friendly names usually contain AMD or Radeon. Some driver strings are
+    only the chip name (``Navi 48``); those still carry PCI vendor 1002.
+    The matching AMD HDMI/DP audio function is not a GPU.
+    """
+
+    upper = (name or "").upper()
+    if "AUDIO" in upper or "SOUND" in upper:
+        return False
+    if "AMD" in upper or "RADEON" in upper:
+        return True
+    pnp_upper = (pnp or "").upper().replace("\\\\", "\\")
+    return "PCI\\VEN_1002" in pnp_upper
+
+
+def _amd_display_rank(name: str) -> int:
+    """Put a discrete Radeon ahead of an integrated one.
+
+    CIM often enumerates the iGPU first. The Qt card shows the first GPU
+    name for a vendor, so an RX 9070 XT should come before "Radeon Graphics".
+    """
+
+    upper = (name or "").upper()
+    if re.search(r"\bRX\b", upper) or "RADEON PRO" in upper or "FIREPRO" in upper:
+        return 0
+    if re.search(r"\bGRAPHICS\b", upper):
+        return 2
+    return 1
+
+
+def _parse_cim_video_controllers(payload: Any) -> List[Dict[str, Any]]:
+    """Parse ``Get-CimInstance Win32_VideoController`` JSON."""
+
+    text = _decode_command_output(payload)
+    if not text:
+        return []
+    start_obj = text.find("{")
+    start_arr = text.find("[")
+    starts = [index for index in (start_obj, start_arr) if index >= 0]
+    if not starts:
+        return []
+    try:
+        raw = json.loads(text[min(starts):])
+    except json.JSONDecodeError:
+        logger.debug("Could not parse CIM video-controller JSON")
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+
+    controllers: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("Name") or item.get("Caption") or "").strip()
+        pnp = str(item.get("PNPDeviceID") or "").strip()
+        if not name and not pnp:
+            continue
+        controllers.append(
+            {
+                "name": name,
+                "memory_mb": _adapter_ram_mb(item.get("AdapterRAM")),
+                "pnp": pnp,
+            }
+        )
+    return controllers
+
+
+def _parse_wmic_video_controllers(payload: Any) -> List[Dict[str, Any]]:
+    """Parse ``wmic path Win32_VideoController get name,AdapterRAM``."""
+
+    text = _decode_command_output(payload)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+    header = lines[0].lower()
+    if "adapterram" in header or header == "name":
+        lines = lines[1:]
+
+    controllers: List[Dict[str, Any]] = []
+    for line in lines:
+        if line.lower().startswith("no instance"):
+            continue
+        ram_first = re.match(r"^(?P<ram>-?\d+)\s+(?P<name>.+)$", line)
+        if ram_first:
+            controllers.append(
+                {
+                    "name": ram_first.group("name").strip(),
+                    "memory_mb": _adapter_ram_mb(ram_first.group("ram")),
+                    "pnp": "",
+                }
+            )
+            continue
+        name_first = re.match(r"^(?P<name>.+?)\s+(?P<ram>-?\d+)$", line)
+        if name_first:
+            controllers.append(
+                {
+                    "name": name_first.group("name").strip(),
+                    "memory_mb": _adapter_ram_mb(name_first.group("ram")),
+                    "pnp": "",
+                }
+            )
+            continue
+        controllers.append({"name": line, "memory_mb": 0, "pnp": ""})
+    return controllers
 
 
 class GPUVendor(Enum):
@@ -59,7 +254,21 @@ class HardwareInfo:
     recommended_threads: int = 4
     has_hw_encoder: bool = False
     preferred_hw_encoder: Optional[str] = None
-    
+
+    def encoding_label(self) -> str:
+        """Status text for ``cli.py --hardware`` and the hardware summary.
+
+        The vendor token stays ``nvidia`` / ``intel`` / ``amd`` so encoder
+        selection is unchanged. The family name is what the machine can run.
+        """
+
+        if not self.has_hw_encoder or not self.preferred_hw_encoder:
+            return "Not Available"
+        family = _HW_ENCODER_FAMILY.get(self.preferred_hw_encoder, "")
+        if family:
+            return f"Available ({self.preferred_hw_encoder} / {family})"
+        return f"Available ({self.preferred_hw_encoder})"
+
     def __str__(self) -> str:
         lines = [
             f"OS: {self.os_name} {self.os_version}",
@@ -70,7 +279,7 @@ class HardwareInfo:
         for gpu in self.gpus:
             lines.append(f"  - {gpu}")
         if self.has_hw_encoder:
-            lines.append(f"Hardware Encoding: {self.preferred_hw_encoder}")
+            lines.append(f"Hardware Encoding: {self.encoding_label()}")
         return "\n".join(lines)
 
 
@@ -79,6 +288,7 @@ class HardwareDetector:
     
     def __init__(self):
         self._info: Optional[HardwareInfo] = None
+        self._windows_controllers: Optional[List[Dict[str, Any]]] = None
     
     @property
     def info(self) -> HardwareInfo:
@@ -198,8 +408,17 @@ class HardwareDetector:
         return 8.0  # Default assumption
     
     def _detect_gpus(self) -> List[GPUInfo]:
-        """Detect available GPUs."""
+        """Detect available GPUs.
+
+        FFmpeg's ``-encoders`` list is not a GPU inventory. A Windows build
+        can list ``h264_nvenc``, ``h264_qsv``, and ``h264_amf`` together when
+        only one vendor is installed; the others are compile-time stubs.
+        Vendor comes from the display-adapter query. Encoder selection checks
+        FFmpeg afterwards and still prefers NVENC, then QSV, then AMF.
+        """
+
         gpus = []
+        self._windows_controllers = None
         system = platform.system()
         
         # Check for NVIDIA GPUs
@@ -267,23 +486,30 @@ class HardwareDetector:
         
         if system == "Windows":
             try:
+                seen = set()
                 for controller in self._get_windows_video_controllers():
-                    name = controller.get("name", "").strip()
-                    if not name:
+                    name = str(controller.get("name") or "").strip()
+                    pnp = str(controller.get("pnp") or "")
+                    if not _is_amd_display(name, pnp):
                         continue
-                    if "AMD" in name.upper() or "RADEON" in name.upper():
-                        gpus.append(GPUInfo(
-                            name=name,
-                            vendor=GPUVendor.AMD,
-                            memory_mb=controller.get("memory_mb", 0),
-                            encoder_support={
-                                "h264": True,
-                                "hevc": True,
-                                "av1": self._amd_supports_av1(name),
-                            }
-                        ))
+                    if not name:
+                        name = "AMD Radeon"
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    gpus.append(GPUInfo(
+                        name=name,
+                        vendor=GPUVendor.AMD,
+                        memory_mb=int(controller.get("memory_mb") or 0),
+                        encoder_support={
+                            "h264": True,
+                            "hevc": True,
+                            "av1": self._amd_supports_av1(name),
+                        }
+                    ))
             except Exception as e:
                 logger.debug(f"Error detecting AMD GPU: {e}")
+            gpus.sort(key=lambda gpu: _amd_display_rank(gpu.name))
         
         elif system == "Linux":
             try:
@@ -388,73 +614,71 @@ class HardwareDetector:
             return False, None
         return True, ordered[0]
 
-    def _get_windows_video_controllers(self) -> List[Dict[str, int | str]]:
-        """Get Windows display controllers with names and memory where possible."""
-        controllers: List[Dict[str, int | str]] = []
+    def _get_windows_video_controllers(self) -> List[Dict[str, Any]]:
+        """Display controllers from CIM, then WMIC if CIM returns nothing.
 
-        wmic_result = subprocess.run(
-            ["wmic", "path", "win32_VideoController", "get", "name,AdapterRAM"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
+        Windows 11 24H2 and 25H2 do not install ``wmic.exe`` by default.
+        The old query called WMIC first and treated ``FileNotFoundError`` as
+        "no AMD GPU", so the CIM fallback never ran. CIM is the query that
+        sees an RX 9070 XT on those installs.
+        """
 
-        if wmic_result.returncode == 0 and wmic_result.stdout.strip():
-            for line in wmic_result.stdout.strip().splitlines()[1:]:
-                line = line.strip()
-                if not line:
-                    continue
-                match = re.match(r"^(?P<name>.+?)\s+(?P<ram>\d+)$", line)
-                if match:
-                    ram_bytes = int(match.group("ram"))
-                    controllers.append({
-                        "name": match.group("name").strip(),
-                        "memory_mb": ram_bytes // (1024 * 1024),
-                    })
-                    continue
+        if self._windows_controllers is not None:
+            return self._windows_controllers
 
-                reversed_match = re.match(r"^(?P<ram>\d+)\s+(?P<name>.+)$", line)
-                if reversed_match:
-                    ram_bytes = int(reversed_match.group("ram"))
-                    controllers.append({
-                        "name": reversed_match.group("name").strip(),
-                        "memory_mb": ram_bytes // (1024 * 1024),
-                    })
-                else:
-                    controllers.append({"name": line, "memory_mb": 0})
-
-        if controllers:
-            return controllers
-
-        powershell_result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Json -Compress",
-            ],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-
-        if powershell_result.returncode != 0 or not powershell_result.stdout.strip():
-            return []
-
-        import json
-
-        raw = json.loads(powershell_result.stdout)
-        if isinstance(raw, dict):
-            raw = [raw]
-
-        for item in raw:
-            ram_bytes = int(item.get("AdapterRAM") or 0)
-            controllers.append({
-                "name": str(item.get("Name") or "").strip(),
-                "memory_mb": ram_bytes // (1024 * 1024),
-            })
-
+        controllers = self._controllers_from_cim()
+        if not controllers:
+            controllers = self._controllers_from_wmic()
+        self._windows_controllers = controllers
         return controllers
+
+    def _run_command(self, args: List[str]) -> Optional[subprocess.CompletedProcess]:
+        """Run a detector helper. A missing executable is an empty result."""
+
+        try:
+            return subprocess.run(
+                args,
+                capture_output=True,
+                check=False,
+                creationflags=_hidden_window_flag(),
+            )
+        except OSError as exc:
+            logger.debug("Command %s unavailable: %s", args[0], exc)
+            return None
+
+    def _controllers_from_cim(self) -> List[Dict[str, Any]]:
+        """``Get-CimInstance Win32_VideoController`` via Windows PowerShell."""
+
+        for executable in ("powershell", "pwsh"):
+            result = self._run_command(
+                [
+                    executable,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    _CIM_VIDEO_COMMAND,
+                ]
+            )
+            if result is None:
+                continue
+            parsed = _parse_cim_video_controllers(result.stdout)
+            if parsed:
+                return parsed
+            stdout = result.stdout or b""
+            stderr = result.stderr or b""
+            if result.returncode == 0 and not stdout.strip() and not stderr.strip():
+                return []
+        return []
+
+    def _controllers_from_wmic(self) -> List[Dict[str, Any]]:
+        """Legacy WMIC listing, used only when CIM returned no controllers."""
+
+        result = self._run_command(
+            ["wmic", "path", "win32_VideoController", "get", "name,AdapterRAM"]
+        )
+        if result is None or result.returncode != 0:
+            return []
+        return _parse_wmic_video_controllers(result.stdout)
 
     def _amd_supports_av1(self, gpu_name: str) -> bool:
         """Detect AV1 encode support for modern AMD GPUs."""

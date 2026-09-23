@@ -454,10 +454,7 @@ def show_hardware():
         for gpu in info.gpus:
             print(f"    - {gpu.name}")
     
-    if info.has_hw_encoder:
-        print(f"\n  Hardware Encoding: Available ({info.preferred_hw_encoder})")
-    else:
-        print(f"\n  Hardware Encoding: Not Available")
+    print(f"\n  Hardware Encoding: {info.encoding_label()}")
     
     print(f"\n  Recommended Threads: {info.recommended_threads}")
 
