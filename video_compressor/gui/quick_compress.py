@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import queue
-import subprocess
 import sys
 import tkinter as tk
 from tkinter import messagebox
@@ -21,6 +20,7 @@ from ..core.profiles import (
 from ..core.codecs import VideoCodec
 from ..config import APP_NAME, get_config_manager
 from .copy import QUICK_COMPRESS_SUBTITLE, QUICK_COMPRESS_TITLE
+from .relaunch import spawn_app
 from .scaling import apply_tk_scaling, center_window, resolve_ui_scale, scaled
 
 # Quick Lite (H.264) / Balanced (HEVC) / HEVC Max. CRF and preset come from the ladder.
@@ -332,7 +332,7 @@ class QuickCompressWindow(tk.Tk):
         self.destroy()
 
     def _open_full_app(self) -> None:
-        subprocess.Popen([sys.executable, "-m", "video_compressor", "--open", str(self.input_file)])
+        spawn_app(["--open", str(self.input_file)])
         self.after(0, self.destroy)
 
 

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
-from typing import Optional
 
-import pystray
 from PIL import Image, ImageDraw
 
 from ..config import APP_NAME
+from .relaunch import spawn_app
 
 
 def _create_icon_image() -> Image.Image:
@@ -22,12 +19,18 @@ def _create_icon_image() -> Image.Image:
 
 
 def _spawn(args: list[str]) -> None:
-    """Start a Qt process. The tray icon keeps the GUI off its own thread."""
+    """Start a Qt process. The tray icon keeps the GUI off its own thread.
 
-    subprocess.Popen([sys.executable, "-m", "video_compressor", *args])
+    Frozen ``SquishIt.exe`` is launched with the flags it already accepts.
+    Source runs still use ``python -m video_compressor``.
+    """
+
+    spawn_app(args)
 
 
-def run_tray(startup_file: Optional[Path] = None) -> None:
+def run_tray(startup_file: Path | None = None) -> None:
+    import pystray
+
     def open_app(_icon, _item) -> None:
         _spawn([])
 

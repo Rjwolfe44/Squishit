@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import queue
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -38,6 +37,7 @@ from ...core.profiles import (
 )
 from ...core.utils import detect_media_type, get_image_extension, get_video_extension
 from ..copy import QUICK_COMPRESS_SUBTITLE, QUICK_COMPRESS_TITLE
+from ..relaunch import spawn_app
 from .theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -302,9 +302,7 @@ class QuickCompressWindow(QWidget):
             QMessageBox.critical(self, APP_NAME, result.error_message or "Compression failed")
 
     def _open_full_app(self) -> None:
-        subprocess.Popen(
-            [sys.executable, "-m", "video_compressor", "--open", str(self.input_file)]
-        )
+        spawn_app(["--open", str(self.input_file)])
         self.close()
 
     def closeEvent(self, event) -> None:  # noqa: N802
