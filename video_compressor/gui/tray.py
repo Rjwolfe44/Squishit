@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import threading
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw
 import pystray
+from PIL import Image, ImageDraw
 
 from ..config import APP_NAME
 
@@ -20,18 +21,21 @@ def _create_icon_image() -> Image.Image:
     return image
 
 
-def run_tray(startup_file: Optional[Path] = None) -> None:
-    from .main_window import run_app
-    from .quick_compress import run_quick_compress
+def _spawn(args: list[str]) -> None:
+    """Start a Qt process. The tray icon keeps the GUI off its own thread."""
 
+    subprocess.Popen([sys.executable, "-m", "video_compressor", *args])
+
+
+def run_tray(startup_file: Optional[Path] = None) -> None:
     def open_app(_icon, _item) -> None:
-        threading.Thread(target=run_app, daemon=True).start()
+        _spawn([])
 
     def quick_open(_icon, _item) -> None:
         if startup_file:
-            threading.Thread(target=lambda: run_quick_compress(startup_file), daemon=True).start()
+            _spawn(["--quick-compress", str(startup_file)])
         else:
-            threading.Thread(target=run_app, daemon=True).start()
+            _spawn([])
 
     def quit_app(_icon, _item) -> None:
         icon.stop()

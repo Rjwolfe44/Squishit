@@ -57,12 +57,12 @@ def main() -> None:
             return
         startup_files = [args.open_file]
     elif args.quick_compress:
-        from video_compressor.gui.quick_compress import run_quick_compress
+        from video_compressor.gui.launch import run_quick_compress
 
         run_quick_compress(args.quick_compress)
         return
 
-    from video_compressor.gui.main_window import run_app
+    from video_compressor.gui.launch import run_app
 
     run_app(startup_files=startup_files, auto_start=False)
 
