@@ -17,14 +17,34 @@ from ..core.descriptions import (
 )
 from ..core.utils import format_size, format_time
 
-PROFILE_HELPER = "Full app profiles (incl. Archival Max)."
+PROFILE_HELPER = "Other presets are here, including archive quality."
 QUICK_COMPRESS_TITLE = "Quick Compress"
-QUICK_COMPRESS_SUBTITLE = (
-    "Explorer one-click · Lite / Balanced / HEVC Max — not the full profile list."
+QUICK_COMPRESS_SUBTITLE = "Pick a preset, then press Quick Compress."
+HOME_TAGLINE = "Shrink a video or image."
+MORE_OPTIONS_TITLE = "More options"
+MORE_OPTIONS_HINT = "Optional. Quick Compress on the left is enough for most files."
+EXTRA_SETTINGS_LABEL = "Show extra settings"
+DROP_ZONE_TITLE = "Drop a video or image"
+DROP_ZONE_NEXT = "Then pick a preset below and press Quick Compress."
+EMPTY_QUEUE = "Nothing here yet"
+QUICK_PRESET_BLURBS = {
+    "Quick Lite": "Fastest. A smaller file without a long wait.",
+    "Balanced": "Recommended. Smaller file that still looks good.",
+    "HEVC Max": "Smallest of the quick presets. Takes longer.",
+}
+PROFILE_FRIENDLY = {
+    "Fast": "Faster encode, larger file.",
+    "Balanced": "Everyday choice in the full preset list.",
+    "Max / Archival": "Smallest archive file. Uses software, not the graphics card.",
+}
+TRAY_HINT = "Closing or minimizing this window does not put SquishIt in the tray."
+TRAY_HELP = (
+    "Closing or minimizing this window does not put SquishIt in the tray.\n\n"
+    "The tray icon is a separate helper. Turn on Start SquishIt tray with Windows "
+    "in the installer, or launch SquishIt with --tray. That icon can open SquishIt "
+    "or Quick Compress. Quit on the icon exits the tray."
 )
-DROP_ZONE_TITLE = "Drop videos or images"
-DROP_ZONE_NEXT = "They queue on the left. Choose a profile, then press Compress."
-EMPTY_QUEUE = "Add files to start"
+HELP_TRAY = "Tray icon"
 MORE_MENU_LABEL = "More…"
 MORE_PROFILES_TOOLTIP = (
     "YouTube / social upload, Mobile, Streaming upload, and custom profiles. "
@@ -43,13 +63,22 @@ __all__ = [
     "DROP_ZONE_NEXT",
     "DROP_ZONE_TITLE",
     "EMPTY_QUEUE",
+    "EXTRA_SETTINGS_LABEL",
     "FINISHING_PROGRESS",
+    "HELP_TRAY",
+    "HOME_TAGLINE",
     "MORE_MENU_LABEL",
+    "MORE_OPTIONS_HINT",
+    "MORE_OPTIONS_TITLE",
     "MORE_PROFILES_TOOLTIP",
+    "PROFILE_FRIENDLY",
     "PROFILE_HELPER",
     "PROGRESS_PHASES",
     "QUICK_COMPRESS_SUBTITLE",
     "QUICK_COMPRESS_TITLE",
+    "QUICK_PRESET_BLURBS",
+    "TRAY_HELP",
+    "TRAY_HINT",
     "STREAMING_UPLOAD_DESCRIPTION",
     "STREAMING_UPLOAD_LABEL",
     "WAITING_FOR_SOFTWARE_FALLBACK",

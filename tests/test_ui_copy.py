@@ -21,10 +21,13 @@ from video_compressor.gui.copy import (
     DROP_ZONE_NEXT,
     DROP_ZONE_TITLE,
     EMPTY_QUEUE,
+    HOME_TAGLINE,
     MORE_PROFILES_TOOLTIP,
     PROFILE_HELPER,
     QUICK_COMPRESS_SUBTITLE,
     QUICK_COMPRESS_TITLE,
+    QUICK_PRESET_BLURBS,
+    TRAY_HINT,
     WAITING_FOR_SOFTWARE_FALLBACK,
     help_menu_items,
     human_progress_status,
@@ -86,6 +89,9 @@ def test_profile_and_quick_copy_describes_file_upload(tmp_path):
         PROFILE_HELPER,
         QUICK_COMPRESS_TITLE,
         QUICK_COMPRESS_SUBTITLE,
+        HOME_TAGLINE,
+        TRAY_HINT,
+        *QUICK_PRESET_BLURBS.values(),
         DROP_ZONE_TITLE,
         DROP_ZONE_NEXT,
         EMPTY_QUEUE,
@@ -96,12 +102,15 @@ def test_profile_and_quick_copy_describes_file_upload(tmp_path):
         streaming_label,
         streaming_tip,
     )
-    assert PROFILE_HELPER == "Full app profiles (incl. Archival Max)."
-    assert QUICK_COMPRESS_SUBTITLE == (
-        "Explorer one-click · Lite / Balanced / HEVC Max — not the full profile list."
-    )
-    assert DROP_ZONE_TITLE == "Drop videos or images"
-    assert EMPTY_QUEUE == "Add files to start"
+    assert PROFILE_HELPER == "Other presets are here, including archive quality."
+    assert QUICK_COMPRESS_SUBTITLE == "Pick a preset, then press Quick Compress."
+    assert HOME_TAGLINE == "Shrink a video or image."
+    assert "does not put SquishIt in the tray" in TRAY_HINT
+    assert "Send to tray" not in TRAY_HINT
+    assert DROP_ZONE_TITLE == "Drop a video or image"
+    assert DROP_ZONE_NEXT == "Then pick a preset below and press Quick Compress."
+    assert EMPTY_QUEUE == "Nothing here yet"
+    assert "CRF" not in QUICK_PRESET_BLURBS["Quick Lite"]
 
 
 def test_codec_recommendation_blurbs_keep_the_same_settings():

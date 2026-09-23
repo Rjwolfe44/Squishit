@@ -182,6 +182,7 @@ def test_main_window_quick_lite_starts_the_existing_compressor(
         "video_compressor.core.compressor.VideoCompressor",
         _FakeCompressor,
     )
+    monkeypatch.setattr(SquishItWindow, "_start_hw_probe", lambda self: None)
     app = QApplication.instance() or QApplication([])
     window = SquishItWindow()
     try:
@@ -225,6 +226,115 @@ def test_main_window_quick_lite_starts_the_existing_compressor(
         app.processEvents()
 
 
+def test_home_path_shows_real_encoder_and_plain_quick_copy(
+    monkeypatch, quiet_config
+):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+
+    from video_compressor.gui.hw_status import FoundHardware, HardwareProbe
+    from video_compressor.gui.qt_shell.main_window import SquishItWindow
+
+    monkeypatch.setattr(SquishItWindow, "_start_hw_probe", lambda self: None)
+    app = QApplication.instance() or QApplication([])
+    window = SquishItWindow()
+    try:
+        window.show()
+        app.processEvents()
+        assert window.form.quick_name
+        assert window._quick_buttons[window.form.quick_name].property("selected") is True
+        assert not any(
+            button.property("selected")
+            for button in window._settings._profile_buttons.values()
+        )
+        assert window._compress_btn.text() == "Quick Compress"
+        assert window._settings._advanced.isVisible() is False
+        tray = window.findChild(QLabel, "trayHint")
+        assert tray is not None
+        assert "does not put SquishIt in the tray" in tray.text()
+        button_text = [button.text() for button in window.findChildren(QPushButton)]
+        assert "Send to tray" not in button_text
+        assert "CRF" not in window._hw_card.using.text()
+
+        probe = HardwareProbe(
+            found=(
+                FoundHardware("NVENC", "NVIDIA GeForce RTX 4070"),
+                FoundHardware("QSV", "Intel UHD 770"),
+            ),
+            encoders={
+                "h264": "h264_nvenc",
+                "hevc": "hevc_nvenc",
+                "svt-av1": None,
+            },
+        )
+        window.apply_hardware_probe(probe)
+        app.processEvents()
+        assert window._hw_card.badge.text() == "NVENC"
+        assert "RTX 4070" in window._hw_card.found.text()
+        assert window._hw_card.using.text() == (
+            "Quick Compress will use NVIDIA hardware (NVENC)."
+        )
+        assert "NVENC" in window._settings._hw_hint.text()
+
+        window.select_profile("Max / Archival")
+        assert window._compress_btn.text() == "Compress"
+        assert "software encoding" in window._hw_card.using.text()
+        assert "keeps hardware off" in window._hw_card.using.text()
+        assert "RTX 4070" in window._hw_card.found.text()
+
+        window.select_quick("Quick Lite")
+        window.form.target_size_enabled = True
+        window.form.target_size_mode = "exact"
+        window.form.target_size_mb = 8
+        window._settings.load(window.form)
+        window._refresh_hw_status()
+        hint = window._settings._hw_hint.text()
+        assert "asks before" in hint
+        assert "NVENC" in hint
+        assert window._hw_card.badge.text() == "NVENC"
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_quick_window_shows_the_encoder_it_will_use(
+    monkeypatch, quiet_config, tmp_path
+):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from video_compressor.gui.hw_status import FoundHardware, HardwareProbe
+    from video_compressor.gui.qt_shell.quick_window import QuickCompressWindow
+
+    monkeypatch.setattr(QuickCompressWindow, "_start_hw_probe", lambda self: None)
+    app = QApplication.instance() or QApplication([])
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"not-a-real-video")
+    window = QuickCompressWindow(clip)
+    try:
+        window.show()
+        app.processEvents()
+        window.apply_hardware_probe(
+            HardwareProbe(
+                found=(FoundHardware("AMF", "AMD Radeon RX 7800 XT"),),
+                encoders={"h264": "h264_amf", "hevc": None},
+            )
+        )
+        window._set_preset("Quick Lite")
+        app.processEvents()
+        assert window._start_btn.text() == "Quick Compress"
+        assert window._hw_card.badge.text() == "AMF"
+        assert "RX 7800 XT" in window._hw_card.found.text()
+        assert window._hw_card.using.text() == (
+            "Quick Compress will use AMD hardware (AMF)."
+        )
+        assert "CRF" not in window._hint.text()
+        assert "long wait" in window._hint.text()
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_quick_window_starts_without_asking(monkeypatch, quiet_config, tmp_path):
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
@@ -232,6 +342,9 @@ def test_quick_window_starts_without_asking(monkeypatch, quiet_config, tmp_path)
     from video_compressor.gui.qt_shell import quick_window
 
     monkeypatch.setattr(quick_window, "VideoCompressor", _FakeCompressor)
+    monkeypatch.setattr(
+        quick_window.QuickCompressWindow, "_start_hw_probe", lambda self: None
+    )
     QuickCompressWindow = quick_window.QuickCompressWindow
     app = QApplication.instance() or QApplication([])
     clip = tmp_path / "clip.mp4"

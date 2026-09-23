@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import queue
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -36,8 +37,15 @@ from ...core.profiles import (
     retarget_quick_compress_fallback,
 )
 from ...core.utils import detect_media_type, get_image_extension, get_video_extension
-from ..copy import QUICK_COMPRESS_SUBTITLE, QUICK_COMPRESS_TITLE
+from ..copy import (
+    QUICK_COMPRESS_SUBTITLE,
+    QUICK_COMPRESS_TITLE,
+    QUICK_PRESET_BLURBS,
+    human_progress_status,
+)
+from ..hw_status import HardwareProbe, describe_hw_status, probe_from_compressor
 from ..relaunch import spawn_app
+from .hw_card import HardwareStatusCard
 from .theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -68,6 +76,8 @@ class QuickCompressWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.input_file = Path(input_file)
         self.compressor: Optional[VideoCompressor] = None
+        self._compressor_lock = threading.Lock()
+        self._hw_probe: Optional[HardwareProbe] = None
         self._config = get_config_manager()
         self._events: queue.Queue = queue.Queue()
         self._job_id: Optional[str] = None
@@ -77,8 +87,8 @@ class QuickCompressWindow(QWidget):
         self._preset = saved if saved in _QUICK_PRESETS else "Balanced"
 
         self.setWindowTitle(f"{APP_NAME} {QUICK_COMPRESS_TITLE}")
-        self.setMinimumSize(560, 380)
-        self.resize(640, 440)
+        self.setMinimumSize(560, 520)
+        self.resize(680, 620)
         icon_path = _window_icon_path()
         if icon_path is not None:
             icon = QIcon(str(icon_path))
@@ -87,6 +97,7 @@ class QuickCompressWindow(QWidget):
 
         self._build()
         self._refresh_preview()
+        self._start_hw_probe()
         self._timer = QTimer(self)
         self._timer.setInterval(100)
         self._timer.timeout.connect(self._pump)
@@ -105,6 +116,9 @@ class QuickCompressWindow(QWidget):
         subtitle.setWordWrap(True)
         outer.addWidget(subtitle)
 
+        self._hw_card = HardwareStatusCard()
+        outer.addWidget(self._hw_card)
+
         name = QLabel(self.input_file.name)
         name.setWordWrap(True)
         outer.addWidget(name)
@@ -117,6 +131,7 @@ class QuickCompressWindow(QWidget):
         for preset_name in _PRESET_ORDER:
             button = QPushButton(preset_name)
             button.setObjectName("pill")
+            button.setToolTip(QUICK_PRESET_BLURBS.get(preset_name, ""))
             button.clicked.connect(
                 lambda _checked=False, name=preset_name: self._set_preset(name)
             )
@@ -131,7 +146,7 @@ class QuickCompressWindow(QWidget):
         self._hint.setWordWrap(True)
         outer.addWidget(self._hint)
 
-        self._status = QLabel("Waiting to start")
+        self._status = QLabel("Ready when you are")
         self._status.setObjectName("hint")
         self._status.setWordWrap(True)
         outer.addWidget(self._status)
@@ -156,7 +171,7 @@ class QuickCompressWindow(QWidget):
         open_app.clicked.connect(self._open_full_app)
         actions.addWidget(open_app)
         actions.addStretch(1)
-        self._start_btn = QPushButton("Start Compression")
+        self._start_btn = QPushButton("Quick Compress")
         self._start_btn.setObjectName("primary")
         self._start_btn.clicked.connect(self.start_compression)
         actions.addWidget(self._start_btn)
@@ -170,8 +185,11 @@ class QuickCompressWindow(QWidget):
             _retint(button, name == self._preset)
 
     def _get_compressor(self) -> VideoCompressor:
-        if self.compressor is None:
-            self.compressor = VideoCompressor()
+        if self.compressor is not None:
+            return self.compressor
+        with self._compressor_lock:
+            if self.compressor is None:
+                self.compressor = VideoCompressor()
         return self.compressor
 
     def _set_preset(self, preset: str) -> None:
@@ -218,8 +236,42 @@ class QuickCompressWindow(QWidget):
 
     def _refresh_preview(self) -> None:
         profile = self._profile(resolve_fallback=False)
-        self._hint.setText(profile.description)
-        self._destination.setText(f"Will save to: {self._output_file(profile)}")
+        self._hint.setText(QUICK_PRESET_BLURBS.get(self._preset, profile.description))
+        self._destination.setText(
+            f"Saves next to the original: {self._output_file(profile)}"
+        )
+        self._refresh_hw_status()
+
+    def _refresh_hw_status(self) -> None:
+        can_resolve = self.compressor is not None and hasattr(
+            self.compressor, "codec_manager"
+        )
+        profile = self._profile(resolve_fallback=can_resolve)
+        use_hw = bool(profile.use_hw_accel)
+        status = describe_hw_status(
+            self._hw_probe,
+            codec=profile.video_codec,
+            use_hw=use_hw,
+            force_software=not use_hw,
+            action="Quick Compress",
+            software_name=profile.video_codec.ffmpeg_encoder,
+        )
+        self._hw_card.apply(status)
+
+    def apply_hardware_probe(self, probe: Optional[HardwareProbe]) -> None:
+        self._hw_probe = probe
+        self._refresh_hw_status()
+
+    def _start_hw_probe(self) -> None:
+        threading.Thread(target=self._hw_probe_worker, daemon=True).start()
+
+    def _hw_probe_worker(self) -> None:
+        try:
+            probe = probe_from_compressor(self._get_compressor())
+        except Exception:
+            logger.debug("Hardware probe failed", exc_info=True)
+            probe = HardwareProbe(failed=True)
+        self._events.put(("hw_probe", probe))
 
     def start_compression(self) -> None:
         if self._running:
@@ -249,7 +301,9 @@ class QuickCompressWindow(QWidget):
         try:
             while True:
                 kind, payload = self._events.get_nowait()
-                if kind == "progress":
+                if kind == "hw_probe":
+                    self.apply_hardware_probe(payload)
+                elif kind == "progress":
                     self._show_progress(payload)
                 elif kind == "result":
                     self._complete(payload)
@@ -263,8 +317,8 @@ class QuickCompressWindow(QWidget):
         except (TypeError, ValueError):
             percent = 0
         self._bar.setValue(max(0, min(100, percent)))
-        status = getattr(getattr(job, "status", None), "value", getattr(job, "status", ""))
-        self._status.setText(str(status or "compressing").replace("_", " ").title())
+        self._status.setText(human_progress_status(job))
+        self._hw_card.set_activity(human_progress_status(job))
         parts = [f"{percent}%"]
         speed = getattr(job, "speed", 0) or 0
         eta = getattr(job, "eta", 0) or 0
