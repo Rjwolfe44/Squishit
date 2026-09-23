@@ -38,10 +38,12 @@ from PySide6.QtWidgets import (
 from ...config import APP_NAME, APP_VERSION, get_config, get_config_manager
 from ...core.history import HistoryEntry, HistoryManager
 from ...core.profiles import (
+    QUICK_COMPRESS_ORDER,
     CompressionProfile,
     ProfileManager,
     build_quick_compress_profiles,
     describe_target_size_plan,
+    normalize_quick_compress_name,
 )
 from ...core.updater import RELEASES_URL
 from ...core.utils import collect_media_files, format_size, format_time
@@ -49,9 +51,22 @@ from ..copy import (
     DROP_ZONE_NEXT,
     DROP_ZONE_TITLE,
     EMPTY_QUEUE,
+    HELP_TRAY,
+    HOME_TAGLINE,
+    QUICK_COMPRESS_TITLE,
+    QUICK_PRESET_BLURBS,
+    TRAY_HELP,
+    TRAY_HINT,
     help_menu_items,
     human_progress_status,
     progress_detail,
+)
+from ..hw_status import (
+    HardwareProbe,
+    describe_hw_status,
+    encoder_result_label,
+    probe_from_compressor,
+    status_summary,
 )
 from ..ipc import SingleInstanceServer
 from ..software_fallback_dialog import (
@@ -61,7 +76,8 @@ from ..software_fallback_dialog import (
     with_declined_fallback_summary,
 )
 from .dialogs import qt_yes_no_ask, show_about
-from .encode_form import EncodeForm, output_path_for, preview_line
+from .encode_form import EncodeForm, output_path_for
+from .hw_card import HardwareStatusCard
 from .settings_pane import SettingsPane, scroll_wrap
 from .theme import DARK_STYLESHEET
 
@@ -198,6 +214,9 @@ class _ResultRow(QFrame):
             elapsed = getattr(result, "encoding_time", 0) or 0
             if elapsed:
                 bits.append(format_time(elapsed))
+        encoder = encoder_result_label(str(getattr(result, "encoder_name", "") or ""))
+        if encoder:
+            bits.append(f"Encoder: {encoder}")
         note = getattr(result, "note", None) or getattr(result, "error_message", None)
         if note:
             bits.append(str(note))
@@ -236,6 +255,9 @@ class SquishItWindow(QMainWindow):
         self._running = False
         self._cancel_requested = False
         self._awaiting_fallback: set[str] = set()
+        self._hw_probe: Optional[HardwareProbe] = None
+        self._full_profile_active = False
+        self._quick_buttons: dict[str, QPushButton] = {}
         self._output_folder: Optional[Path] = None
         self._current_profile: Optional[CompressionProfile] = None
         self._selected_profile = get_config().default_profile or "Balanced"
@@ -254,8 +276,10 @@ class SquishItWindow(QMainWindow):
             self.form.apply_profile(base)
 
         self._build()
-        self._settings.load(self.form)
-        self._settings.set_active_profile(self._selected_profile)
+        saved_quick = normalize_quick_compress_name(
+            get_config().quick_compress_profile
+        )
+        self.select_quick(saved_quick, persist=False)
         self._place_on_screen()
         self._timer = QTimer(self)
         self._timer.setInterval(80)
@@ -266,6 +290,7 @@ class SquishItWindow(QMainWindow):
         if startup_files:
             self.add_paths([str(path) for path in startup_files])
         self._refresh_preview()
+        self._start_hw_probe()
         if auto_start and self._files:
             QTimer.singleShot(0, self.start_compression)
 
@@ -303,10 +328,9 @@ class SquishItWindow(QMainWindow):
         title = QLabel(APP_NAME)
         title.setObjectName("title")
         titles.addWidget(title)
-        self._encoder_label = QLabel("")
-        self._encoder_label.setObjectName("hint")
-        self._encoder_label.setWordWrap(True)
-        titles.addWidget(self._encoder_label)
+        tagline = QLabel(HOME_TAGLINE)
+        tagline.setObjectName("hint")
+        titles.addWidget(tagline)
         header.addLayout(titles, 1)
         self._output_btn = QPushButton("Output folder")
         self._output_btn.clicked.connect(self._pick_output_folder)
@@ -318,6 +342,13 @@ class SquishItWindow(QMainWindow):
         about_btn.clicked.connect(self._open_about)
         header.addWidget(about_btn)
         outer.addLayout(header)
+
+        self._hw_card = HardwareStatusCard()
+        outer.addWidget(self._hw_card)
+        tray = QLabel(TRAY_HINT)
+        tray.setObjectName("trayHint")
+        tray.setWordWrap(True)
+        outer.addWidget(tray)
 
         self._queue_host = QWidget()
         queue_layout = QVBoxLayout(self._queue_host)
@@ -346,8 +377,33 @@ class SquishItWindow(QMainWindow):
         drop_layout.addLayout(drop_actions)
         queue_layout.addWidget(self._drop)
 
+        quick_title = QLabel(QUICK_COMPRESS_TITLE)
+        quick_title.setObjectName("section")
+        queue_layout.addWidget(quick_title)
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(6)
+        presets = build_quick_compress_profiles()
+        for preset_name in QUICK_COMPRESS_ORDER:
+            button = QPushButton(preset_name)
+            button.setObjectName("pill")
+            button.setToolTip(
+                QUICK_PRESET_BLURBS.get(preset_name, presets[preset_name].description)
+            )
+            button.clicked.connect(
+                lambda _checked=False, name=preset_name: self.select_quick(name)
+            )
+            self._quick_buttons[preset_name] = button
+            quick_row.addWidget(button)
+        quick_row.addStretch(1)
+        queue_layout.addLayout(quick_row)
+        self._quick_blurb = QLabel("")
+        self._quick_blurb.setObjectName("hint")
+        self._quick_blurb.setWordWrap(True)
+        queue_layout.addWidget(self._quick_blurb)
+
         actions = QHBoxLayout()
-        self._compress_btn = QPushButton("Compress")
+        self._compress_btn = QPushButton("Quick Compress")
+        self._compress_btn.setMinimumHeight(44)
         self._compress_btn.setObjectName("primary")
         self._compress_btn.clicked.connect(self.start_compression)
         actions.addWidget(self._compress_btn)
@@ -393,8 +449,10 @@ class SquishItWindow(QMainWindow):
             return
         if self.form.quick_name:
             self._settings.set_active_quick(self.form.quick_name)
-        else:
+        elif self._full_profile_active:
             self._settings.set_active_profile(self._selected_profile)
+        else:
+            self._settings.set_active_profile(None)
         self._refresh_preview()
 
     def select_profile(self, name: str) -> None:
@@ -402,23 +460,26 @@ class SquishItWindow(QMainWindow):
         if profile is None:
             return
         self._selected_profile = name
+        self._full_profile_active = True
         self.form.apply_profile(profile, quick_name=None)
         self._settings.load(self.form)
         self._settings.set_active_profile(name)
         self._refresh_preview()
 
-    def select_quick(self, name: str) -> None:
+    def select_quick(self, name: str, *, persist: bool = True) -> None:
         presets = build_quick_compress_profiles()
         profile = presets.get(name)
         if profile is None:
             return
+        self._full_profile_active = False
         self.form.apply_profile(profile, quick_name=name)
         self._settings.load(self.form)
         self._settings.set_active_quick(name)
-        try:
-            get_config_manager().update_config(quick_compress_profile=name)
-        except Exception:
-            logger.debug("Could not store the Quick Compress preset", exc_info=True)
+        if persist:
+            try:
+                get_config_manager().update_config(quick_compress_profile=name)
+            except Exception:
+                logger.debug("Could not store the Quick Compress preset", exc_info=True)
         self._refresh_preview()
 
     def _base_profile(self) -> CompressionProfile:
@@ -438,14 +499,56 @@ class SquishItWindow(QMainWindow):
 
     def _refresh_preview(self) -> None:
         profile = self.job_profile()
-        encoder_name = None
-        if self._compressor is not None and profile.use_hw_accel:
-            try:
-                encoder_name = self._compressor._select_hw_encoder(profile.video_codec)
-            except Exception:
-                encoder_name = None
-        self._encoder_label.setText(preview_line(profile, encoder_name))
+        self._style_quick()
+        self._refresh_action_label()
+        self._refresh_hw_status()
         self._refresh_size_preview(profile)
+
+    def _style_quick(self) -> None:
+        for name, button in self._quick_buttons.items():
+            _polish_flag(button, "selected", name == self.form.quick_name)
+        self._quick_blurb.setText(
+            QUICK_PRESET_BLURBS.get(self.form.quick_name or "", "")
+        )
+
+    def _refresh_action_label(self) -> None:
+        if self._running:
+            return
+        if self.form.quick_name:
+            self._compress_btn.setText("Quick Compress")
+        else:
+            self._compress_btn.setText("Compress")
+
+    def _refresh_hw_status(self) -> None:
+        profile = self.job_profile()
+        action = "Quick Compress" if self.form.quick_name else "This preset"
+        status = describe_hw_status(
+            self._hw_probe,
+            codec=profile.video_codec,
+            use_hw=bool(profile.use_hw_accel),
+            force_software=self.form.ladder_choice().force_software,
+            action=action,
+            software_name=profile.video_codec.ffmpeg_encoder,
+        )
+        self._hw_card.apply(status)
+        self._settings.set_detected_hw(status_summary(status))
+
+    def apply_hardware_probe(self, probe: Optional[HardwareProbe]) -> None:
+        """Show a probe immediately. Tests use this; the home path uses the worker."""
+
+        self._hw_probe = probe
+        self._refresh_hw_status()
+
+    def _start_hw_probe(self) -> None:
+        threading.Thread(target=self._hw_probe_worker, daemon=True).start()
+
+    def _hw_probe_worker(self) -> None:
+        try:
+            probe = probe_from_compressor(self._get_compressor())
+        except Exception:
+            logger.debug("Hardware probe failed", exc_info=True)
+            probe = HardwareProbe(failed=True)
+        self._queue.put(("hw_probe", probe))
 
     def _refresh_size_preview(self, profile: CompressionProfile) -> None:
         if not profile.target_size_mb or profile.output_mode != "video":
@@ -602,7 +705,7 @@ class SquishItWindow(QMainWindow):
     def start_compression(self) -> None:
         if self._running or not self._files:
             if not self._files:
-                self._queue_label.setText("Add a file, then press Compress.")
+                self._queue_label.setText("Add a file, then press Quick Compress.")
             return
         self._cancel_requested = False
         self._results.clear()
@@ -724,6 +827,9 @@ class SquishItWindow(QMainWindow):
         if handle_software_fallback_queue_message(self, message):
             return
         kind = message[0]
+        if kind == "hw_probe":
+            self.apply_hardware_probe(message[1])
+            return
         if kind == "external_open":
             _kind, paths = message
             self.showNormal()
@@ -751,6 +857,12 @@ class SquishItWindow(QMainWindow):
                 self._rows.addWidget(row)
             if row is not None:
                 row.update_job(job, awaiting=job_id in self._awaiting_fallback)
+                self._hw_card.set_activity(
+                    human_progress_status(
+                        job,
+                        awaiting_software_fallback=job_id in self._awaiting_fallback,
+                    )
+                )
         elif kind == "result":
             _kind, result = message
             self._results.append(result)
@@ -837,7 +949,9 @@ class SquishItWindow(QMainWindow):
                 message += f", {skipped} skipped"
         if failed:
             message += f", {failed} failed"
-        self._queue_label.setText(with_declined_fallback_summary(message, self._results))
+        summary = with_declined_fallback_summary(message, self._results)
+        self._queue_label.setText(summary)
+        self._hw_card.set_activity(summary)
         self._clear_rows()
         for result in self._results:
             if getattr(result, "cancelled", False):
@@ -891,6 +1005,8 @@ class SquishItWindow(QMainWindow):
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
+        menu.addAction(HELP_TRAY, self._explain_tray)
+        menu.addSeparator()
         for label, url in help_menu_items():
             menu.addAction(label, lambda target=url: webbrowser.open(target))
         button = self.sender()
@@ -898,6 +1014,9 @@ class SquishItWindow(QMainWindow):
             menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
         else:
             menu.exec(self.mapToGlobal(self.rect().topRight()))
+
+    def _explain_tray(self) -> None:
+        QMessageBox.information(self, f"{APP_NAME} tray", TRAY_HELP)
 
     def _open_about(self) -> None:
         show_about(

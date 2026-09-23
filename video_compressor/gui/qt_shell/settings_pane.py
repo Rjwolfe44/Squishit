@@ -23,11 +23,14 @@ from ...core.codecs import AudioCodec, VideoCodec
 from ...core.profiles import CompressionProfile
 from ...core.quality_ladder import profile_picker_label
 from ..copy import (
+    EXTRA_SETTINGS_LABEL,
     MORE_MENU_LABEL,
+    MORE_OPTIONS_HINT,
+    MORE_OPTIONS_TITLE,
     MORE_PROFILES_TOOLTIP,
+    PROFILE_FRIENDLY,
     PROFILE_HELPER,
-    QUICK_COMPRESS_SUBTITLE,
-    QUICK_COMPRESS_TITLE,
+    QUICK_PRESET_BLURBS,
     profile_ui_text,
     secondary_menu_entries,
 )
@@ -84,8 +87,8 @@ class SettingsPane(QWidget):
         self._profiles = list(profiles)
         self._on_change = on_change
         self._loading = False
+        self._detected_hw = ""
         self._profile_buttons: dict[str, QPushButton] = {}
-        self._quick_buttons: dict[str, QPushButton] = {}
         self._build()
         self.load(form)
 
@@ -97,25 +100,10 @@ class SettingsPane(QWidget):
         root.setContentsMargins(4, 4, 8, 16)
         root.setSpacing(8)
 
-        root.addWidget(_section(QUICK_COMPRESS_TITLE))
-        subtitle = _hint(QUICK_COMPRESS_SUBTITLE)
-        root.addWidget(subtitle)
-        quick_row = QHBoxLayout()
-        quick_row.setSpacing(6)
-        from ...core.profiles import QUICK_COMPRESS_ORDER, build_quick_compress_profiles
+        root.addWidget(_section(MORE_OPTIONS_TITLE))
+        root.addWidget(_hint(MORE_OPTIONS_HINT))
 
-        presets = build_quick_compress_profiles()
-        for name in QUICK_COMPRESS_ORDER:
-            button = QPushButton(name)
-            button.setObjectName("pill")
-            button.setToolTip(presets[name].description)
-            button.clicked.connect(lambda _checked=False, preset=name: self._emit_quick(preset))
-            self._quick_buttons[name] = button
-            quick_row.addWidget(button)
-        quick_row.addStretch(1)
-        root.addLayout(quick_row)
-
-        root.addWidget(_section("Profiles"))
+        root.addWidget(_section("Other presets"))
         helper = _hint(PROFILE_HELPER)
         root.addWidget(helper)
         pill_row = QHBoxLayout()
@@ -126,7 +114,7 @@ class SettingsPane(QWidget):
             label, blurb = profile_ui_text(profile.name, profile.description)
             button = QPushButton(profile_picker_label(label))
             button.setObjectName("pill")
-            button.setToolTip(blurb)
+            button.setToolTip(PROFILE_FRIENDLY.get(profile.name, blurb))
             button.clicked.connect(
                 lambda _checked=False, profile_name=profile.name: self._emit_profile(
                     profile_name
@@ -145,6 +133,22 @@ class SettingsPane(QWidget):
         self._profile_blurb = _hint("")
         root.addWidget(self._profile_blurb)
 
+        self._extra = QCheckBox(EXTRA_SETTINGS_LABEL)
+        self._extra.setObjectName("extraSettings")
+        self._extra.setToolTip("Codec, file size, output, and performance.")
+        root.addWidget(self._extra)
+
+        self._advanced = QWidget()
+        advanced = QVBoxLayout(self._advanced)
+        advanced.setContentsMargins(0, 8, 0, 0)
+        advanced.setSpacing(8)
+        self._build_advanced(advanced)
+        root.addWidget(self._advanced)
+        self._advanced.setVisible(False)
+        self._extra.toggled.connect(self._advanced.setVisible)
+        root.addStretch(1)
+
+    def _build_advanced(self, root: QVBoxLayout) -> None:
         root.addWidget(_section("Video"))
         form = QFormLayout()
         form.setSpacing(8)
@@ -162,14 +166,14 @@ class SettingsPane(QWidget):
         self._ladder_hint = _hint("")
         root.addWidget(self._ladder_hint)
 
-        self._hw = QCheckBox("Hardware acceleration")
+        self._hw = QCheckBox("Use hardware encoding")
         self._hw.toggled.connect(self._on_hw)
         root.addWidget(self._hw)
         self._hw_hint = _hint("")
         root.addWidget(self._hw_hint)
 
         root.addWidget(_section("Target size"))
-        self._target_on = QCheckBox("Use target size")
+        self._target_on = QCheckBox("Aim for a file size")
         self._target_on.toggled.connect(self._on_target_toggle)
         root.addWidget(self._target_on)
         size_row = QHBoxLayout()
@@ -184,13 +188,13 @@ class SettingsPane(QWidget):
         self._target_mode = QComboBox()
         self._target_mode.addItems(TARGET_MODES)
         self._target_mode.currentIndexChanged.connect(self._on_target_mode)
-        mode_form.addRow("Target mode", self._target_mode)
+        mode_form.addRow("Size mode", self._target_mode)
         self._exact_audio = QComboBox()
         self._exact_audio.addItems(EXACT_AUDIO)
         self._exact_audio.currentIndexChanged.connect(self._on_exact_audio)
         mode_form.addRow("Exact audio", self._exact_audio)
         root.addLayout(mode_form)
-        self._two_pass = QCheckBox("Two-pass exact size")
+        self._two_pass = QCheckBox("Two passes for an exact size")
         self._two_pass.toggled.connect(self._on_two_pass)
         root.addWidget(self._two_pass)
         self._size_preview = _hint("")
@@ -219,7 +223,7 @@ class SettingsPane(QWidget):
         self._template.setPlaceholderText("{name}_compressed")
         self._template.editingFinished.connect(self._on_template)
         template_form = QFormLayout()
-        template_form.addRow("Name template", self._template)
+        template_form.addRow("File name", self._template)
         root.addLayout(template_form)
 
         root.addWidget(_section("Performance"))
@@ -227,13 +231,12 @@ class SettingsPane(QWidget):
         self._governor = QComboBox()
         self._governor.addItems(GOVERNORS)
         self._governor.currentIndexChanged.connect(self._on_governor)
-        perf.addRow("Resource use", self._governor)
+        perf.addRow("Computer effort", self._governor)
         self._parallel = QComboBox()
         self._parallel.addItems(["1", "2", "3", "4", "6", "8"])
         self._parallel.currentIndexChanged.connect(self._on_parallel)
-        perf.addRow("Parallel jobs", self._parallel)
+        perf.addRow("Files at once", self._parallel)
         root.addLayout(perf)
-        root.addStretch(1)
 
     def _rebuild_more(self) -> None:
         self._more.blockSignals(True)
@@ -310,6 +313,12 @@ class SettingsPane(QWidget):
             self.form.video_container = self._container.currentText()
         self._container.blockSignals(False)
 
+    def set_detected_hw(self, summary: str) -> None:
+        """Real detection text. Does not change the encoder or the checkbox."""
+
+        self._detected_hw = summary or ""
+        self._apply_hw_hint_text()
+
     def _refresh_hints(self) -> None:
         choice = self.form.ladder_choice()
         self._hw.setEnabled(not choice.force_software)
@@ -317,34 +326,50 @@ class SettingsPane(QWidget):
             self._hw.setChecked(False)
             self.form.use_hw_accel = False
         self._ladder_hint.setText(self.form.ladder_hint())
-        self._hw_hint.setText(self.form.hw_hint())
+        self._apply_hw_hint_text()
+
+    def _apply_hw_hint_text(self) -> None:
+        detected = (self._detected_hw or "").strip()
+        policy = self.form.hw_hint()
+        if not detected:
+            self._hw_hint.setText(policy)
+            return
+        choice = self.form.ladder_choice()
+        exact = (
+            self.form.target_size_enabled
+            and self.form.target_size_mode == "exact"
+            and self.form.use_hw_accel
+            and not choice.force_software
+        )
+        if exact:
+            self._hw_hint.setText(f"{detected}\n\n{policy}")
+        else:
+            self._hw_hint.setText(detected)
+
+    def _friendly_profile_blurb(self, name: str, description: str) -> str:
+        if name in PROFILE_FRIENDLY:
+            return PROFILE_FRIENDLY[name]
+        _label, blurb = profile_ui_text(name, description)
+        return blurb
 
     def _refresh_profile_chrome(self, quick_name: Optional[str]) -> None:
-        for name, button in self._quick_buttons.items():
-            _retint(button, name == quick_name)
+        for button in self._profile_buttons.values():
+            _retint(button, False)
+        self._more.blockSignals(True)
+        self._more.setCurrentIndex(0)
+        self._more.blockSignals(False)
         if quick_name:
-            for button in self._profile_buttons.values():
-                _retint(button, False)
-            self._more.blockSignals(True)
-            self._more.setCurrentIndex(0)
-            self._more.blockSignals(False)
-            preset = next(
-                (item for item in self._profiles if item.name == quick_name),
-                None,
-            )
+            blurb = QUICK_PRESET_BLURBS.get(quick_name, "")
+            text = f"Quick preset: {quick_name}."
+            if blurb:
+                text = f"{text} {blurb}"
+            self._profile_blurb.setText(text)
+        else:
             self._profile_blurb.setText("")
-            if preset is None:
-                from ...core.profiles import build_quick_compress_profiles
-
-                qc = build_quick_compress_profiles().get(quick_name)
-                if qc is not None:
-                    self._profile_blurb.setText(qc.description)
 
     def set_active_profile(self, name: Optional[str]) -> None:
         for profile_name, button in self._profile_buttons.items():
             _retint(button, profile_name == name)
-        for button in self._quick_buttons.values():
-            _retint(button, False)
         self._more.blockSignals(True)
         if name in self._profile_buttons or not name:
             self._more.setCurrentIndex(0)
@@ -354,25 +379,19 @@ class SettingsPane(QWidget):
         self._more.blockSignals(False)
         profile = next((item for item in self._profiles if item.name == name), None)
         if profile is not None:
-            _label, blurb = profile_ui_text(profile.name, profile.description)
-            self._profile_blurb.setText(blurb)
+            self._profile_blurb.setText(
+                self._friendly_profile_blurb(profile.name, profile.description)
+            )
         else:
             self._profile_blurb.setText("")
 
     def set_active_quick(self, name: Optional[str]) -> None:
         self._refresh_profile_chrome(name)
-        for preset, button in self._quick_buttons.items():
-            _retint(button, preset == name)
 
     def _emit_profile(self, name: str) -> None:
         if self._loading:
             return
         self._on_change("profile", name)
-
-    def _emit_quick(self, name: str) -> None:
-        if self._loading:
-            return
-        self._on_change("quick", name)
 
     def _emit_field(self) -> None:
         if self._loading:

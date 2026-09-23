@@ -54,6 +54,43 @@ QLabel#muted, QLabel#hint {
 QLabel#hint {
     font-size: 12px;
 }
+QLabel#hwFound, QLabel#activityStatus, QLabel#trayHint {
+    color: #d4d4d8;
+    background: transparent;
+    font-size: 12px;
+}
+QLabel#hwUsing {
+    color: #fafafa;
+    background: transparent;
+    font-size: 13px;
+    font-weight: 600;
+}
+QLabel#hwBadge {
+    background: #3f3f46;
+    color: #fafafa;
+    border-radius: 8px;
+    padding: 4px 10px;
+    font-weight: 700;
+}
+QLabel#hwBadge[state="ready"] {
+    background: #1d4ed8;
+    color: #ffffff;
+}
+QLabel#hwBadge[state="software"] {
+    background: #3f3f46;
+    color: #fafafa;
+}
+QLabel#hwBadge[state="failed"] {
+    background: #7f1d1d;
+    color: #ffffff;
+}
+QLabel#hwBadge[state="pending"] {
+    background: #3f3f46;
+    color: #fafafa;
+}
+QWidget#hwCard {
+    background: transparent;
+}
 QPushButton {
     background: #27272a;
     color: #fafafa;

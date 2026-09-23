@@ -17,7 +17,6 @@ from ...core.profiles import CompressionProfile
 from ...core.quality_ladder import (
     QualityRung,
     coerce_preset_override,
-    get_step,
     matching_rung,
     resolve_encoder_choice,
 )
@@ -318,26 +317,3 @@ def output_path_for(
     except Exception:
         stem = f"{input_path.stem}_compressed"
     return dest / (sanitize_filename(stem) + ext)
-
-
-def preview_line(profile: CompressionProfile, encoder_name: Optional[str] = None) -> str:
-    """Short header line. ``encoder_name`` is a probe result, not a new choice."""
-
-    step = None
-    try:
-        matched = matching_rung(profile.video_codec, profile.crf, profile.preset)
-        if matched is not None:
-            step = get_step(profile.video_codec, matched)
-    except KeyError:
-        step = None
-    rung = step.rung.label if step is not None else "custom"
-    if encoder_name:
-        hw = encoder_name
-    elif profile.use_hw_accel:
-        hw = "HW NVENC → QSV → AMF"
-    else:
-        hw = "software"
-    return (
-        f"{profile.name} · {profile.video_codec.value} · "
-        f"CRF {profile.crf} · {profile.preset} · {rung} · {hw}"
-    )
