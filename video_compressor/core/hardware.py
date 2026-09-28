@@ -526,7 +526,11 @@ class HardwareDetector:
                             gpus.append(GPUInfo(
                                 name=name,
                                 vendor=GPUVendor.AMD,
-                                encoder_support={"h264": True, "hevc": True}
+                                encoder_support={
+                                    "h264": True,
+                                    "hevc": True,
+                                    "av1": self._amd_supports_av1(name),
+                                },
                             ))
             except Exception as e:
                 logger.debug(f"Error detecting AMD GPU on Linux: {e}")
@@ -690,6 +694,10 @@ class HardwareDetector:
             r"RX\s*79\d{2}",
             r"RX\s*8\d{3}",
             r"RX\s*9\d{3}",
+            # RDNA3 (7900-class) and RDNA4 (9060/9070). A CIM name of "Navi 48"
+            # is an RX 9070 XT when the product string omits "RX".
+            r"NAVI\s*3[123]\b",
+            r"NAVI\s*4[48]\b",
             r"RADEON\s+PRO\s+W7",
             r"RADEON\s+AI\s+PRO",
         ]

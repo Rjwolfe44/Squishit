@@ -10,8 +10,8 @@ Found a bug or want a feature? Open a [GitHub Issue](https://github.com/Rjwolfe4
 
 ### Video Codecs
 - **HEVC (H.265)** — Default speed lane. Quick Compress Max stays on HEVC
-- **AV1 (SVT-AV1)** — User-available archival codec. Max / Archival uses this lane with hardware off
-- **AV1 (libaom)** — User-available reference AV1 encoder
+- **SVT-AV1** — Max / Archival. Best compression, on the CPU. Hardware encode stays off
+- **Fast hardware AV1** — AV1 codec with hardware on: NVENC, then QSV, then AMF (`av1_amf` on AMD, including RX 9070 XT). Software fallback is libaom. This is not Max / Archival
 - **H.264 (AVC)** — Maximum compatibility. Quick Lite, the fastest Quick Compress rung, uses H.264 and prefers NVENC, then QSV, then AMF, then libx264
 - **VP9** — Web-friendly fallback when you specifically want WebM output
 
@@ -26,7 +26,8 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 ### Hardware Acceleration
 - NVIDIA NVENC (H.264, HEVC) — preferred when more than one vendor is available
 - Intel Quick Sync Video (QSV)
-- AMD AMF (H.264, HEVC — including RX 9070 XT)
+- AMD AMF (H.264, HEVC, and AV1 when the GPU advertises it and FFmpeg lists `av1_amf` — including RX 9070 XT)
+- Windows Max / Archival decode can use D3D11VA (`-hwaccel d3d11va`). If that fails, the same `libsvtav1` encode runs again with software decode. Encode is not switched to AMF
 - Software libx264 when Quick Lite has no matching hardware encoder
 - Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band, fails, or finishes under an exact target where padding would apply, SquishIt does not switch to software until the caller confirms. Padding that short hardware file is ask-gated: the main window asks with the same Yes/No dialog; No or dismissing it keeps the unpadded hardware result and shows that on the result card. The CLI confirms with `--allow-software-fallback`. Quick Compress presets are not target-size jobs, so they do not ask. Leaving the callback unset also keeps the hardware result.
 
@@ -35,7 +36,7 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 |---------|-------------|----------|
 | **Fast** | H.264 Quick rung (CRF 26, fast) | Time-sensitive encoding |
 | **Balanced** | HEVC Balanced rung (CRF 28, medium) | General use |
-| **Max / Archival** | SVT-AV1 Max rung (CRF 36, preset 6) in MKV, hardware off | Archive-friendly files |
+| **Max / Archival** | SVT-AV1 Max rung (CRF 36, preset 6) in MKV, best compression, CPU, hardware encode off | Archive-friendly files |
 | **YouTube / social upload** | Video file for YouTube and other social uploads (`--profile youtube`) | Social file uploads |
 | **Mobile** | Smaller files for mobile | Mobile viewing |
 | **Streaming upload** | Video file for Twitch, YouTube, or OBS upload (`--profile streaming`) | Upload-ready files |
@@ -51,13 +52,13 @@ Quick, Balanced, and Max share one CRF/preset table. The GUI compression control
 |------|-------|----------|-----|
 | **H.264** (Quick Lite) | CRF 26, fast — fastest Quick Compress rung | CRF 28, medium | CRF 32, slow |
 | **HEVC** (Quick Compress) | CRF 24, veryfast | CRF 28, medium | CRF 30, slow — **HEVC Max** |
-| **SVT-AV1** (archival, hardware off) | CRF 32, preset 10 | CRF 35, preset 8 | CRF 36, preset 6 — **Max / Archival** |
-| **AV1 (libaom)** | CRF 26, cpu-used 8 | CRF 30, cpu-used 6 | CRF 34, cpu-used 4 |
+| **SVT-AV1** (Max / Archival, best compression, CPU, hardware encode off) | CRF 32, preset 10 | CRF 35, preset 8 | CRF 36, preset 6 — **Max / Archival** |
+| **Fast hardware AV1** (NVENC, then QSV, then AMF; else libaom) | CRF 26, cpu-used 8 | CRF 30, cpu-used 6 | CRF 34, cpu-used 4 |
 
 Quick finishes sooner and makes larger files. Balanced is the default tradeoff. Max is the best compression in that lane. When a profile matches a rung and a hardware encoder is selected, the command uses that rung's CQ and vendor preset (NVENC, then QSV, then AMF). SVT-AV1 stays on the software encoder. The encode-speed slider keeps the numeric SVT-AV1 and libaom preset instead of applying an x264 name.
 
 ### Encode resource governor
-One governor owns encode concurrency. It splits the CPU thread budget across the jobs that are actually running, and it caps how many encodes start at once: software jobs share half the logical CPUs, NVENC keeps 3 sessions, and QSV, AMF, and VideoToolbox keep 2. Each job gets one thread flag from that budget. libsvtav1 uses `lp=`. libx264 and libx265 use a single `-threads` value and do not also set `pools` or `frame-threads`. Quick Lite, HEVC Max, and Archival SVT-AV1 keep their encoder choices.
+One governor owns encode concurrency. It splits the CPU thread budget across the jobs that are actually running, and it caps how many encodes start at once: software jobs share half the logical CPUs, NVENC keeps 3 sessions, and QSV, AMF, and VideoToolbox keep 2. Each job gets one thread flag from that budget. libsvtav1 uses `lp=`. A single Max / Archival job on Resource Max sets `lp` to the logical CPU count. libx264 and libx265 use a single `-threads` value and do not also set `pools` or `frame-threads`. Quick Lite, HEVC Max, and Archival SVT-AV1 keep their encoder choices.
 
 ### Right-Click Context Menu
 - **Compress with SquishIt** — Quick compress with last-used profile

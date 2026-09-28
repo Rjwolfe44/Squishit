@@ -21,15 +21,15 @@ _CODEC_LABELS = {
     "hevc": "HEVC (H.265)",
     "h264": "H.264 (AVC)",
     "vp9": "VP9",
-    "svt-av1": "SVT-AV1 (Fast AV1)",
-    "av1": "AV1 (AOMedia)",
+    "svt-av1": "SVT-AV1 (best compression, CPU)",
+    "av1": "Fast hardware AV1",
 }
 _CODEC_MAP = {
     "HEVC (H.265)": VideoCodec.HEVC,
     "H.264 (AVC)": VideoCodec.H264,
     "VP9": VideoCodec.VP9,
-    "SVT-AV1 (Fast AV1)": VideoCodec.SVT_AV1,
-    "AV1 (AOMedia)": VideoCodec.AV1,
+    "SVT-AV1 (best compression, CPU)": VideoCodec.SVT_AV1,
+    "Fast hardware AV1": VideoCodec.AV1,
 }
 _CODEC_REVERSE = {v: k for k, v in _CODEC_MAP.items()}
 

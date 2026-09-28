@@ -93,6 +93,53 @@ def _job(tmp_path: Path, profile: CompressionProfile, *, parallel_jobs: int, nam
     return job
 
 
+def test_resource_max_single_svt_job_uses_logical_cpus():
+    """Resource Max and one SVT-AV1 job set lp to the logical CPU count.
+
+    Low RAM normally keeps 85% of a max budget. That haircut does not apply
+    to this job, and the count is not clamped to physical cores.
+    """
+
+    logical = 24
+    alone = threads_for_job(
+        cpu_threads=logical,
+        cpu_cores=12,
+        total_ram_gb=8.0,
+        profile_threads=None,
+        resource_governor="max",
+        codec="svt-av1",
+        hw_encoder=None,
+        parallel_jobs=1,
+        frame_height=1080,
+    )
+    assert alone == logical
+
+    auto_large = threads_for_job(
+        cpu_threads=logical,
+        cpu_cores=12,
+        total_ram_gb=32.0,
+        profile_threads=None,
+        resource_governor="auto",
+        codec="libsvtav1",
+        hw_encoder=None,
+        parallel_jobs=1,
+    )
+    assert auto_large == logical
+
+    shared = threads_for_job(
+        cpu_threads=logical,
+        cpu_cores=12,
+        total_ram_gb=32.0,
+        profile_threads=None,
+        resource_governor="max",
+        codec="svt-av1",
+        hw_encoder=None,
+        parallel_jobs=4,
+    )
+    assert shared < alone
+    assert shared * 4 <= logical
+
+
 def test_parallel_wave_splits_one_cpu_budget():
     alone = _threads(codec="svt-av1", parallel_jobs=1)
     shared = _threads(codec="svt-av1", parallel_jobs=4)

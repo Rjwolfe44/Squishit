@@ -52,8 +52,8 @@ class VideoCodec(Enum):
     @property
     def display_name(self) -> str:
         names = {
-            VideoCodec.AV1: "AV1 (AOMedia â€” reference, slow)",
-            VideoCodec.SVT_AV1: "SVT-AV1 (Fast AV1 â€” recommended)",
+            VideoCodec.AV1: "Fast hardware AV1",
+            VideoCodec.SVT_AV1: "SVT-AV1 (best compression, CPU)",
             VideoCodec.HEVC: "HEVC (H.265)",
             VideoCodec.H264: "H.264 (AVC)",
             VideoCodec.VP9: "VP9 (Google)",

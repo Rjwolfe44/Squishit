@@ -1056,13 +1056,25 @@ class SettingsPanel(ctk.CTkFrame):
             return
         codec = self._selected_codec()
         target_mode = self.target_mode_var.get() if hasattr(self, "target_mode_var") else "balanced"
+        if codec == VideoCodec.SVT_AV1:
+            self._hw_hint.configure(
+                text=(
+                    "SVT-AV1 (best compression, CPU). Hardware encode stays off. "
+                    "Fast hardware AV1 is the AV1 codec with hardware encoding on."
+                )
+            )
+            return
         if not self.hw_var.get():
             self._hw_hint.configure(text="Hardware acceleration off. SquishIt will use a software encoder.")
             return
         if target_mode == "exact":
+            prefix = ""
+            if codec == VideoCodec.AV1:
+                prefix = "Fast hardware AV1 tries NVENC, then QSV, then AMF first. "
             self._hw_hint.configure(
                 text=(
-                    "Exact target tries a hardware encoder first when one is available. "
+                    prefix
+                    + "Exact target tries a hardware encoder first when one is available. "
                     "If that encode misses the size, fails, or is short enough that "
                     "padding would hit the exact target, SquishIt asks before a "
                     "software retry. No keeps the hardware file and does not pad it. "
@@ -1074,8 +1086,23 @@ class SettingsPanel(ctk.CTkFrame):
             self._hw_hint.configure(text="No supported GPU encoder detected for this system.")
             return
         encoder = self.codec_manager.get_hw_encoder(codec, self.hw_vendor)
-        if encoder:
+        if encoder and codec == VideoCodec.AV1:
+            self._hw_hint.configure(
+                text=(
+                    f"Fast hardware AV1 ready: {encoder} "
+                    "(NVENC, then QSV, then AMF). "
+                    "Max / Archival stays SVT-AV1 on the CPU for best compression."
+                )
+            )
+        elif encoder:
             self._hw_hint.configure(text=f"Hardware acceleration ready: {encoder}. Auto threads still reserve CPU for filters and audio.")
+        elif codec == VideoCodec.AV1:
+            self._hw_hint.configure(
+                text=(
+                    "Fast hardware AV1 is not available on this system. "
+                    "Max / Archival SVT-AV1 (best compression, CPU) is the software AV1 lane."
+                )
+            )
         else:
             self._hw_hint.configure(text=f"{codec.value.upper()} will encode on the CPU on this system.")
 

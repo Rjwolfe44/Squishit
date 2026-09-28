@@ -33,9 +33,11 @@ Max / Archival    ~0.73 s   25_299 B   0.792   <= 25 s; 8k–120k B; SSIM >= 0.6
 
 Ordering, also soft:
 
-* Archival wall time is at least 1.5× Lite, and slower than HEVC Max. That
-  catches a collapsed preset (Archival dropped onto a fast preset, or Lite
-  switched onto a slow AV1 preset) without pinning a stopwatch.
+* Wall-clock order is not asserted. A single Max / Archival job uses every
+  logical CPU (``lp``), so on a short clip SVT-AV1 can finish faster than
+  Quick Lite or HEVC Max. Each lane still has an absolute time ceiling so a
+  hung encode fails. Preset collapse is the encoder, CRF, and preset checks
+  (libsvtav1, CRF 36, preset 6), not a stopwatch.
 * Lite's file is at least 1.25× either Max. Quick stays the larger file on
   this clip. The two Max sizes may sit close together; they stay distinct by
   codec, CRF, and preset (HEVC CRF 30 slow versus SVT-AV1 CRF 36 preset 6),
@@ -91,8 +93,6 @@ _SSIM_FLOOR = {
     "hevc_max": 0.68,
     "archival": 0.68,
 }
-# Archival preset 6 versus Lite's fast H.264. Measured ratio was about 4×.
-_ARCHIVAL_VS_LITE_MIN_TIME_RATIO = 1.5
 # Lite versus either Max. Measured ratio was about 2.4×.
 _LITE_VS_MAX_MIN_SIZE_RATIO = 1.25
 
@@ -383,10 +383,6 @@ def test_lite_and_dual_max_software_time_size_ssim(ladder_case, tmp_path):
     lite = samples["lite"]
     hevc_max = samples["hevc_max"]
     archival = samples["archival"]
-    assert (
-        archival.wall_seconds >= lite.wall_seconds * _ARCHIVAL_VS_LITE_MIN_TIME_RATIO
-    ), detail
-    assert archival.wall_seconds > hevc_max.wall_seconds, detail
     assert lite.size_bytes >= int(hevc_max.size_bytes * _LITE_VS_MAX_MIN_SIZE_RATIO), (
         detail
     )

@@ -321,6 +321,12 @@ class SettingsPane(QWidget):
 
     def _refresh_hints(self) -> None:
         choice = self.form.ladder_choice()
+        if choice.codec == VideoCodec.AV1 and not choice.force_software:
+            self._hw.setText("Fast hardware AV1")
+        elif choice.codec == VideoCodec.SVT_AV1:
+            self._hw.setText("Hardware encode stays off (SVT-AV1, CPU)")
+        else:
+            self._hw.setText("Use hardware encoding")
         self._hw.setEnabled(not choice.force_software)
         if choice.force_software:
             self._hw.setChecked(False)

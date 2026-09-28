@@ -35,7 +35,10 @@ QUICK_PRESET_BLURBS = {
 PROFILE_FRIENDLY = {
     "Fast": "Faster encode, larger file.",
     "Balanced": "Everyday choice in the full preset list.",
-    "Max / Archival": "Smallest archive file. Uses software, not the graphics card.",
+    "Max / Archival": (
+        "SVT-AV1, best compression, on the CPU. "
+        "Fast hardware AV1 is a different codec."
+    ),
 }
 TRAY_HINT = "Closing or minimizing this window does not put SquishIt in the tray."
 TRAY_HELP = (

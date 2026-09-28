@@ -174,6 +174,26 @@ def test_missing_wmic_reports_rx_9070_xt_and_prefers_amf(monkeypatch, quiet_tool
     assert "software" not in status.using.lower()
 
 
+def test_rx_9070_xt_selects_av1_amf_when_ffmpeg_lists_it(monkeypatch, quiet_tools):
+    """Fast hardware AV1 on Deus: the 9070 XT advertises AV1 and FFmpeg has av1_amf."""
+
+    _install_queries(monkeypatch, cim=_cim_bytes(_DEUS_ADAPTERS), wmic=None)
+    detector = HardwareDetector()
+    info = detector.refresh()
+    discrete = info.gpus[0]
+    assert discrete.name == "AMD Radeon RX 9070 XT"
+    assert discrete.encoder_support["av1"] is True
+
+    compressor = _compressor(
+        detector,
+        _FFMPEG_STUBS
+        | {"av1_nvenc", "av1_qsv", "av1_amf", "libsvtav1", "libaom-av1"},
+    )
+    assert compressor._select_hw_encoder(VideoCodec.AV1) == "av1_amf"
+    assert compressor._select_hw_encoder(VideoCodec.SVT_AV1) is None
+    assert compressor._select_hw_encoder(VideoCodec.H264) == "h264_amf"
+
+
 def test_no_display_adapter_stays_on_software_despite_ffmpeg_stubs(
     monkeypatch, quiet_tools
 ):
@@ -262,6 +282,7 @@ def test_pci_vendor_1002_counts_when_the_friendly_name_omits_radeon(monkeypatch)
     info = HardwareDetector().refresh()
     assert [gpu.name for gpu in info.gpus] == ["Navi 48"]
     assert info.gpus[0].vendor is GPUVendor.AMD
+    assert info.gpus[0].encoder_support["av1"] is True
     assert info.has_hw_encoder is True
     assert info.preferred_hw_encoder == "amd"
 
@@ -286,6 +307,7 @@ def test_linux_lspci_vga_line_still_detects_amd(monkeypatch):
     assert len(gpus) == 1
     assert gpus[0].vendor is GPUVendor.AMD
     assert "9070" in gpus[0].name
+    assert gpus[0].encoder_support["av1"] is True
 
 
 def test_cli_hardware_lists_amd_amf(monkeypatch, capsys):

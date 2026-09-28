@@ -193,6 +193,11 @@ def test_main_window_quick_lite_starts_the_existing_compressor(
         assert window.findChild(QScrollArea, "settingsScroll") is not None
         codec = window._settings._codec
         assert codec.findData(VideoCodec.AV1.value) >= 0
+        assert codec.itemText(codec.findData(VideoCodec.AV1.value)) == "Fast hardware AV1"
+        svt_index = codec.findData(VideoCodec.SVT_AV1.value)
+        assert svt_index >= 0
+        assert "best compression" in codec.itemText(svt_index)
+        assert "CPU" in codec.itemText(svt_index)
         clip = tmp_path / "clip.mp4"
         clip.write_bytes(b"not-a-real-video")
         window.select_profile("Max / Archival")
@@ -280,7 +285,11 @@ def test_home_path_shows_real_encoder_and_plain_quick_copy(
         assert window._compress_btn.text() == "Compress"
         assert "software encoding" in window._hw_card.using.text()
         assert "keeps hardware off" in window._hw_card.using.text()
+        assert "best compression" in window._hw_card.using.text()
+        assert "fast hardware AV1" in window._hw_card.using.text()
         assert "RTX 4070" in window._hw_card.found.text()
+        assert "best compression" in window._settings._ladder_hint.text()
+        assert window._settings._hw.text().startswith("Hardware encode stays off")
 
         window.select_quick("Quick Lite")
         window.form.target_size_enabled = True

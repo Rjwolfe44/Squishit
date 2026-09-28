@@ -39,8 +39,8 @@ CODEC_LABELS = {
     VideoCodec.H264: "H.264",
     VideoCodec.HEVC: "HEVC",
     VideoCodec.VP9: "VP9",
-    VideoCodec.SVT_AV1: "SVT-AV1",
-    VideoCodec.AV1: "AV1 (libaom)",
+    VideoCodec.SVT_AV1: "SVT-AV1 (best compression, CPU)",
+    VideoCodec.AV1: "Fast hardware AV1",
 }
 RUNG_LABELS = [rung.label for rung in QualityRung]
 TARGET_MODES = ["auto", "fast", "balanced", "strict", "exact"]
@@ -142,10 +142,25 @@ class EncodeForm:
 
     def hw_hint(self) -> str:
         choice = self.ladder_choice()
+        if choice.codec == VideoCodec.SVT_AV1:
+            return (
+                "SVT-AV1 (best compression, CPU). Hardware encode stays off. "
+                "Fast hardware AV1 is the AV1 codec with hardware encoding on."
+            )
         if choice.force_software:
             return (
-                "Hardware acceleration stays off for this codec. "
-                "SquishIt uses the software encoder."
+                "Hardware encode stays off for this preset. "
+                "SquishIt will use a software encoder."
+            )
+        if choice.codec == VideoCodec.AV1 and self.use_hw_accel:
+            if self.target_size_enabled and self.target_size_mode == "exact":
+                return (
+                    "Fast hardware AV1 tries NVENC, then QSV, then AMF first. "
+                    + _EXACT_HW_HINT
+                )
+            return (
+                "Fast hardware AV1: NVENC, then QSV, then AMF (av1_amf on AMD). "
+                "Max / Archival stays SVT-AV1 on the CPU for best compression."
             )
         if not self.use_hw_accel:
             return "Hardware acceleration off. SquishIt will use a software encoder."

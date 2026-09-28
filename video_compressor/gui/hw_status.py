@@ -158,10 +158,15 @@ def describe_hw_status(
     found_line = _found_line(probe.found)
     tooltip = software_name
     if force_software:
+        using = f"{action} keeps hardware off and will use software encoding."
+        if codec == VideoCodec.SVT_AV1:
+            using += (
+                " SVT-AV1 is best compression on the CPU, not fast hardware AV1."
+            )
         return HwStatusText(
             badge="Software",
             found=found_line,
-            using=(f"{action} keeps hardware off and will use software encoding."),
+            using=using,
             state="software",
             tooltip=tooltip,
         )
@@ -183,6 +188,8 @@ def describe_hw_status(
         found_line = f"Found {FAMILY_PLAIN.get(family, family)}."
     if encoder and family:
         using = _hardware_using(action, family, probe.found)
+        if codec == VideoCodec.AV1:
+            using = f"Fast hardware AV1. {using}"
         return HwStatusText(
             badge=family if family != "VideoToolbox" else "Apple",
             found=found_line,

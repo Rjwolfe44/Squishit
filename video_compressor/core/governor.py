@@ -11,7 +11,10 @@ Budget
     ``threads_for_job`` applies the per-codec ceiling on top of that share.
     An explicit thread override is kept for a single job and is divided across
     the wave when more than one job runs, so a batch cannot give every job the
-    full override.
+    full override. One software SVT-AV1 job whose mode is ``max`` (Resource
+    Max, or auto on a large machine) gets ``lp`` equal to the logical CPU
+    count. That count is not clamped to physical cores, and the low-RAM 85%
+    haircut does not apply to that single job. A wave still splits one budget.
 
 Admission
     ``EncodeResourceGovernor`` is the live ledger. ``max_concurrent`` is the
@@ -193,7 +196,12 @@ def threads_for_job(
     parallel_jobs: int = 1,
     frame_height: int = 0,
 ) -> int:
-    """Thread count for one job. The fair share is a ceiling, not a suggestion."""
+    """Thread count for one job. The fair share is a ceiling, not a suggestion.
+
+    A single software SVT-AV1 job in Resource Max (or auto that resolves to
+    max) is the exception: ``lp`` is the logical CPU count, not a fraction
+    of it and not the physical-core count.
+    """
 
     codec_name = (codec or "").lower()
     n_parallel = max(1, int(parallel_jobs or 1))
@@ -237,8 +245,47 @@ def threads_for_job(
 
     if x265_cap is not None:
         requested = min(requested, x265_cap)
+    if _svt_single_job_uses_logical_cpus(
+        codec_name=codec_name,
+        hw_encoder=hw_encoder,
+        n_parallel=n_parallel,
+        resource_governor=resource_governor,
+        frame_height=frame_height,
+        cpu_threads=logical,
+        total_ram_gb=total_ram_gb,
+    ):
+        # Resource Max / one Max-Archival job: lp covers the logical CPUs.
+        return logical
     # Codec floors must not hand a job more threads than its share of the machine.
     return max(1, min(requested, share))
+
+
+def _svt_single_job_uses_logical_cpus(
+    *,
+    codec_name: str,
+    hw_encoder: Optional[str],
+    n_parallel: int,
+    resource_governor: str,
+    frame_height: int,
+    cpu_threads: int,
+    total_ram_gb: float,
+) -> bool:
+    """True when one software SVT-AV1 job should set ``lp`` to every logical CPU."""
+
+    if hw_encoder or n_parallel != 1:
+        return False
+    if codec_name not in {"svt-av1", "libsvtav1"}:
+        return False
+    resolved = resolve_governor_mode(
+        governor=resource_governor,
+        n_parallel=n_parallel,
+        codec=codec_name,
+        hw_encoder=hw_encoder,
+        frame_height=frame_height,
+        cpu_threads=cpu_threads,
+        total_ram_gb=total_ram_gb,
+    )
+    return resolved == "max"
 
 
 def apply_thread_policy(argv: Sequence[str], *, threads: int, encoder: str) -> List[str]:

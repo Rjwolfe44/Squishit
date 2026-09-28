@@ -108,7 +108,8 @@ Examples:
         default=None,
         help=(
             'Video codec (default: depends on profile). '
-            'AV1 is available as svt-av1 (archival lane) or av1 (libaom).'
+            'svt-av1 is Max / Archival SVT-AV1 (best compression, CPU). '
+            'av1 is fast hardware AV1 (NVENC, then QSV, then AMF, else libaom).'
         ),
     )
 

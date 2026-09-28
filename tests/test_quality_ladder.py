@@ -1,8 +1,12 @@
 """Locked Quick / Balanced / Max encoder arguments.
 
 The expected argv is hardcoded so a GUI, CLI, or Quick Compress edit cannot
-silently drift from the ladder.
+silently drift from the ladder. Max / Archival snapshots are checked for both
+Linux and Windows: Windows software SVT-AV1 inserts ``-hwaccel d3d11va``
+before ``-i`` and still encodes with ``libsvtav1``.
 """
+
+import platform
 
 import pytest
 
@@ -737,7 +741,30 @@ def _sample_video_info(input_file):
     )
 
 
-def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
+def _snapshot_argv(
+    source: str,
+    output: str,
+    codec_args: list[str],
+    *,
+    system_name: str,
+    svt_decode: bool,
+) -> list[str]:
+    """Full ffmpeg argv for a snapshot.
+
+    Windows software SVT-AV1 decode is ``-hwaccel d3d11va`` before ``-i``.
+    The encoder arguments are unchanged, and hardware encodes do not get it.
+    """
+
+    cmd = ["ffmpeg", "-y", "-hide_banner"]
+    if svt_decode and system_name == "Windows":
+        cmd.extend(["-hwaccel", "d3d11va"])
+    cmd.extend(["-i", source, *codec_args, output])
+    return cmd
+
+
+@pytest.mark.parametrize("system_name", ["Linux", "Windows"])
+def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path, system_name):
+    monkeypatch.setattr(platform, "system", lambda: system_name)
     monkeypatch.setattr(VideoCompressor, "_find_ffmpeg", lambda self: "ffmpeg")
     monkeypatch.setattr(VideoCompressor, "_find_ffprobe", lambda self: "ffprobe")
     monkeypatch.setattr(VideoCompressor, "_find_cjxl", lambda self: None)
@@ -759,28 +786,35 @@ def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
 
     archival_cmd = compressor._build_video_ffmpeg_command(archival_job, archival)
 
-    assert archival_cmd == [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
+    assert archival_cmd == _snapshot_argv(
         str(input_file),
-        "-c:v",
-        "libsvtav1",
-        "-crf",
-        "36",
-        "-preset",
-        "6",
-        "-svtav1-params",
-        "lp=4",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        "96000",
         str(archival_out),
-    ]
+        [
+            "-c:v",
+            "libsvtav1",
+            "-crf",
+            "36",
+            "-preset",
+            "6",
+            "-svtav1-params",
+            "lp=4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96000",
+        ],
+        system_name=system_name,
+        svt_decode=True,
+    )
+    assert archival_cmd[archival_cmd.index("-c:v") + 1] == "libsvtav1"
+    assert "-hwaccel_output_format" not in archival_cmd
+    assert "av1_amf" not in archival_cmd
+    if system_name == "Windows":
+        assert archival_cmd[3:5] == ["-hwaccel", "d3d11va"]
+    else:
+        assert "-hwaccel" not in archival_cmd
     assert archival_cmd.count("-threads") == 0
     assert archival_cmd.count("-svtav1-params") == 1
     assert "nvenc" not in " ".join(archival_cmd)
@@ -799,30 +833,31 @@ def test_max_lane_ffmpeg_commands_snapshot(monkeypatch, tmp_path):
 
     hevc_cmd = compressor._build_video_ffmpeg_command(hevc_job, hevc_max)
 
-    assert hevc_cmd == [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
+    assert hevc_cmd == _snapshot_argv(
         str(input_file),
-        "-c:v",
-        "hevc_nvenc",
-        "-preset",
-        "p7",
-        "-cq",
-        "30",
-        "-b:v",
-        "0",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        "96000",
-        "-threads",
-        "4",
         str(hevc_out),
-    ]
+        [
+            "-c:v",
+            "hevc_nvenc",
+            "-preset",
+            "p7",
+            "-cq",
+            "30",
+            "-b:v",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96000",
+            "-threads",
+            "4",
+        ],
+        system_name=system_name,
+        svt_decode=False,
+    )
+    assert "-hwaccel" not in hevc_cmd
 
 
 _SOFTWARE_ENCODERS = {
@@ -886,13 +921,18 @@ def _flag(cmd, name):
     return cmd[cmd.index(name) + 1]
 
 
-def test_compress_keeps_quick_lite_h264_and_distinct_maxes(monkeypatch, tmp_path):
+@pytest.mark.parametrize("system_name", ["Linux", "Windows"])
+def test_compress_keeps_quick_lite_h264_and_distinct_maxes(
+    monkeypatch, tmp_path, system_name
+):
     """Quick Lite stays H.264, and the two Max lanes do not share one argv.
 
     No GPU is advertised, so hardware-on profiles fall through to software.
-    Archival stays on SVT-AV1 with hardware off.
+    Archival stays on SVT-AV1 with hardware off. On Windows that software
+    encode decodes with D3D11VA and still uses libsvtav1.
     """
 
+    monkeypatch.setattr(platform, "system", lambda: system_name)
     compressor = _ladder_compressor(
         monkeypatch,
         gpus=[],
@@ -924,81 +964,89 @@ def test_compress_keeps_quick_lite_h264_and_distinct_maxes(monkeypatch, tmp_path
     assert _encoder(lite_cmd) == "libx264"
     assert "libx265" not in lite_cmd
     assert "hevc" not in " ".join(lite_cmd)
-    assert lite_cmd == [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
+    assert lite_cmd == _snapshot_argv(
         str(source),
-        "-c:v",
-        "libx264",
-        "-crf",
-        "26",
-        "-preset",
-        "fast",
-        "-threads",
-        "4",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128000",
-        "-movflags",
-        "+faststart",
         str(lite_out),
-    ]
+        [
+            "-c:v",
+            "libx264",
+            "-crf",
+            "26",
+            "-preset",
+            "fast",
+            "-threads",
+            "4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128000",
+            "-movflags",
+            "+faststart",
+        ],
+        system_name=system_name,
+        svt_decode=False,
+    )
+    assert "-hwaccel" not in lite_cmd
 
     assert hevc_result.video_codec == "hevc"
     assert hevc_result.encoder_name == "libx265"
-    assert hevc_cmd == [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
+    assert hevc_cmd == _snapshot_argv(
         str(source),
-        "-c:v",
-        "libx265",
-        "-crf",
-        "30",
-        "-preset",
-        "slow",
-        "-threads",
-        "4",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        "96000",
         str(hevc_out),
-    ]
+        [
+            "-c:v",
+            "libx265",
+            "-crf",
+            "30",
+            "-preset",
+            "slow",
+            "-threads",
+            "4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96000",
+        ],
+        system_name=system_name,
+        svt_decode=False,
+    )
+    assert "-hwaccel" not in hevc_cmd
 
     assert archival_result.video_codec == "svt-av1"
     assert archival_result.encoder_name == "libsvtav1"
     assert archival.use_hw_accel is False
-    assert archival_cmd == [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-i",
+    assert archival_cmd == _snapshot_argv(
         str(source),
-        "-c:v",
-        "libsvtav1",
-        "-crf",
-        "36",
-        "-preset",
-        "6",
-        "-svtav1-params",
-        "lp=4",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "libopus",
-        "-b:a",
-        "96000",
         str(archival_out),
-    ]
+        [
+            "-c:v",
+            "libsvtav1",
+            "-crf",
+            "36",
+            "-preset",
+            "6",
+            "-svtav1-params",
+            "lp=4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96000",
+        ],
+        system_name=system_name,
+        svt_decode=True,
+    )
+    assert "-hwaccel_output_format" not in archival_cmd
+    assert "av1_amf" not in archival_cmd
+    if system_name == "Windows":
+        assert archival_cmd[3:5] == ["-hwaccel", "d3d11va"]
+    else:
+        assert "-hwaccel" not in archival_cmd
     assert archival_cmd.count("-threads") == 0
     assert not any(
         token in " ".join(archival_cmd)

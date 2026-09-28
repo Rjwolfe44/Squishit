@@ -246,6 +246,8 @@ class CompressionJob:
     software_fallback_reason: str = ""
     software_fallback_message: str = ""
     software_fallback_settled: bool = False
+    # Set after D3D11VA decode fails so the retry omits -hwaccel. Encode stays put.
+    decode_hwaccel_disabled: bool = False
     
     def __post_init__(self):
         if isinstance(self.input_file, str):
@@ -264,6 +266,62 @@ class TargetSizeSearchState:
     # Lowest bitrate known to still overshoot the target.
     upper_bitrate: Optional[int] = None
     upper_size_bytes: Optional[int] = None
+
+
+# Decode-only. Do not set -hwaccel_output_format: that keeps frames on the GPU
+# and libsvtav1 cannot encode them. d3d11va downloads back to system memory.
+WINDOWS_DECODE_HWACCEL = "d3d11va"
+
+# Failure phrases only. A later SVT error that merely echoes "-hwaccel d3d11va"
+# must not look like a decode-device failure and must not retry.
+_DECODE_HWACCEL_FAILURE_MARKERS = (
+    "failed to create direct3d",
+    "failed to create d3d11",
+    "failed to create dxgi",
+    "failed to create specified hw device",
+    "device creation failed",
+    "hwaccel initialisation returned error",
+    "hwaccel initialization returned error",
+    "hwaccel init failed",
+    "hwaccel requested for input stream",
+    "error creating a d3d11",
+)
+
+
+def software_svt_decode_hwaccel(
+    *,
+    system: str,
+    codec: VideoCodec,
+    hw_encoder: Optional[str],
+    disabled: bool = False,
+) -> Optional[str]:
+    """Windows D3D11VA input decode for software SVT-AV1, or None.
+
+    The encoder is not changed. A hardware encoder, including ``av1_amf``,
+    does not take this flag, so Max / Archival cannot become an AMF encode
+    by way of the decode path.
+    """
+
+    if disabled or hw_encoder or system != "Windows":
+        return None
+    if codec != VideoCodec.SVT_AV1:
+        return None
+    return WINDOWS_DECODE_HWACCEL
+
+
+def decode_hwaccel_failed(argv: List[str], stderr_text: str) -> bool:
+    """True when this argv asked for D3D11VA and FFmpeg reported that it failed."""
+
+    if not stderr_text:
+        return False
+    try:
+        index = argv.index("-hwaccel")
+    except ValueError:
+        return False
+    if index + 1 >= len(argv) or argv[index + 1] != WINDOWS_DECODE_HWACCEL:
+        return False
+    lowered = stderr_text.lower()
+    return any(marker in lowered for marker in _DECODE_HWACCEL_FAILURE_MARKERS)
 
 
 class VideoCompressor:
@@ -1121,8 +1179,11 @@ class VideoCompressor:
 
         A GPU must advertise support for the codec and FFmpeg must provide
         that vendor's encoder. None means the caller keeps the software
-        encoder (libx264 on Quick Lite, libx265 on Quick Max). SVT-AV1 has
-        no hardware encoder here, so Max / Archival stays on libsvtav1.
+        encoder. ``VideoCodec.AV1`` with hardware on uses ``av1_nvenc``, then
+        ``av1_qsv``, then ``av1_amf`` (an RX 9070 XT that advertises AV1 and
+        has ``av1_amf`` in FFmpeg selects AMF). SVT-AV1 has no hardware
+        encoder here, so Max / Archival stays on libsvtav1 even when
+        ``av1_amf`` is installed.
         """
         info = self.hw_detector.info
         if not info.gpus:
@@ -1487,11 +1548,16 @@ class VideoCompressor:
         """Build an FFmpeg command for video compression."""
         video_info = job.video_info
 
-        cmd = self._build_input_command(job, profile)
-
         hw_encoder = None
         if profile.use_hw_accel:
             hw_encoder = self._select_hw_encoder(profile.video_codec)
+        decode_hwaccel = software_svt_decode_hwaccel(
+            system=platform.system(),
+            codec=profile.video_codec,
+            hw_encoder=hw_encoder,
+            disabled=job.decode_hwaccel_disabled,
+        )
+        cmd = self._build_input_command(job, profile, decode_hwaccel=decode_hwaccel)
 
         codec_settings = profile.to_codec_settings()
         media = video_info if isinstance(video_info, VideoInfo) else None
@@ -1584,15 +1650,29 @@ class VideoCompressor:
             encoder=job.encoder_name,
         )
 
-    def _build_input_command(self, job: CompressionJob, profile: CompressionProfile) -> List[str]:
-        """Build the shared FFmpeg input and optional trim arguments."""
+    def _build_input_command(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        *,
+        decode_hwaccel: Optional[str] = None,
+    ) -> List[str]:
+        """Build the shared FFmpeg input and optional trim arguments.
+
+        ``decode_hwaccel`` is an input option (``-hwaccel d3d11va``) placed
+        before ``-i``. It does not select the encoder.
+        """
         cmd = [
             self._ffmpeg_path,
             "-y",
             "-hide_banner",
+        ]
+        if decode_hwaccel:
+            cmd.extend(["-hwaccel", decode_hwaccel])
+        cmd.extend([
             "-i",
             str(job.input_file),
-        ]
+        ])
 
         if profile.trim_enabled:
             start = parse_timecode(profile.trim_start)
@@ -1804,6 +1884,31 @@ class VideoCompressor:
         """
         media_info = job.video_info if isinstance(job.video_info, VideoInfo) else None
         return self._build_video_ffmpeg_command(job, self._optimize_video_profile(job.profile, media_info))
+
+    def _retry_without_decode_hwaccel(
+        self,
+        job: CompressionJob,
+        cmd: List[str],
+        stderr_text: str,
+    ) -> bool:
+        """Retry once with CPU decode after D3D11VA fails. Encoder stays put."""
+
+        if job.decode_hwaccel_disabled or not decode_hwaccel_failed(cmd, stderr_text):
+            return False
+        job.decode_hwaccel_disabled = True
+        if job.output_file.exists():
+            job.output_file.unlink(missing_ok=True)
+        job.progress = 0.0
+        job.speed = 0.0
+        job.eta = 0.0
+        job.current_frame = 0
+        logger.warning(
+            "D3D11VA decode failed for %s; retrying %s with software decode",
+            job.input_file,
+            job.encoder_name or "libsvtav1",
+        )
+        self._report_progress(job)
+        return True
 
     def _should_retry_with_safe_av1_settings(self, profile: CompressionProfile, error_text: str) -> bool:
         """Detect libaom-av1 option failures that can be retried with safer settings."""
@@ -2686,7 +2791,10 @@ class VideoCompressor:
                         continue
                     break
 
+                full_stderr = "\n".join(stderr_lines)
                 stderr_text = "\n".join(stderr_lines[-20:]).strip()
+                if self._retry_without_decode_hwaccel(job, cmd, full_stderr):
+                    continue
                 if (
                     retry_count == 0
                     and stderr_text

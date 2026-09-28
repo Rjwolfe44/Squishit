@@ -3,7 +3,10 @@
 GUI settings, Quick Compress, and the CLI all read this table so a rung emits
 one FFmpeg argument set. Two Max labels stay separate:
 
-* Max / Archival is the SVT-AV1 lane. Hardware stays off.
+* Max / Archival is the SVT-AV1 lane (best compression, CPU). Hardware encode
+  stays off. It is not replaced with AMF AV1.
+* The AV1 codec is the fast hardware lane: NVENC, then QSV, then AMF, else
+  libaom. That is not Max / Archival.
 * Quick Compress Max is the HEVC lane (``HEVC Max``). Hardware may stay on.
 
 Quick Lite, the fastest Quick Compress button, is the H.264 Quick rung.
@@ -172,7 +175,8 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             32,
             "10",
             "SVT-AV1 Quick: faster archival encode, larger files "
-            "(CRF 32, preset 10). Hardware stays off.",
+            "(CRF 32, preset 10). Hardware stays off. "
+            "This is the CPU lane, not fast hardware AV1.",
             force_software=True,
         ),
         QualityRung.BALANCED: _step(
@@ -181,7 +185,8 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             35,
             "8",
             "SVT-AV1 Balanced: default archival tradeoff "
-            "(CRF 35, preset 8). Hardware stays off.",
+            "(CRF 35, preset 8). Hardware stays off. "
+            "Best compression stays on the CPU, not fast hardware AV1.",
             force_software=True,
         ),
         QualityRung.MAX: _step(
@@ -189,8 +194,9 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             QualityRung.MAX,
             36,
             "6",
-            "Max / Archival: best SVT-AV1 compression (CRF 36, preset 6). "
-            "Hardware stays off. Not Quick Compress Max (HEVC).",
+            "Max / Archival: SVT-AV1 (best compression, CPU) at CRF 36, preset 6. "
+            "Hardware stays off. Not the fast hardware AV1 lane. "
+            "Not Quick Compress Max (HEVC).",
             force_software=True,
         ),
     },
@@ -200,22 +206,27 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             QualityRung.QUICK,
             26,
             "8",
-            "AV1 Quick: faster libaom encode, larger files (CRF 26, cpu-used 8).",
+            "Fast hardware AV1: NVENC, then QSV, then AMF when hardware is on. "
+            "Software is libaom (CRF 26, cpu-used 8). "
+            "Not Max / Archival SVT-AV1 (best compression, CPU).",
         ),
         QualityRung.BALANCED: _step(
             VideoCodec.AV1,
             QualityRung.BALANCED,
             30,
             "6",
-            "AV1 Balanced: default libaom tradeoff (CRF 30, cpu-used 6).",
+            "Fast hardware AV1: NVENC, then QSV, then AMF when hardware is on. "
+            "Software is libaom (CRF 30, cpu-used 6). "
+            "Not Max / Archival SVT-AV1 (best compression, CPU).",
         ),
         QualityRung.MAX: _step(
             VideoCodec.AV1,
             QualityRung.MAX,
             34,
             "4",
-            "AV1 Max: best libaom compression (CRF 34, cpu-used 4). "
-            "Max / Archival is SVT-AV1, not libaom.",
+            "Fast hardware AV1 at its slowest rung: NVENC, then QSV, then AMF "
+            "when hardware is on. Software is libaom (CRF 34, cpu-used 4). "
+            "Max / Archival is SVT-AV1 (best compression, CPU), not this lane.",
         ),
     },
     VideoCodec.H264: {
