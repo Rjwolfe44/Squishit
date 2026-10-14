@@ -280,6 +280,49 @@ def parse_timecode(value: Union[str, int, float, None]) -> Optional[float]:
     return seconds if seconds >= 0 else None
 
 
+def format_timecode(seconds: Union[int, float, None], always_hours: bool = False) -> str:
+    """Format seconds as ``MM:SS.mmm`` (or ``H:MM:SS.mmm`` once past an hour).
+
+    Works from whole milliseconds so values like 59.9996 carry cleanly to
+    ``01:00.000`` instead of printing ``00:60.000``.
+    """
+    try:
+        total_ms = int(round(max(0.0, float(seconds or 0.0)) * 1000))
+    except (TypeError, ValueError, OverflowError):
+        total_ms = 0
+    hours, rest = divmod(total_ms, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    secs, millis = divmod(rest, 1000)
+    if hours or always_hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}.{millis:03d}"
+    return f"{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def unique_output_path(path: Union[str, Path], is_taken=None) -> Path:
+    """Return ``path`` or ``name (2).ext``, ``name (3).ext`` ... that is not taken.
+
+    ``is_taken`` is an optional predicate for names that are reserved but not on
+    disk yet (for example other jobs in the same batch); it should compare
+    case-insensitively because Windows file names are.
+    """
+    candidate = Path(path)
+
+    def taken(value: Path) -> bool:
+        if value.exists():
+            return True
+        return bool(is_taken and is_taken(value))
+
+    if not taken(candidate):
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    counter = 2
+    while True:
+        attempt = candidate.with_name(f"{stem} ({counter}){suffix}")
+        if not taken(attempt):
+            return attempt
+        counter += 1
+
+
 def get_video_extension(codec: str, container: Optional[str] = None) -> str:
     """
     Get appropriate file extension for video codec.
