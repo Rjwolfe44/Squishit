@@ -2,12 +2,27 @@
 """Command-line interface for SquishIt."""
 
 import argparse
+import math
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Callable, List, NamedTuple, Optional, Sequence
 import logging
 
+from video_compressor.core.clips import (
+    MAX_JOIN_CLIPS,
+    MIN_CLIP_SECONDS,
+    Clip,
+    ClipJob,
+    ClipMode,
+    ClipPlan,
+    effective_media_info,
+    expand_clip_jobs,
+    normalize_clips,
+    parse_clip_range,
+    resolve_clip_plan,
+)
 from video_compressor.core.compressor import VideoCompressor, CompressionResult
 from video_compressor.core.profiles import (
     ProfileManager,
@@ -20,6 +35,7 @@ from video_compressor.core.utils import (
     detect_media_type,
     format_size,
     format_time,
+    format_timecode,
     get_image_extension,
     get_video_extension,
     SUPPORTED_MEDIA_EXTENSIONS,
@@ -61,6 +77,12 @@ Examples:
 
   # Quick Compress Max: HEVC, not archival SVT-AV1
   %(prog)s video.mp4 --profile max --codec hevc
+
+  # Keep two parts of a video, each saved as its own file (..._clip01.mp4, ..._clip02.mp4)
+  %(prog)s video.mp4 --clip 1:30-2:45 --clip 5:00-5:30
+
+  # Keep the first 30 seconds and everything from 10:00 on, joined into one file
+  %(prog)s video.mp4 --clip -30 --clip 10:00- --join
         """
     )
     
@@ -212,6 +234,31 @@ Examples:
         help='Target frame rate'
     )
     
+    # Clips (trim)
+    parser.add_argument(
+        '--clip',
+        action='append',
+        default=None,
+        metavar='START-END',
+        help=(
+            'Keep only this part of each video; repeat for several parts. '
+            'Times are seconds or [h:]mm:ss[.mmm]. Leave one end open: '
+            '-30 is the first 30 seconds, 1:00- is from 1:00 to the end. '
+            'Several clips are saved as separate files '
+            '(name_compressed_clip01.mp4, ...) unless --join is used. '
+            'Ignored for images'
+        )
+    )
+
+    parser.add_argument(
+        '--join',
+        action='store_true',
+        help=(
+            'Join all --clip parts, in the order given, into one output file '
+            f'instead of one file per clip (needs 2 to {MAX_JOIN_CLIPS} --clip options)'
+        )
+    )
+
     # Hardware acceleration
     parser.add_argument(
         '--no-hw-accel',
@@ -549,60 +596,198 @@ def build_compare_profiles(base_profile: CompressionProfile, compressor: VideoCo
     return candidates
 
 
-def process_file(
+def get_clip_plan(args: argparse.Namespace) -> Optional[ClipPlan]:
+    """Build the clip plan requested with --clip / --join, or None without --clip.
+
+    Raises ValueError with a one-line message for bad input.
+    """
+    specs = list(getattr(args, 'clip', None) or [])
+    join = bool(getattr(args, 'join', False))
+    if not specs:
+        if join:
+            raise ValueError("--join needs at least two --clip options")
+        return None
+
+    clips: List[Clip] = []
+    for spec in specs:
+        try:
+            clips.append(parse_clip_range(spec))
+        except ValueError as exc:
+            raise ValueError(f"Invalid --clip value: {exc}") from None
+
+    if join:
+        if len(clips) < 2:
+            raise ValueError(
+                "--join needs at least two --clip options (use a single --clip to just trim)"
+            )
+        if len(clips) > MAX_JOIN_CLIPS:
+            raise ValueError(f"--join can join at most {MAX_JOIN_CLIPS} clips (got {len(clips)})")
+
+    return ClipPlan(tuple(clips), ClipMode.JOIN if join else ClipMode.SEPARATE)
+
+
+_CLIP_VALUE_START = re.compile(r'-[\d.]')
+
+
+def attach_clip_values(argv: Sequence[str]) -> List[str]:
+    """Rewrite ``--clip -1:30`` as ``--clip=-1:30``.
+
+    argparse reads a value like ``-1:30`` as a new option (``-30`` already works),
+    and an open start such as "the first 1:30" is a natural thing to type.
+    """
+    items = list(argv)
+    fixed: List[str] = []
+    i = 0
+    while i < len(items):
+        item = items[i]
+        if item == '--':
+            fixed.extend(items[i:])
+            break
+        if item == '--clip' and i + 1 < len(items) and _CLIP_VALUE_START.match(items[i + 1]):
+            fixed.append(f'{item}={items[i + 1]}')
+            i += 2
+            continue
+        fixed.append(item)
+        i += 1
+    return fixed
+
+
+def _timecode(seconds: float) -> str:
+    return "end" if math.isinf(seconds) else format_timecode(seconds)
+
+
+def _length_text(seconds: float) -> str:
+    return "to the end" if math.isinf(seconds) else format_timecode(seconds)
+
+
+def _clip_range_text(clip: Clip) -> str:
+    return f"{_timecode(clip.start)} - {_timecode(clip.end)}"
+
+
+def clip_warnings(requested: Sequence[Clip], duration: float) -> List[str]:
+    """Say which requested clips fall outside the video (dropped) or run past its end (cut)."""
+    if duration <= 0:
+        return []
+    notes: List[str] = []
+    for number, clip in enumerate(requested, start=1):
+        label = f"clip {number} ({_clip_range_text(clip)})"
+        if not normalize_clips([clip], duration):
+            notes.append(
+                f"{label} is outside the video or shorter than {MIN_CLIP_SECONDS:g} s, "
+                "so it was skipped"
+            )
+        elif not math.isinf(clip.end) and clip.end > duration + 0.001:
+            notes.append(
+                f"{label} runs past the end of the video, so it was cut at "
+                f"{format_timecode(duration)}"
+            )
+    return notes
+
+
+class ClipRun(NamedTuple):
+    """The encodes to run for one video: resolved plan (None = whole file), jobs, source info."""
+
+    plan: Optional[ClipPlan]
+    jobs: List[ClipJob]
+    info: Any
+
+
+def plan_clip_run(
     input_path: Path,
-    output_dir: Optional[Path],
-    suffix: str,
+    clips: ClipPlan,
     profile: CompressionProfile,
     compressor: VideoCompressor,
-    dry_run: bool = False,
-    parallel_jobs: int = 1,
-) -> Optional[CompressionResult]:
-    """Process a single file."""
-    media_type = detect_media_type(input_path)
-    if media_type == "image":
-        ext = f".{get_image_extension(profile.image_format)}"
-    else:
-        ext = f".{get_video_extension(profile.video_codec.value, profile.video_container)}"
+) -> ClipRun:
+    """Analyze a video and expand the requested clips into jobs.
 
-    # Determine output path
-    if output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{input_path.stem}{suffix}{ext}"
+    Raises ValueError when the file cannot be read or no clip falls inside it.
+    """
+    info = compressor.analyze_media(input_path)
+    if not info:
+        raise ValueError(f"Could not analyze {input_path.name}")
+    duration = float(getattr(info, 'duration', 0.0) or 0.0)
+
+    for note in clip_warnings(clips.clips, duration):
+        print(f"Warning: {input_path.name}: {note}")
+    if not normalize_clips(clips.clips, duration):
+        raise ValueError(
+            f"none of the --clip ranges fall inside this video ({format_timecode(duration)} long)"
+        )
+
+    plan = resolve_clip_plan(clips, profile, duration)
+    if plan is None:
+        print(f"Note: the clip covers all of {input_path.name}; compressing the whole video")
+    return ClipRun(plan, expand_clip_jobs(plan), info)
+
+
+def _print_target_preview(
+    compressor: VideoCompressor,
+    profile: CompressionProfile,
+    analyzed: Any,
+    prefix: str = "  -> ",
+    warn_skip: bool = True,
+) -> None:
+    """Dry-run lines for target-size mode (the size band the encode will aim for)."""
+    if not (profile.target_size_mb or profile.target_reduction_percent):
+        return
+    if analyzed and hasattr(analyzed, 'video_codec'):
+        plan = compressor._resolve_target_size_plan(profile, analyzed)
+        if plan:
+            print(f"{prefix}Target: {plan.target_size_mb} MB ({plan.mode.value})")
+            print(f"{prefix}Preview: {plan.video_bitrate // 1000} kbps video, ±{int(plan.tolerance_ratio * 100)}% tolerance")
+            if warn_skip and plan.target_size_bytes >= analyzed.size:
+                print(f"{prefix}Skip: target is not smaller than the source file")
+
+
+def _job_note(job: ClipJob) -> str:
+    """Short description of one encode, for the dry-run output list."""
+    plan = job.plan
+    length = _length_text(plan.total_duration)
+    if job.title:
+        return f"{job.title}, {length}"
+    if plan.count > 1:
+        return f"{plan.count} clips joined, {length}"
+    return length
+
+
+def _print_clip_dry_run(
+    run: ClipRun,
+    profile: CompressionProfile,
+    compressor: VideoCompressor,
+    output_for: Callable[[ClipJob], Path],
+) -> None:
+    """Dry-run lines for a clipped video: each clip, the mode, the total length, each output."""
+    plan = run.plan
+    if plan.count == 1:
+        mode_text = "single clip"
+    elif plan.mode is ClipMode.JOIN:
+        mode_text = "join (all clips in one file)"
     else:
-        output_path = input_path.parent / f"{input_path.stem}{suffix}{ext}"
-    
-    if dry_run:
-        print(f"Would compress: {input_path.name}")
-        print(f"  -> Output: {output_path.name}")
-        print(f"  -> Profile: {profile.name}")
-        print(f"  -> Type: {media_type or 'unknown'}")
-        if media_type == 'video':
-            print(f"  -> Codec: {profile.video_codec.value} in {profile.video_container}")
-            if profile.target_size_mb or profile.target_reduction_percent:
-                analyzed = compressor.analyze_media(input_path)
-                if analyzed and hasattr(analyzed, 'video_codec'):
-                    plan = compressor._resolve_target_size_plan(profile, analyzed)
-                    if plan:
-                        print(f"  -> Target: {plan.target_size_mb} MB ({plan.mode.value})")
-                        print(f"  -> Preview: {plan.video_bitrate // 1000} kbps video, ±{int(plan.tolerance_ratio * 100)}% tolerance")
-                        if plan.target_size_bytes >= analyzed.size:
-                            print("  -> Skip: target is not smaller than the source file")
-        else:
-            print(f"  -> Format: {profile.image_format}")
-        return None
-    
-    print(f"\nCompressing: {input_path.name}")
-    print(f"  Output: {output_path.name}")
-    print(f"  Profile: {profile.name}")
-    
-    result = compressor.compress(
-        input_file=input_path,
-        output_file=output_path,
-        profile=profile,
-        parallel_jobs=max(1, int(parallel_jobs or 1)),
-    )
-    
+        mode_text = "separate (one file per clip)"
+    source_length = float(getattr(run.info, 'duration', 0.0) or 0.0)
+    total = effective_media_info(run.info, plan).duration
+
+    print(f"  -> Mode: {mode_text}")
+    print(f"  -> Clips: {plan.count}")
+    for number, clip in enumerate(plan.clips, start=1):
+        print(f"       {number}. {_clip_range_text(clip)} (length {_length_text(clip.duration)})")
+    if source_length > 0:
+        print(f"  -> Duration: {format_timecode(total)} of {format_timecode(source_length)}")
+    else:
+        print(f"  -> Duration: {format_timecode(total)}")
+    for job in run.jobs:
+        print(f"  -> Output: {output_for(job).name} ({_job_note(job)})")
+        _print_target_preview(
+            compressor,
+            profile,
+            effective_media_info(run.info, job.plan),
+            prefix="       ",
+            warn_skip=False,
+        )
+
+
+def _report_result(result: CompressionResult) -> None:
+    """Print the outcome of one encode."""
     if result.success:
         if result.skipped:
             print("  - Skipped")
@@ -628,14 +813,115 @@ def process_file(
                 "    Software fallback was not run. "
                 "Re-run with --allow-software-fallback to confirm it."
             )
-    
-    return result
+
+
+def process_file(
+    input_path: Path,
+    output_dir: Optional[Path],
+    suffix: str,
+    profile: CompressionProfile,
+    compressor: VideoCompressor,
+    dry_run: bool = False,
+    parallel_jobs: int = 1,
+    clips: Optional[ClipPlan] = None,
+) -> List[CompressionResult]:
+    """Process a single file.
+
+    Returns one result per encode: one for a whole file, a joined run or a single
+    clip, one per clip when several clips are saved as separate files. A dry run
+    returns an empty list.
+    """
+    media_type = detect_media_type(input_path)
+    if media_type == "image":
+        ext = f".{get_image_extension(profile.image_format)}"
+    else:
+        ext = f".{get_video_extension(profile.video_codec.value, profile.video_container)}"
+
+    # Determine output path
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = output_dir
+    else:
+        out_dir = input_path.parent
+
+    def output_for(job: ClipJob) -> Path:
+        tag = f"_{job.token}" if job.token else ""
+        return out_dir / f"{input_path.stem}{suffix}{tag}{ext}"
+
+    run = ClipRun(None, [ClipJob(None)], None)
+    if clips is not None:
+        if media_type == "image":
+            print(f"Warning: --clip is ignored for images ({input_path.name})")
+        else:
+            try:
+                run = plan_clip_run(input_path, clips, profile, compressor)
+            except ValueError as exc:
+                print(f"Error: {input_path.name}: {exc}")
+                return [
+                    CompressionResult(
+                        success=False,
+                        input_file=input_path,
+                        error_message=str(exc),
+                        media_type=media_type or "video",
+                    )
+                ]
+    clipped = run.plan is not None
+
+    if dry_run:
+        print(f"Would compress: {input_path.name}")
+        if not clipped:
+            print(f"  -> Output: {output_for(run.jobs[0]).name}")
+        print(f"  -> Profile: {profile.name}")
+        print(f"  -> Type: {media_type or 'unknown'}")
+        if media_type == 'video':
+            print(f"  -> Codec: {profile.video_codec.value} in {profile.video_container}")
+            if not clipped:
+                if profile.target_size_mb or profile.target_reduction_percent:
+                    _print_target_preview(compressor, profile, compressor.analyze_media(input_path))
+        else:
+            print(f"  -> Format: {profile.image_format}")
+        if clipped:
+            _print_clip_dry_run(run, profile, compressor, output_for)
+        return []
+
+    results: List[CompressionResult] = []
+    for job in run.jobs:
+        output_path = output_for(job)
+        title = job.title
+        if not title and job.plan is not None and job.plan.count > 1:
+            title = f"joining {job.plan.count} clips"
+
+        print(f"\nCompressing: {input_path.name}" + (f" ({title})" if title else ""))
+        print(f"  Output: {output_path.name}")
+        print(f"  Profile: {profile.name}")
+        if job.plan is not None:
+            label = "Clips" if job.plan.count > 1 else "Clip"
+            print(f"  {label}: " + ", ".join(_clip_range_text(clip) for clip in job.plan.clips))
+
+        compress_args = dict(
+            input_file=input_path,
+            output_file=output_path,
+            profile=profile,
+            parallel_jobs=max(1, int(parallel_jobs or 1)),
+        )
+        if job.plan is not None:
+            compress_args['clips'] = job.plan
+        result = compressor.compress(**compress_args)
+
+        _report_result(result)
+        results.append(result)
+
+    if len(run.jobs) > 1:
+        done = sum(1 for r in results if r.success)
+        print(f"\n{input_path.name}: {done} of {len(run.jobs)} clips encoded")
+
+    return results
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point."""
     parser = create_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(attach_clip_values(sys.argv[1:] if argv is None else argv))
     
     # Setup logging
     if args.quiet:
@@ -658,6 +944,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list_codecs:
         list_codecs(compressor)
         return 0
+
+    # Clips (--clip / --join)
+    try:
+        clip_plan = get_clip_plan(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
     
     # Process input files
     input_files: List[Path] = []
@@ -700,6 +993,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     output_dir = Path(args.output) if args.output else None
 
     if args.compare:
+        if clip_plan is not None:
+            print("Note: --clip is ignored with --compare")
         compare_profiles = build_compare_profiles(profile, compressor)
         overall_success = True
         for filepath in input_files:
@@ -734,7 +1029,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Files: {len(input_files)}")
     print(f"Profile: {profile.name}")
     print(f"Codec: {profile.video_codec.value}")
-    
+    if clip_plan is not None:
+        if clip_plan.count == 1:
+            print("Clips: 1")
+        elif clip_plan.mode is ClipMode.JOIN:
+            print(f"Clips: {clip_plan.count} (joined into one file)")
+        else:
+            print(f"Clips: {clip_plan.count} (saved as separate files)")
+
     existing_files = [filepath for filepath in input_files if filepath.exists()]
     for filepath in input_files:
         if filepath not in existing_files:
@@ -748,7 +1050,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             queued_files=len(existing_files),
         )
 
-    def _run_one(filepath: Path) -> Optional[CompressionResult]:
+    def _run_one(filepath: Path) -> List[CompressionResult]:
         return process_file(
             input_path=filepath,
             output_dir=output_dir,
@@ -757,18 +1059,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             compressor=compressor,
             dry_run=args.dry_run,
             parallel_jobs=slots,
+            clips=clip_plan,
         )
 
     if slots <= 1 or args.dry_run:
         for filepath in existing_files:
-            result = _run_one(filepath)
-            if result:
-                results.append(result)
+            results.extend(_run_one(filepath))
     else:
         with ThreadPoolExecutor(max_workers=slots) as pool:
-            for result in pool.map(_run_one, existing_files):
-                if result:
-                    results.append(result)
+            for file_results in pool.map(_run_one, existing_files):
+                results.extend(file_results)
     
     # Summary
     if results and not args.dry_run:
@@ -783,6 +1083,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             total_compressed = sum(r.compressed_size for r in successful)
             total_time = sum(r.encoding_time for r in successful)
             
+            sources = {r.input_file for r in results}
+            if len(sources) != len(results):
+                # Several clips per file: say how many files and how many outputs.
+                print(f"  Source files: {len(sources)}  ·  Outputs: {len(results)}")
             print(f"  Successful: {len(successful)}")
             print(f"  Failed: {len(failed)}")
             print(f"  Total Original: {format_size(total_original)}")
@@ -793,7 +1097,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if failed:
             print(f"\nFailed files:")
             for r in failed:
-                print(f"  • {r.input_file.name}: {r.error_message}")
+                where = f" ({r.output_file.name})" if clip_plan is not None and r.output_file else ""
+                print(f"  • {r.input_file.name}{where}: {r.error_message}")
     
     return 0 if all(r.success for r in results) else 1
 
