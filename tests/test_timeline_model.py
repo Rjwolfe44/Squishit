@@ -1280,3 +1280,70 @@ def test_a_drag_that_ends_where_it_started_leaves_no_undo_step():
     assert model.end_gesture() is False
     assert not model.can_undo
     assert model.clips[0].end == 20.0
+
+
+# ── keeping or dropping the sound ────────────────────────────────────────────
+
+
+def test_the_sound_is_kept_by_default_and_round_trips_through_a_plan():
+    model = _two_clip_model()
+    assert model.keep_audio is True
+    assert model.to_plan().keep_audio is True
+    silent = ClipPlan((Clip(10, 20), Clip(30, 40)), ClipMode.JOIN, keep_audio=False)
+    again = ClipEditModel.from_plan(silent, 100.0)
+    assert again.keep_audio is False and again.mode is ClipMode.JOIN
+    assert again.to_plan() == silent
+
+
+def test_the_whole_video_without_sound_is_a_plan_not_no_change():
+    model = ClipEditModel(60.0)
+    assert model.to_plan() is None
+    model.set_keep_audio(False)
+    plan = model.to_plan()
+    assert plan == ClipPlan((Clip(0.0, 60.0),), ClipMode.SEPARATE, keep_audio=False)
+    reopened = ClipEditModel.from_plan(plan, 60.0)
+    assert reopened.is_whole_video and reopened.keep_audio is False
+    reopened.set_keep_audio(True)
+    assert reopened.to_plan() is None
+
+
+def test_the_sound_choice_is_an_undoable_edit_that_notifies():
+    model = _two_clip_model()
+    seen: list = []
+    model.subscribe(lambda: seen.append(model.keep_audio))
+    assert model.set_keep_audio(False) is True
+    assert seen == [False] and model.can_undo
+    model.set_keep_audio(False)  # no change, no notice, no extra undo step
+    assert seen == [False]
+    model.undo()
+    assert model.keep_audio is True and model.can_redo
+    model.redo()
+    assert model.keep_audio is False
+    model.split_at(15.0)
+    model.undo()
+    assert model.keep_audio is False  # undoing a later edit leaves the choice alone
+    model.reset_to_whole()
+    assert model.keep_audio is False
+
+
+def test_a_gesture_that_only_changes_the_sound_is_one_undo_step():
+    model = _two_clip_model()
+    model.begin_gesture()
+    model.set_keep_audio(False)
+    assert model.end_gesture() is True
+    model.undo()
+    assert model.keep_audio is True and not model.can_undo
+    model.begin_gesture()
+    model.set_keep_audio(False)
+    assert model.cancel_gesture() is True
+    assert model.keep_audio is True
+
+
+def test_describe_selection_says_when_the_sound_is_left_out():
+    model = ClipEditModel(60.0, clips=[Clip(0, 30)])
+    assert "no sound" not in describe_selection(model)
+    model.set_keep_audio(False)
+    assert describe_selection(model) == "1 clip · 0:30 of 1:00 · no sound"
+    assert describe_selection(model, 60_000_000).endswith(
+        f"· no sound · about {format_size(30_000_000)} of source"
+    )

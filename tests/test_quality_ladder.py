@@ -36,8 +36,8 @@ from video_compressor.core.quality_ladder import (
     resolve_encoder_choice,
 )
 
-# Software argv for every public codec lane. VP9 and libaom express the
-# preset as cpu-used; the step preset is asserted separately.
+# Software argv for every public codec lane. VP9 expresses the preset as
+# cpu-used; the step preset is asserted separately.
 EXPECTED_SOFTWARE_ARGS = {
     (VideoCodec.HEVC, QualityRung.QUICK): [
         "-c:v",
@@ -99,63 +99,36 @@ EXPECTED_SOFTWARE_ARGS = {
         "-pix_fmt",
         "yuv420p",
     ],
+    # Fast AV1's software encoder is SVT-AV1 now (it was libaom at 0.2x real
+    # time). The ladder preset is the most a strong CPU runs; the compressor
+    # may go faster on a small CPU or a 4K frame (see test_fast_av1.py).
     (VideoCodec.AV1, QualityRung.QUICK): [
         "-c:v",
-        "libaom-av1",
+        "libsvtav1",
         "-crf",
-        "26",
-        "-b:v",
-        "0",
-        "-usage",
-        "good",
-        "-cpu-used",
-        "8",
-        "-aq-mode",
-        "1",
-        "-lag-in-frames",
-        "25",
-        "-row-mt",
-        "1",
+        "30",
+        "-preset",
+        "10",
         "-pix_fmt",
         "yuv420p",
     ],
     (VideoCodec.AV1, QualityRung.BALANCED): [
         "-c:v",
-        "libaom-av1",
+        "libsvtav1",
         "-crf",
-        "30",
-        "-b:v",
-        "0",
-        "-usage",
-        "good",
-        "-cpu-used",
-        "6",
-        "-aq-mode",
-        "1",
-        "-lag-in-frames",
-        "25",
-        "-row-mt",
-        "1",
+        "33",
+        "-preset",
+        "9",
         "-pix_fmt",
         "yuv420p",
     ],
     (VideoCodec.AV1, QualityRung.MAX): [
         "-c:v",
-        "libaom-av1",
+        "libsvtav1",
         "-crf",
-        "34",
-        "-b:v",
-        "0",
-        "-usage",
-        "good",
-        "-cpu-used",
-        "4",
-        "-aq-mode",
-        "1",
-        "-lag-in-frames",
-        "25",
-        "-row-mt",
-        "1",
+        "36",
+        "-preset",
+        "8",
         "-pix_fmt",
         "yuv420p",
     ],
@@ -246,9 +219,9 @@ EXPECTED_PRESET = {
     (VideoCodec.SVT_AV1, QualityRung.QUICK): "10",
     (VideoCodec.SVT_AV1, QualityRung.BALANCED): "8",
     (VideoCodec.SVT_AV1, QualityRung.MAX): "6",
-    (VideoCodec.AV1, QualityRung.QUICK): "8",
-    (VideoCodec.AV1, QualityRung.BALANCED): "6",
-    (VideoCodec.AV1, QualityRung.MAX): "4",
+    (VideoCodec.AV1, QualityRung.QUICK): "10",
+    (VideoCodec.AV1, QualityRung.BALANCED): "9",
+    (VideoCodec.AV1, QualityRung.MAX): "8",
     (VideoCodec.H264, QualityRung.QUICK): "fast",
     (VideoCodec.H264, QualityRung.BALANCED): "medium",
     (VideoCodec.H264, QualityRung.MAX): "slow",
@@ -590,8 +563,9 @@ def test_x264_preset_names_do_not_replace_numeric_av1_presets():
     assert svt_named.force_software is True
     assert svt_slow.preset == "6"
     assert svt_numeric.preset == "4"
-    assert av1_named.preset == "6"
-    assert av1_named.crf == 30
+    # Fast AV1 Balanced is SVT-AV1 CRF 33, preset 9 (was libaom CRF 30, cpu-used 6).
+    assert av1_named.preset == "9"
+    assert av1_named.crf == 33
     assert hevc_named.preset == "medium"
     assert hevc_named.force_software is False
 

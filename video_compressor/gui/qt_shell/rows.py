@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...core.clips import WHOLE_SOURCE_TOLERANCE
 from ...core.utils import format_size, format_time
 from ..copy import human_progress_status, progress_detail
 from ..hw_status import encoder_result_label
@@ -93,18 +94,28 @@ def clock(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def clip_summary(plan) -> str:
-    """Badge text for a file's clips: 'Trimmed to 0:42', '3 clips · saved separately · 1:23'."""
+def clip_summary(plan, duration: Optional[float] = None) -> str:
+    """Badge text for a file's clips: 'Trimmed to 0:42', '3 clips · saved separately · 1:23'.
+
+    ' · no sound' is added when the clips leave the sound out. Pass the video's
+    ``duration`` so a sound-only change to the whole video reads 'Whole video'.
+    """
 
     if plan is None or not getattr(plan, "clips", None):
         return ""
     total = clock(plan.total_duration)
     count = len(plan.clips)
+    silent = " · no sound" if not getattr(plan, "keep_audio", True) else ""
     if count == 1:
-        return f"Trimmed to {total}"
+        only = plan.clips[0]
+        length = float(duration or 0)
+        tolerance = WHOLE_SOURCE_TOLERANCE
+        if length > 0 and only.start <= tolerance and only.end >= length - tolerance:
+            return f"Whole video{silent}"
+        return f"Trimmed to {total}{silent}"
     if getattr(plan.mode, "value", plan.mode) == "join":
-        return f"{count} clips joined · {total}"
-    return f"{count} clips · saved separately · {total}"
+        return f"{count} clips joined · {total}{silent}"
+    return f"{count} clips · saved separately · {total}{silent}"
 
 
 def describe_media(info) -> str:

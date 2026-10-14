@@ -1060,7 +1060,7 @@ class SettingsPanel(ctk.CTkFrame):
             self._hw_hint.configure(
                 text=(
                     "SVT-AV1 (best compression, CPU). Hardware encode stays off. "
-                    "Fast hardware AV1 is the AV1 codec with hardware encoding on."
+                    "Fast AV1 is the quicker AV1 choice."
                 )
             )
             return
@@ -1070,7 +1070,7 @@ class SettingsPanel(ctk.CTkFrame):
         if target_mode == "exact":
             prefix = ""
             if codec == VideoCodec.AV1:
-                prefix = "Fast hardware AV1 tries NVENC, then QSV, then AMF first. "
+                prefix = "Fast AV1 tries a graphics card that passed an AV1 test encode first. "
             self._hw_hint.configure(
                 text=(
                     prefix
@@ -1089,8 +1089,8 @@ class SettingsPanel(ctk.CTkFrame):
         if encoder and codec == VideoCodec.AV1:
             self._hw_hint.configure(
                 text=(
-                    f"Fast hardware AV1 ready: {encoder} "
-                    "(NVENC, then QSV, then AMF). "
+                    f"Fast AV1 can use {encoder} if it passes the AV1 test encode "
+                    "(NVENC, then QSV, then AMF), otherwise SVT-AV1 on the processor. "
                     "Max / Archival stays SVT-AV1 on the CPU for best compression."
                 )
             )
@@ -1099,8 +1099,8 @@ class SettingsPanel(ctk.CTkFrame):
         elif codec == VideoCodec.AV1:
             self._hw_hint.configure(
                 text=(
-                    "Fast hardware AV1 is not available on this system. "
-                    "Max / Archival SVT-AV1 (best compression, CPU) is the software AV1 lane."
+                    "No AV1 graphics hardware was found, so Fast AV1 will use your "
+                    "processor (SVT-AV1). Max / Archival is the slower, smaller SVT-AV1 choice."
                 )
             )
         else:

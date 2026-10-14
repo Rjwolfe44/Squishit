@@ -226,3 +226,52 @@ def test_rerun_without_overwrite_adds_a_number(compressor, tmp_path):
     assert first.output_file == tmp_path / "talk_clip01.mp4"
     assert second.output_file == tmp_path / "talk_clip01 (2).mp4"
     assert first.output_file.read_bytes() == first_bytes
+
+
+@pytest.mark.smoke
+def test_clips_saved_without_their_sound_have_no_audio_stream(compressor, tmp_path):
+    source = _make_source(compressor, tmp_path / "talk.mp4")
+    separate = ClipPlan(tuple(Clip(start, end) for start, end in _CLIPS), ClipMode.SEPARATE, keep_audio=False)
+
+    for job in expand_clip_jobs(separate):
+        result = _compress(
+            compressor, source, tmp_path / f"quiet_{job.token}.mp4", _lite(),
+            job_id=f"quiet-{job.token}", clips=job.plan,
+        )
+        total, streams = _probe(compressor, result.output_file)
+        assert set(streams) == {"video"}, job.token
+
+    joined = ClipPlan(separate.clips, ClipMode.JOIN, keep_audio=False)
+    result = _compress(compressor, source, tmp_path / "quiet-join.mp4", _lite(), job_id="quiet-join", clips=joined)
+    total, streams = _probe(compressor, result.output_file)
+    assert set(streams) == {"video"}
+    assert total == pytest.approx(3.5, abs=_TOLERANCE)
+
+
+@pytest.mark.smoke
+def test_the_whole_video_without_its_sound_keeps_every_frame(compressor, tmp_path):
+    source = _make_source(compressor, tmp_path / "talk.mp4")
+    plan = ClipPlan((Clip(0.0, 10.0),), keep_audio=False)
+
+    result = _compress(compressor, source, tmp_path / "talk-quiet.mp4", _lite(), job_id="quiet-whole", clips=plan)
+
+    total, streams = _probe(compressor, result.output_file)
+    assert set(streams) == {"video"}
+    assert total == pytest.approx(10.0, abs=_TOLERANCE)
+
+
+@pytest.mark.smoke
+def test_exact_two_pass_join_without_sound_hits_the_target(compressor, tmp_path):
+    source = _make_source(compressor, tmp_path / "noisy.mp4", size="320x240", noise=True)
+    profile = _lite()
+    profile.target_size_mb = 1
+    profile.target_size_mode = "exact"
+    profile.exact_two_pass = True
+    plan = ClipPlan((Clip(0.5, 3.5), Clip(5.0, 8.0)), ClipMode.JOIN, keep_audio=False)
+
+    result = _compress(compressor, source, tmp_path / "exact-quiet.mp4", profile, job_id="exact-quiet", clips=plan)
+
+    total, streams = _probe(compressor, result.output_file)
+    assert set(streams) == {"video"}
+    assert total == pytest.approx(6.0, abs=_TOLERANCE)
+    assert result.compressed_size <= 1_000_000, result.note

@@ -30,6 +30,12 @@ from video_compressor.core.profiles import (
     apply_cli_quality_ladder,
 )
 from video_compressor.core.hardware import get_hardware_detector
+from video_compressor.core.fast_av1 import (
+    HW_AV1_ENCODERS,
+    REASON_NOT_LISTED,
+    FastAv1Route,
+    ProbeResult,
+)
 from video_compressor.core.codecs import VideoCodec, AudioCodec, ImageFormat, CodecManager
 from video_compressor.core.utils import (
     detect_media_type,
@@ -131,7 +137,9 @@ Examples:
         help=(
             'Video codec (default: depends on profile). '
             'svt-av1 is Max / Archival SVT-AV1 (best compression, CPU). '
-            'av1 is fast hardware AV1 (NVENC, then QSV, then AMF, else libaom).'
+            'av1 is Fast AV1: a graphics card that passes a quick AV1 test '
+            '(NVENC, then QSV, then AMF), else SVT-AV1 at a fast preset, '
+            'else libaom; HEVC when FFmpeg has no AV1 encoder.'
         ),
     )
 
@@ -351,7 +359,10 @@ Examples:
     parser.add_argument(
         '--hardware',
         action='store_true',
-        help='Show detected hardware information'
+        help=(
+            'Show detected hardware information, and run the Fast AV1 test '
+            'encode on each hardware AV1 encoder FFmpeg lists'
+        ),
     )
     
     parser.add_argument(
@@ -484,11 +495,16 @@ def show_info(filepath: Path, compressor: VideoCompressor):
         print(f"  Alpha:        {'yes' if info.has_alpha else 'no'}")
 
 
-def show_hardware():
-    """Show hardware information."""
-    detector = get_hardware_detector()
+def show_hardware(compressor: Optional[VideoCompressor] = None):
+    """Show hardware information.
+
+    With a compressor, also run Fast AV1's test encode on every hardware AV1
+    encoder its FFmpeg lists (fresh, not the saved result) and say what
+    ``--codec av1`` will use.
+    """
+    detector = compressor.hw_detector if compressor is not None else get_hardware_detector()
     info = detector.info
-    
+
     print("\n" + "="*50)
     print("System Hardware Information")
     print("="*50)
@@ -496,15 +512,54 @@ def show_hardware():
     print(f"  CPU:          {info.cpu_name}")
     print(f"  CPU Threads:  {info.cpu_threads}")
     print(f"  RAM:          {info.total_ram_gb:.1f} GB")
-    
+
     if info.gpus:
         print(f"\n  GPUs:")
         for gpu in info.gpus:
-            print(f"    - {gpu.name}")
-    
+            driver = f" (driver {gpu.driver_version})" if gpu.driver_version else ""
+            print(f"    - {gpu.name}{driver}")
+
     print(f"\n  Hardware Encoding: {info.encoding_label()}")
-    
+
     print(f"\n  Recommended Threads: {info.recommended_threads}")
+
+    if compressor is not None:
+        print_fast_av1_check(compressor)
+
+
+def describe_fast_av1_route(route: FastAv1Route) -> str:
+    """One line for what Fast AV1 (``--codec av1``) encodes with."""
+
+    if route.kind == "hardware":
+        card = {
+            "nvidia": "NVIDIA graphics card",
+            "intel": "Intel graphics",
+            "amd": "AMD graphics card",
+        }.get(route.vendor, "graphics card")
+        return f"{route.encoder} ({card})"
+    if route.kind == "software":
+        if route.encoder == "libsvtav1":
+            return "libsvtav1 on the processor (SVT-AV1, fast preset)"
+        return "libaom-av1 on the processor (slower; this FFmpeg has no SVT-AV1)"
+    fallback = {"hevc": "HEVC", "h264": "H.264"}.get(route.fallback_codec, route.fallback_codec)
+    return f"{fallback} (this FFmpeg has no AV1 encoder)"
+
+
+def print_fast_av1_check(compressor: VideoCompressor) -> None:
+    """Run and print the hardware AV1 test encode for each candidate encoder."""
+
+    print("\n  Fast AV1 hardware check (short test encode, run now):")
+    listed = set(compressor._hw_av1_candidates())
+    for encoder in HW_AV1_ENCODERS:
+        if encoder in listed:
+            result = compressor.av1_probe.check(encoder, refresh=True)
+        else:
+            result = ProbeResult(encoder, False, REASON_NOT_LISTED)
+        verdict = "yes" if result.ok else "no"
+        timing = f" in {result.seconds:.2f} s" if result.ok and result.seconds else ""
+        print(f"    {encoder:<10} {verdict:<4} {result.describe()}{timing}")
+    route = compressor.fast_av1_route(use_hw_accel=True)
+    print(f"\n  Fast AV1 will use: {describe_fast_av1_route(route)}")
 
 
 def list_codecs(compressor: VideoCompressor):
@@ -956,7 +1011,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     
     # Handle info commands
     if args.hardware:
-        show_hardware()
+        show_hardware(compressor)
         return 0
     
     if args.list_codecs:

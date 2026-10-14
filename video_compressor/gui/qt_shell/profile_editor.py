@@ -1378,8 +1378,9 @@ class ProfileEditorDialog(QDialog):
             self._hw.setChecked(self._hw_pref)
             if codec == VideoCodec.AV1:
                 self._hw_hint.setText(
-                    "Fast hardware AV1 uses your graphics card when it can "
-                    "(NVIDIA, Intel, or AMD) and your processor otherwise."
+                    "Fast AV1 uses your graphics card when it passes a quick "
+                    "AV1 test (NVIDIA, Intel, or AMD) and your processor "
+                    "(SVT-AV1) otherwise."
                 )
             else:
                 self._hw_hint.setText(
@@ -1781,7 +1782,7 @@ class ProfileEditorDialog(QDialog):
                 "A profile file needs a name."
             )
         try:
-            profile = CompressionProfile.from_dict(data)
+            profile = CompressionProfile.from_saved_dict(data)
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"That profile has a setting SquishIt doesn't understand ({exc})."

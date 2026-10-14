@@ -12,7 +12,10 @@ Found a bug or want a feature? Open a [GitHub Issue](https://github.com/Rjwolfe4
 Press **Trim** on any video in the queue (or double-click it) to open the clip editor.
 
 - **See what you keep.** A filmstrip timeline shows the whole video. Drag the edges of a blue box to trim, drag its middle to move it, or drag across empty space to add another clip. The mouse wheel zooms, Shift + wheel scrolls, and edges snap to the playhead and to other clips (hold Alt to turn snapping off).
-- **Preview as you go.** Scrub, step frame by frame, or press Space to play. Playback is silent. SquishIt uses its bundled FFmpeg for the pictures, so there is nothing extra to install.
+- **Preview as you go.** Scrub, step frame by frame, or press Space to play. Playback has sound and the picture keeps in step with it; scrubbing and frame steps stay silent. SquishIt uses its bundled FFmpeg for the pictures and the sound, and Windows' own sound output, so there is nothing extra to install.
+- **Sound on or off.** **Sound on / Sound off** next to the play buttons (or `M`) turns the preview sound on and off, and the slider beside it sets the volume. The editor remembers both for next time. A video without sound says "This video has no sound." and hides these controls. With no sound device, playback simply carries on silently.
+- **Sound wave.** Tick **Sound wave** to show how loud the video is along the timeline, under the filmstrip. It zooms and scrolls with the timeline and is worked out in the background, at low priority, while you edit. The editor remembers whether it is shown.
+- **Keep or drop the sound.** Untick **Include the sound in the saved clips** to save clips (separate files or a joined video) without any sound. The file's badge and the editor summary then say "no sound". This works on the whole video too, without trimming anything: **Use whole video** keeps the choice and saves the whole video without its sound. It is undoable like any other edit.
 - **Many clips from one video.** Choose **Save each clip as its own file** (default) or **Join all clips into one video**. A size target applies to each output file.
 - **Exact times.** Type times such as `1:30` or `90.5` in the clip table or the time box.
 - **Safe by default.** SquishIt never replaces a file that is already there; it saves `name (2).mp4` instead. Your files and their clips stay in the list after a run, so you can run them again with other settings.
@@ -20,6 +23,7 @@ Press **Trim** on any video in the queue (or double-click it) to open the clip e
 | Key | Action |
 |-----|--------|
 | `Space` | Play / pause |
+| `M` | Sound on / off |
 | `I` / `O` | Start / end the selected clip at the playhead |
 | `S` | Split the clip at the playhead |
 | `←` / `→` | Back / forward one frame |
@@ -32,10 +36,13 @@ Press **Trim** on any video in the queue (or double-click it) to open the clip e
 
 Progress, time left, and size targets are worked out from the clips, not the whole video. From the command line, use `--clip START-END` (see below).
 
+**Checking the sound by hand** (the tests cannot listen): open a video with sound in the editor and press Space. You should hear it from the playhead, with lips and claps in step with the picture after several minutes, and again after pausing, seeking and pressing Play. `M` should silence it at once and bring it back from the playhead; the volume slider should change the loudness while playing and be remembered next time. Unplug or disable the sound device and play again: the picture keeps going and the editor says the preview is silent. A video without sound plays silently with the sound controls hidden. The volume slider scales the sound itself; it never moves SquishIt's slider in the Windows volume mixer. The automated tests never make a sound: they cannot open the real sound device unless `SQUISHIT_REAL_AUDIO=1` is set, and the two checks that then use it play only silence.
+
 ### Video Codecs
 - **HEVC (H.265)** — Default speed lane. Quick Compress Max stays on HEVC
 - **SVT-AV1** — Max / Archival. Best compression, on the CPU. Hardware encode stays off
-- **Fast hardware AV1** — AV1 codec with hardware on: NVENC, then QSV, then AMF (`av1_amf` on AMD, including RX 9070 XT). Software fallback is libaom. This is not Max / Archival
+- **Fast AV1** (`--codec av1`) — fast AV1 on any PC. It uses a graphics card only after that card passes a short AV1 test encode on this PC (NVENC, then QSV, then AMF, including `av1_amf` on an RX 9070 XT). Otherwise it runs SVT-AV1 at a preset this processor can keep near real time, then libaom in its realtime mode if FFmpeg has no SVT-AV1. If FFmpeg has no AV1 encoder at all, the same rung runs on HEVC (or H.264) and the result says so. This is not Max / Archival
+- AV1 files need a player with AV1 support: VLC, Edge or Chrome, or Windows' free AV1 Video Extension
 - **H.264 (AVC)** — Maximum compatibility. Quick Lite, the fastest Quick Compress rung, uses H.264 and prefers NVENC, then QSV, then AMF, then libx264
 - **VP9** — Web-friendly fallback when you specifically want WebM output
 
@@ -50,10 +57,12 @@ MP4, MKV, WebM, MOV, AVI — with automatic codec/container compatibility filter
 ### Hardware Acceleration
 - NVIDIA NVENC (H.264, HEVC) — preferred when more than one vendor is available
 - Intel Quick Sync Video (QSV)
-- AMD AMF (H.264, HEVC, and AV1 when the GPU advertises it and FFmpeg lists `av1_amf` — including RX 9070 XT)
+- AMD AMF (H.264, HEVC, and AV1 — including `av1_amf` on an RX 9070 XT)
+- **AV1 hardware is checked, not guessed.** FFmpeg lists `av1_nvenc`, `av1_qsv`, and `av1_amf` on every Windows PC, and a GPU name says little about the driver. Fast AV1 runs eight generated 640x360 frames through each listed encoder (no file written, 8-second limit, no console window) and only uses one that works. The window does this on its hardware-check thread at startup. Answers are saved in `%APPDATA%\SquishIt\av1_hardware_check.json`, keyed by encoder, FFmpeg build, and graphics adapters with driver versions, so a normal launch does not test again; a new driver, GPU, or FFmpeg tests again (a pass is kept 30 days, a failure 7). A failure that reads like a busy GPU ("out of memory", "busy", NVENC's session limit), a timeout, or a check that could not run is never saved, so the next launch tests again; a damaged entry in the file is ignored and tested again. Remote Desktop sessions keep their own answers, because AMF and QSV often cannot reach the GPU there. On a PC with an integrated and a discrete GPU the test uses the same default adapter the real encode will use. The window never runs or waits for a test on its own thread: until the startup check has an answer, the size preview and the start-up slot count treat Fast AV1 as running on the CPU, and both redraw when the check finishes. A test still running when SquishIt exits is stopped. `cli.py --hardware` runs the test fresh and prints each result
+- AMF AV1 quality values are AV1 q-indexes (0-255), so the ladder's CQ is multiplied by 4 for `av1_amf` (CQ 30 → q-index 120). The old value was used as-is, which meant near-lossless files: on a 10 s 1080p clip Balanced went from 40.7 MB to 16.9 MB at the same speed, matching SVT-AV1 CRF 33-34 in VMAF
 - Windows Max / Archival decode can use D3D11VA (`-hwaccel d3d11va`). If that fails, the same `libsvtav1` encode runs again with software decode. Encode is not switched to AMF
 - Software libx264 when Quick Lite has no matching hardware encoder
-- Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band, fails, or finishes under an exact target where padding would apply, SquishIt does not switch to software until the caller confirms. Padding that short hardware file is ask-gated: the main window asks with the same Yes/No dialog; No or dismissing it keeps the unpadded hardware result and shows that on the result card. The CLI confirms with `--allow-software-fallback`. Quick Compress presets are not target-size jobs, so they do not ask. Leaving the callback unset also keeps the hardware result.
+- Target-size and exact-size jobs use that same order first. If the hardware encode misses the size band, fails, or finishes under an exact target where padding would apply, SquishIt does not switch to software until the caller confirms. Padding that short hardware file is ask-gated: the main window asks with the same Yes/No dialog; No or dismissing it keeps the unpadded hardware result and shows that on the result card. The CLI confirms with `--allow-software-fallback`. For Fast AV1 that software retry is SVT-AV1 (libaom without it). Quick Compress presets are not target-size jobs, so they do not ask: if a graphics card that passed the AV1 test still fails on one file, Fast AV1 re-encodes that file with SVT-AV1 and says so on the result. Leaving the callback unset also keeps the hardware result.
 
 ### Compression Profiles
 | Profile | Description | Use Case |
@@ -77,12 +86,15 @@ Quick, Balanced, and Max share one CRF/preset table. The GUI compression control
 | **H.264** (Quick Lite) | CRF 26, fast — fastest Quick Compress rung | CRF 28, medium | CRF 32, slow |
 | **HEVC** (Quick Compress) | CRF 24, veryfast | CRF 28, medium | CRF 30, slow — **HEVC Max** |
 | **SVT-AV1** (Max / Archival, best compression, CPU, hardware encode off) | CRF 32, preset 10 | CRF 35, preset 8 | CRF 36, preset 6 — **Max / Archival** |
-| **Fast hardware AV1** (NVENC, then QSV, then AMF; else libaom) | CRF 26, cpu-used 8 | CRF 30, cpu-used 6 | CRF 34, cpu-used 4 |
+| **Fast AV1** — on the CPU (SVT-AV1) | CRF 30, preset 10 | CRF 33, preset 9 | CRF 36, preset 8 |
+| **Fast AV1** — on a graphics card that passed the AV1 test (NVENC, then QSV, then AMF) | CQ 26 | CQ 30 | CQ 34 |
 
-Quick finishes sooner and makes larger files. Balanced is the default tradeoff. Max is the best compression in that lane. When a profile matches a rung and a hardware encoder is selected, the command uses that rung's CQ and vendor preset (NVENC, then QSV, then AMF). SVT-AV1 stays on the software encoder. The encode-speed slider keeps the numeric SVT-AV1 and libaom preset instead of applying an x264 name.
+Quick finishes sooner and makes larger files. Balanced is the default tradeoff. Max is the best compression in that lane. When a profile matches a rung and a hardware encoder is selected, the command uses that rung's CQ and vendor preset (NVENC, then QSV, then AMF). SVT-AV1 stays on the software encoder. The encode-speed slider keeps the numeric SVT-AV1 preset instead of applying an x264 name.
+
+Fast AV1's rung preset is the most a strong CPU runs. On a smaller CPU or a bigger frame it goes faster, never slower, so the encode stays near real time. The count is the job's own share of the CPU (two jobs at once each get about half): counting a 4K frame as four 1080p frames, 8 or more logical CPUs per 1080p frame keep the rung preset, 4-7 use at least preset 9, 2-3 at least preset 10, and fewer use preset 12 (measured on 10 s of 1080p: preset 9 runs 1.5x real time on 2 CPUs, 3.0x on 4, 5.4x on 8). Preset 9 beat preset 10 at the same CRF in both size and VMAF, so Balanced uses it. Without SVT-AV1, libaom runs its realtime mode at cpu-used 8 with row and tile threading (3.6x real time on 32 threads, instead of 0.2x in its "good" mode) at the rung's CRF. A custom Fast AV1 CRF and preset (a saved profile, the profile editor, or `--crf`) are used exactly as given, with no speed floor. A profile file saved by 2.1.0 or older whose Fast AV1 numbers are exactly one of that version's libaom rungs (CRF 26/30/34 with cpu-used 8/6/4) takes the matching new rung when it is loaded; files saved now carry a `settings_version`, so the same numbers typed today stay as typed.
 
 ### Encode resource governor
-One governor owns encode concurrency. It splits the CPU thread budget across the jobs that are actually running, and it caps how many encodes start at once: software jobs share half the logical CPUs, NVENC keeps 3 sessions, and QSV, AMF, and VideoToolbox keep 2. Each job gets one thread flag from that budget. libsvtav1 uses `lp=`. A single Max / Archival job on Resource Max sets `lp` to the logical CPU count. libx264 and libx265 use a single `-threads` value and do not also set `pools` or `frame-threads`. Quick Lite, HEVC Max, and Archival SVT-AV1 keep their encoder choices.
+One governor owns encode concurrency. It splits the CPU thread budget across the jobs that are actually running, and it caps how many encodes start at once: software jobs share half the logical CPUs, NVENC keeps 3 sessions, and QSV, AMF, and VideoToolbox keep 2. Each job gets one thread flag from that budget. libsvtav1 uses `lp=`. A single Max / Archival job on Resource Max sets `lp` to the logical CPU count. A single Fast AV1 job on the CPU gets every logical CPU on Auto whenever the PC has 8 GB of RAM or more; for a 4K frame on a PC with less than about 13 GB, its SVT-AV1 `lp` is capped so the encoder stays within about 45% of RAM (full parallelism peaks above 5 GB at 4K; 8 GB gets `lp=4`, 4 GB `lp=1`). libx264 and libx265 use a single `-threads` value and do not also set `pools` or `frame-threads`. Quick Lite, HEVC Max, and Archival SVT-AV1 keep their encoder choices.
 
 ### Right-Click Context Menu
 - **Compress with SquishIt** — Quick compress with last-used profile
@@ -154,7 +166,10 @@ python cli.py talk.mp4 --clip 1:30-2:45 --clip 10:00-10:30
 python cli.py talk.mp4 --clip 5-10 --clip 20-25 --join
 python cli.py talk.mp4 --clip -30 --dry-run      # first 30 seconds; show the plan only
 
-# Show hardware info
+# Fast AV1: graphics card if it passes the AV1 test, else SVT-AV1 on the CPU
+python cli.py video.mp4 --codec av1
+
+# Show hardware info, and test each hardware AV1 encoder now
 python cli.py --hardware
 ```
 
@@ -162,7 +177,8 @@ python cli.py --hardware
 | Option | Description |
 |--------|-------------|
 | `-p, --profile` | Profile: fast, balanced, max, youtube, mobile, streaming. `max` is Max / Archival (SVT-AV1, hardware off). Quick Compress Max is `--profile max --codec hevc` |
-| `-c, --codec` | Video codec: hevc, h264, vp9, svt-av1, av1 |
+| `-c, --codec` | Video codec: hevc, h264, vp9, svt-av1, av1. `av1` is Fast AV1 (a graphics card that passes the AV1 test, else SVT-AV1, else libaom, else HEVC with a note); `svt-av1` is Max / Archival's encoder |
+| `--hardware` | Print the detected CPU, RAM, and GPUs (with driver versions), run the Fast AV1 test encode on each hardware AV1 encoder FFmpeg lists, and say what `--codec av1` will use |
 | `--crf` | Constant Rate Factor (0-51, lower = better quality) |
 | `--preset` | Encoding speed (ultrafast to veryslow) |
 | `-t, --target-size` | Target file size in MB |
@@ -179,7 +195,7 @@ python cli.py --hardware
 
 ## Dev Tooling
 
-GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. CI installs FFmpeg and the Qt platform libraries, then runs the unit tests — including an offscreen PySide6 launch check — and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC), and that Quick Lite plus both Max lanes (`libx265` and `libsvtav1`) stay inside soft encode-time, file-size, and SSIM bounds. Those bounds are documented in `tests/test_encode_ladder_regression.py`. Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`.
+GitHub Actions runs `pytest` on Ubuntu for Python 3.10 and 3.12. CI installs FFmpeg and the Qt platform libraries, then runs the unit tests — including an offscreen PySide6 launch check — and a separate `smoke` step (`pytest -m smoke`). The smoke step checks that the installed `ffmpeg` binary can encode about one second of generated video, that `VideoCompressor` encodes that clip on the Quick Lite software path (`libx264`, not HEVC), and that Quick Lite plus both Max lanes (`libx265` and `libsvtav1`) stay inside soft encode-time, file-size, and SSIM bounds. Those bounds are documented in `tests/test_encode_ladder_regression.py`. Locally those tests skip when `ffmpeg` is not on `PATH`; in CI a missing binary fails the job. Run just that check with `python -m pytest -m smoke`. `tests/test_fast_av1_smoke.py` encodes a second of video on every Fast AV1 path the FFmpeg has (SVT-AV1, libaom, a GPU that passes the AV1 test, and the HEVC fallback) and skips the paths it lacks. The repo's `vendor\ffmpeg` essentials build has no libsvtav1; set `SQUISHIT_SMOKE_FFMPEG` to a full build (for example the installed app's `_internal\vendor\ffmpeg\ffmpeg.exe`) to run the SVT-AV1 one. Unit tests never start a real hardware encoder or write the AV1 check file: `tests/conftest.py` swaps in a fake check.
 
 All dev commands go through `dev.bat`:
 
@@ -223,8 +239,10 @@ video_compressor/          # Main package (launch: python -m video_compressor)
 │   ├── codecs.py           # Codec definitions, container compatibility matrix
 │   ├── compressor.py       # Compression engine, FFmpeg integration
 │   ├── eta.py              # Rolling-window ETA calculator
+│   ├── fast_av1.py         # Fast AV1: hardware AV1 test encode and its cache, SVT-AV1 speed/memory policy
 │   ├── hardware.py         # GPU/CPU detection
-│   ├── preview.py          # Frames, filmstrip and silent playback for the trim editor
+│   ├── preview.py          # Frames, filmstrip, playback with sound and the sound wave for the trim editor
+│   ├── audio_out.py        # Sound output (Windows waveOut via ctypes, or silent) and the A/V sync clock
 │   ├── profiles.py         # Compression profiles
 │   └── utils.py            # Utility functions
 └── gui/
@@ -257,7 +275,12 @@ tests/                      # Test suite (pytest; Qt launch check is offscreen)
 ├── test_window_clips_smoke.py  # The window through the real engine (marker: smoke)
 ├── test_timeline_model.py  # Timeline geometry, clip editing, undo
 ├── test_trim_editor.py     # Trim editor and timeline widget (offscreen Qt)
+├── test_audio_out.py       # Sound output (fake winmm), sync clock; one real-device check on Windows
+├── test_preview_audio.py   # Sound playback, sound wave and sync with fakes, plus real-FFmpeg smoke
 ├── test_ffmpeg_smoke.py    # Real FFmpeg and VideoCompressor encodes (marker: smoke)
+├── conftest.py             # Fake hardware AV1 check for every test (no GPU encode, no cache file)
+├── test_fast_av1.py        # Fast AV1 check, fallback chain, presets, copy (fakes only)
+├── test_fast_av1_smoke.py  # Each Fast AV1 path this FFmpeg has (marker: smoke)
 ├── test_profiles.py
 └── test_target_size.py
 ```
@@ -267,7 +290,7 @@ tests/                      # Test suite (pytest; Qt launch check is offscreen)
 ## Requirements
 
 - **Python** 3.10+
-- **FFmpeg** with libx265, libsvtav1, libaom-av1, libx264, and libvpx-vp9
+- **FFmpeg** with libx265, libsvtav1, libaom-av1, libx264, and libvpx-vp9 (Fast AV1 still works without libsvtav1, more slowly on libaom, and falls back to HEVC with neither)
 - **Windows 10/11** (context menu integration is Windows-only)
 
 ### Python Dependencies

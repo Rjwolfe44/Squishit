@@ -470,10 +470,21 @@ class SquishItWindow(QMainWindow):
         self._settings.set_detected_hw(status_summary(status))
 
     def apply_hardware_probe(self, probe: Optional[HardwareProbe]) -> None:
-        """Show a probe immediately. Tests use this; the home path uses the worker."""
+        """Show a probe immediately. Tests use this; the home path uses the worker.
+
+        The size preview is redrawn too: before the check finished it counted
+        an unverified AV1 graphics card as the CPU.
+        """
 
         self._hw_probe = probe
+        if probe is not None and not probe.failed:
+            self.form.av1_software = probe.av1_software
+            self.form.av1_fallback = probe.av1_fallback
         self._refresh_hw_status()
+        try:
+            self._refresh_size_preview(self.job_profile())
+        except Exception:
+            logger.debug("Size preview refresh after the hardware check failed", exc_info=True)
 
     def _start_hw_probe(self) -> None:
         threading.Thread(target=self._hw_probe_worker, daemon=True).start()
@@ -499,8 +510,12 @@ class SquishItWindow(QMainWindow):
         if clips is not None:
             # A size target applies to each output, so judge it against a clip.
             first = clips.clips[0] if clips.mode.value != "join" else None
-            shown = ClipPlan((first,)) if first is not None else clips
+            shown = ClipPlan((first,), keep_audio=clips.keep_audio) if first is not None else clips
             info = effective_media_info(info, shown)
+            if not clips.keep_audio:
+                # The clips leave the sound out, as the engine will: no audio budget.
+                profile = CompressionProfile.from_dict(profile.to_dict())
+                profile.disable_audio = True
         if self._compressor is None:
             self._settings.set_size_preview("")
             return
@@ -544,6 +559,9 @@ class SquishItWindow(QMainWindow):
                 from ...core.compressor import VideoCompressor
 
                 compressor = VideoCompressor()
+                # Previews and slot counts on this thread never wait for the
+                # Fast AV1 hardware test encode.
+                compressor.ui_thread = self._ui_thread
                 compressor.set_progress_callback(
                     lambda job: self._queue.put(("progress", job))
                 )
@@ -672,7 +690,8 @@ class SquishItWindow(QMainWindow):
         item["clips"] = plan
         row = item.get("row")
         if row is not None:
-            row.set_clip_summary(clip_summary(plan))
+            length = getattr(item.get("info"), "duration", None)
+            row.set_clip_summary(clip_summary(plan, length))
         self._refresh_preview()
 
     def clear_trim(self, path: Path) -> None:

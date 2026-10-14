@@ -927,3 +927,172 @@ def test_a_join_of_repeated_parts_is_measured_at_its_real_length(monkeypatch, tm
 
     assert eff.duration == pytest.approx(100.0)  # not capped at the 60 s source
     assert eff.frame_count == 3000
+
+
+# --- clips saved without their sound ---------------------------------------------
+
+
+def _silent(*ranges, mode=ClipMode.SEPARATE):
+    return ClipPlan(tuple(Clip(start, end) for start, end in ranges), mode, keep_audio=False)
+
+
+def _no_audio_args(cmd):
+    return "-an" in cmd and "-c:a" not in cmd and "-b:a" not in cmd and "[acat]" not in " ".join(cmd)
+
+
+@pytest.mark.parametrize("audio_mode", ["auto", "copy", "reencode"])
+def test_a_clip_without_its_sound_drops_the_audio(monkeypatch, tmp_path, audio_mode):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(audio_mode=audio_mode)
+    job = _job(tmp_path, profile, plan=_silent((2, 5)))
+
+    cmd = compressor._build_video_ffmpeg_command(job, profile)
+
+    assert cmd[3:9] == ["-ss", "2.000", "-t", "3.000", "-i", str(job.input_file)]
+    assert _no_audio_args(cmd)
+    assert "-map" not in cmd
+    loud = compressor._build_video_ffmpeg_command(_job(tmp_path, profile, plan=ClipPlan((Clip(2, 5),))), profile)
+    assert "-an" not in loud and "-c:a" in loud
+
+
+def test_a_join_without_its_sound_has_no_audio_in_the_graph(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(max_resolution=720)
+    job = _job(tmp_path, profile, plan=_silent((0, 2), (4, 6), mode=ClipMode.JOIN))
+
+    cmd = compressor._build_video_ffmpeg_command(job, profile)
+
+    assert _graph(cmd) == "[0:v:0][1:v:0]concat=n=2:v=1:a=0[vcat];[vcat]scale=-2:720[vout]"
+    assert _maps(cmd) == ["[vout]"]
+    assert _no_audio_args(cmd)
+
+
+@pytest.mark.parametrize("plan", [_silent((0, 2)), _silent((0, 2), (4, 6), mode=ClipMode.JOIN)])
+def test_two_pass_without_the_sound_leaves_audio_out_of_both_passes(monkeypatch, tmp_path, plan):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(exact_two_pass=True, target_size_mb=5, target_size_mode="exact")
+    job = _job(tmp_path, profile, plan=plan)
+    target = build_target_size_plan(
+        target_size_mb=5, duration_seconds=4.0, audio_bitrate=0, container="mp4",
+        codec=VideoCodec.H264, mode="exact",
+    )
+    compressor._reserve_encode_slot(job, profile, codec="h264", hw_encoder=None)
+    try:
+        first, second = compressor._build_two_pass_commands(
+            job, profile, target_plan=target, target_video_bitrate=900_000, passlogfile=tmp_path / "pass",
+        )
+    finally:
+        compressor.governor.release(job.id)
+
+    assert _no_audio_args(first) and _no_audio_args(second)
+    assert first[-8:-7] == ["-an"] and second[-1] == str(job.output_file)
+
+
+def test_saving_just_the_sound_of_clips_without_sound_is_a_clear_error(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(output_mode="audio")
+    job = _job(tmp_path, profile, plan=_silent((2, 5)), output="out.m4a")
+
+    with pytest.raises(ValueError, match="no audio to save"):
+        compressor._build_audio_ffmpeg_command(job, profile)
+
+    source = tmp_path / "talk.mp4"
+    result, seen = _run_compress(
+        compressor, tmp_path, profile=profile, info=_info(source), output_size=1,
+        clips=_silent((2, 5)), output_name="talk.m4a",
+    )
+    assert result.success is False and "no audio to save" in result.error_message
+    assert seen["commands"] == []
+
+
+def test_a_silent_clip_gives_the_whole_size_target_to_the_picture(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    monkeypatch.setattr(
+        compressor.codec_manager, "get_compatible_container", lambda codec, container: VideoContainer.MP4,
+    )
+    source = tmp_path / "long.mp4"
+    info = _info(source, duration=100.0, size=100_000_000, frame_count=3000)
+    profile = _profile(target_size_mb=5, target_size_mode="strict")
+
+    result, seen = _run_compress(
+        compressor, tmp_path, profile=profile, info=info, output_size=5_000_000,
+        clips=_silent((10, 40)),
+    )
+
+    assert result.success, result.error_message
+    expected = build_target_size_plan(
+        target_size_mb=5, duration_seconds=30.0, audio_bitrate=0, container="mp4",
+        codec=VideoCodec.H264, mode="strict",
+    )
+    cmd = seen["commands"][0]
+    assert _after(cmd, "-b:v") == str(expected.video_bitrate)
+    assert _no_audio_args(cmd)
+    assert result.audio_codec == "none"
+    job = compressor.get_job("trim-run")
+    assert job.clip_plan.keep_audio is False and job.video_info.has_audio is False
+    assert job.source_info.has_audio is True
+
+
+def test_exact_mode_budgets_no_audio_for_a_silent_clip(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    source = tmp_path / "long.mp4"
+    info = _info(source, duration=100.0, size=100_000_000, frame_count=3000)
+    profile = _profile(target_size_mb=5, target_size_mode="exact")
+    plans = []
+    original = compressor._resolve_target_size_plan
+
+    def spy(profile_arg, media_info):
+        plan = original(profile_arg, media_info)
+        plans.append(plan)
+        return plan
+
+    compressor._resolve_target_size_plan = spy
+    result, seen = _run_compress(
+        compressor, tmp_path, profile=profile, info=info, output_size=5_000_000,
+        clips=_silent((10, 40)), output_name="out.mkv",
+    )
+
+    assert result.success, result.error_message
+    # Exact mode would set aside its recommended audio bitrate (96 kbps here);
+    # without sound only the planner's fixed floor for "no audio" is left.
+    no_audio = build_target_size_plan(
+        target_size_mb=5, duration_seconds=30.0, audio_bitrate=0, container="mp4",
+        codec=VideoCodec.H264, mode="exact",
+    ).audio_bitrate
+    assert plans and all(plan.audio_bitrate == no_audio for plan in plans if plan is not None)
+    assert all(_no_audio_args(cmd) for cmd in seen["commands"])
+    # Leaving the sound out was the request, not something exact mode did.
+    assert "audio removed" not in result.note and "opus" not in result.note
+
+
+def test_exact_notes_only_name_audio_changes_exact_mode_made(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    info = _info(tmp_path / "s.mp4")
+    final = _profile(disable_audio=True, video_codec=VideoCodec.HEVC, audio_codec=AudioCodec.OPUS)
+
+    # The user asked for no sound: only the codec change is an adjustment.
+    asked_silent = _profile(disable_audio=True)
+    assert compressor._describe_exact_target_changes(asked_silent, final, info, 0) == "hevc"
+    # The user wanted sound and exact mode dropped it: that is still reported.
+    assert compressor._describe_exact_target_changes(_profile(), final, info, 0) == "hevc, audio removed"
+    # With sound kept, a new audio codec is still named.
+    kept = _profile(video_codec=VideoCodec.HEVC, audio_codec=AudioCodec.OPUS)
+    assert compressor._describe_exact_target_changes(_profile(), kept, info, 0) == "hevc, opus"
+
+
+def test_the_whole_video_without_its_sound_is_encoded_not_skipped(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    monkeypatch.setattr(compressor, "_optimize_video_profile", lambda profile, media_info=None: profile)
+    source = tmp_path / "small.mp4"
+    info = _info(source, duration=60.0, size=2_000_000, frame_count=1800)
+    profile = _profile(target_size_mb=3, target_size_mode="strict")  # bigger than the source
+
+    result, seen = _run_compress(
+        compressor, tmp_path, profile=profile, info=info, output_size=500_000,
+        clips=ClipPlan((Clip(0, 60),), keep_audio=False),
+    )
+
+    assert result.success and result.skipped is False
+    cmd = seen["commands"][0]
+    assert cmd[3:7] == ["-t", "60.000", "-i", str(source)]
+    assert _no_audio_args(cmd)

@@ -1,4 +1,4 @@
-"""Timeline widget for the trim editor: ruler, filmstrip, clip regions, playhead.
+"""Timeline widget for the trim editor: ruler, filmstrip, sound wave, clip regions, playhead.
 
 All the geometry and editing rules live in ``gui/timeline_model.py`` (pure,
 tested). This file only paints that state and turns mouse input into model
@@ -7,9 +7,11 @@ calls, so it stays thin.
 
 from __future__ import annotations
 
-from typing import Optional
+import array
+import math
+from typing import Optional, Sequence
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -21,14 +23,20 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
+from ...core.preview import wave_level
 from ...core.utils import format_timecode
 from ..timeline_model import ClipEditModel, TimelineView, format_tick_label
 
 RULER_H = 26
 TRACK_H = 76
+#: Height of the optional sound wave lane under the filmstrip.
+WAVE_H = 44
 HANDLE_W = 9
 _BG = QColor("#0d0d0f")
 _TRACK = QColor("#18181b")
+_WAVE_BG = QColor("#111114")
+_WAVE = QColor("#2dd4bf")
+_WAVE_MID = QColor("#27272a")
 _TEXT = QColor("#d4d4d8")
 _TICK = QColor("#71717a")
 _ACCENT = QColor("#3b82f6")
@@ -45,6 +53,10 @@ class TimelineWidget(QWidget):
     * Drag across empty space to make a new clip.
     * Mouse wheel zooms around the pointer; Shift + wheel scrolls.
     * Holding Alt while dragging turns edge snapping off.
+
+    The optional sound wave lane (``set_wave_visible``) sits under the
+    filmstrip and follows the same zoom and scroll; clips, dimming and the
+    playhead are drawn over it, and it edits like the filmstrip.
     """
 
     seekRequested = Signal(float)  # a click landed here: show this frame properly
@@ -62,9 +74,14 @@ class TimelineWidget(QWidget):
         self._drag: Optional[dict] = None
         self._hover_x: Optional[float] = None
         self._create_rect: Optional[tuple[float, float]] = None
+        self._wave_visible = False
+        self._wave = array.array("f")  # peak per bucket, 0..1; -1 = not measured yet
+        self._wave_version = 0
+        self._wave_message = ""
+        self._wave_cache: Optional[tuple] = None  # (key, pixmap)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMinimumHeight(RULER_H + TRACK_H + 6)
+        self._apply_height()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setToolTip(
             "Click to move the playhead. Drag a clip's edge to trim it, or drag "
@@ -93,6 +110,64 @@ class TimelineWidget(QWidget):
         if 0 <= index < self._thumb_count and pixmap is not None and not pixmap.isNull():
             self._thumbs[index] = pixmap
             self.update()
+
+    # -- sound wave -----------------------------------------------------
+
+    @property
+    def wave_visible(self) -> bool:
+        return self._wave_visible
+
+    @property
+    def track_height(self) -> int:
+        """Height of everything under the ruler: filmstrip, plus the sound wave if shown."""
+        return TRACK_H + (WAVE_H if self._wave_visible else 0)
+
+    def set_wave_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible == self._wave_visible:
+            return
+        self._wave_visible = visible
+        self._apply_height()
+        self.update()
+
+    def set_wave_buckets(self, count: int) -> None:
+        """Start a new sound wave of ``count`` buckets, none measured yet."""
+        self._wave = array.array("f", [-1.0]) * max(0, int(count))
+        self._wave_version += 1
+        self.update()
+
+    def set_wave_peaks(self, first: int, peaks: Sequence[float]) -> None:
+        """Fill buckets ``first..`` with measured peaks (0..1); out-of-range ones are ignored."""
+        count = len(self._wave)
+        first = int(first)
+        for offset, peak in enumerate(peaks):
+            index = first + offset
+            if 0 <= index < count:
+                self._wave[index] = max(0.0, min(1.0, float(peak)))
+        self._wave_version += 1
+        if self._wave_visible:
+            self.update()
+
+    def set_wave_message(self, text: str) -> None:
+        """Words shown in the lane while there is no wave to draw (e.g. still reading)."""
+        self._wave_message = str(text or "")
+        if self._wave_visible:
+            self.update()
+
+    @property
+    def wave_measured(self) -> int:
+        """How many buckets have a measured peak (tests, progress)."""
+        return sum(1 for peak in self._wave if peak >= 0.0)
+
+    def wave_rect(self) -> QRectF:
+        """Where the sound wave lane is drawn (empty when hidden)."""
+        if not self._wave_visible:
+            return QRectF()
+        return QRectF(0, RULER_H + TRACK_H, self.width(), WAVE_H)
+
+    def _apply_height(self) -> None:
+        self.setFixedHeight(RULER_H + self.track_height + 6)
+        self.updateGeometry()
 
     def zoom(self, factor: float) -> None:
         centre = self.width() / 2.0
@@ -155,23 +230,90 @@ class TimelineWidget(QWidget):
     def _clip_rect(self, clip) -> QRectF:
         x0 = self.view.time_to_x(clip.start)
         x1 = self.view.time_to_x(clip.end)
-        return QRectF(x0, RULER_H, max(1.0, x1 - x0), TRACK_H)
+        return QRectF(x0, RULER_H, max(1.0, x1 - x0), self.track_height)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         width = self.width()
-        track = QRectF(0, RULER_H, width, TRACK_H)
+        film = QRectF(0, RULER_H, width, TRACK_H)
         painter.fillRect(self.rect(), _BG)
-        painter.fillRect(track, _TRACK)
-        self._paint_filmstrip(painter, track)
-        self._paint_dimming(painter, track)
+        painter.fillRect(film, _TRACK)
+        self._paint_filmstrip(painter, film)
+        if self._wave_visible:
+            self._paint_wave(painter, self.wave_rect())
+        self._paint_dimming(painter, QRectF(0, RULER_H, width, self.track_height))
         self._paint_ruler(painter)
         self._paint_clips(painter)
         self._paint_create(painter)
         self._paint_playhead(painter)
         self._paint_hover(painter)
         painter.end()
+
+    def _paint_wave(self, painter: QPainter, lane: QRectF) -> None:
+        painter.fillRect(lane, _WAVE_BG)
+        mid = lane.top() + lane.height() / 2.0
+        painter.setPen(QPen(_WAVE_MID, 1))
+        painter.drawLine(QPointF(lane.left(), mid), QPointF(lane.right(), mid))
+        pixmap = self._wave_pixmap(int(lane.width()), int(lane.height()))
+        if pixmap is not None:
+            painter.drawPixmap(QPointF(lane.left(), lane.top()), pixmap)
+        elif self._wave_message:
+            painter.setPen(QPen(_TICK, 1))
+            painter.drawText(lane, Qt.AlignmentFlag.AlignCenter, self._wave_message)
+
+    def _wave_pixmap(self, width: int, height: int) -> Optional[QPixmap]:
+        """The bars for the visible stretch, cached until the view or the data change."""
+        if width <= 0 or height <= 0 or not len(self._wave) or self.view.duration <= 0:
+            return None
+        ratio = max(1.0, float(self.devicePixelRatioF()))
+        key = (
+            round(self.view.offset, 9),
+            round(self.view.px_per_sec, 9),
+            width,
+            height,
+            ratio,
+            self._wave_version,
+        )
+        if self._wave_cache is not None and self._wave_cache[0] == key:
+            return self._wave_cache[1]
+        lines = self._wave_lines(width, height)
+        if not lines:
+            self._wave_cache = (key, None)
+            return None
+        pixmap = QPixmap(int(width * ratio), int(height * ratio))
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setPen(QPen(_WAVE, 1))
+        painter.drawLines(lines)
+        painter.end()
+        self._wave_cache = (key, pixmap)
+        return pixmap
+
+    def _wave_lines(self, width: int, height: int) -> list:
+        """One vertical bar per pixel column: the loudest bucket under that column."""
+        data = self._wave
+        count = len(data)
+        duration = self.view.duration
+        per_second = count / duration
+        pps = self.view.px_per_sec
+        offset = self.view.offset
+        mid = height / 2.0
+        half = max(1.0, mid - 3.0)
+        lines = []
+        for x in range(width):
+            t0 = offset + x / pps
+            if t0 >= duration:
+                break
+            first = int(t0 * per_second)
+            last = max(first + 1, int(math.ceil((t0 + 1.0 / pps) * per_second)))
+            peak = max(data[first:min(last, count)], default=-1.0)
+            if peak <= 0.0:
+                continue  # silent, or not measured yet
+            reach = max(0.5, wave_level(peak) * half)
+            lines.append(QLineF(x + 0.5, mid - reach, x + 0.5, mid + reach))
+        return lines
 
     def _paint_filmstrip(self, painter: QPainter, track: QRectF) -> None:
         count = self._thumb_count
@@ -270,7 +412,7 @@ class TimelineWidget(QWidget):
         if self._create_rect is None:
             return
         a, b = self._create_rect
-        rect = QRectF(min(a, b), RULER_H, abs(b - a), TRACK_H)
+        rect = QRectF(min(a, b), RULER_H, abs(b - a), self.track_height)
         fill = QColor(_ACCENT)
         fill.setAlpha(70)
         painter.fillRect(rect, fill)
@@ -283,7 +425,7 @@ class TimelineWidget(QWidget):
         if x < -2 or x > self.width() + 2:
             return
         painter.setPen(QPen(_PLAYHEAD, 2))
-        painter.drawLine(QPointF(x, 0), QPointF(x, RULER_H + TRACK_H))
+        painter.drawLine(QPointF(x, 0), QPointF(x, RULER_H + self.track_height))
         head = QPainterPath()
         head.moveTo(x - 6, 0)
         head.lineTo(x + 6, 0)

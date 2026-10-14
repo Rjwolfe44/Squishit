@@ -77,6 +77,7 @@ class QuickCompressWindow(QWidget):
         self.input_file = Path(input_file)
         self.compressor: Optional[VideoCompressor] = None
         self._compressor_lock = threading.Lock()
+        self._ui_thread = threading.current_thread()
         self._hw_probe: Optional[HardwareProbe] = None
         self._config = get_config_manager()
         self._events: queue.Queue = queue.Queue()
@@ -189,7 +190,10 @@ class QuickCompressWindow(QWidget):
             return self.compressor
         with self._compressor_lock:
             if self.compressor is None:
-                self.compressor = VideoCompressor()
+                compressor = VideoCompressor()
+                # This thread never waits for the Fast AV1 hardware test encode.
+                compressor.ui_thread = self._ui_thread
+                self.compressor = compressor
         return self.compressor
 
     def _set_preset(self, preset: str) -> None:

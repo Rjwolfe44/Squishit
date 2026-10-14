@@ -2,7 +2,11 @@
 
 What was found comes from the hardware detector. What Quick Compress will
 use comes from ``VideoCompressor._select_hw_encoder`` (NVENC, then QSV, then
-AMF, then software). This module does not pick a different encoder.
+AMF, then software). For Fast AV1 that picker only returns an encoder that
+passed a real test encode, and ``VideoCompressor.fast_av1_route`` says what
+runs without one (SVT-AV1, libaom, or HEVC). This module does not pick a
+different encoder. ``probe_from_compressor`` can run those test encodes, so
+callers run it on a worker thread.
 """
 
 from __future__ import annotations
@@ -30,6 +34,20 @@ FAMILY_PLAIN = {
     "VideoToolbox": "Apple hardware (VideoToolbox)",
 }
 
+# "Fast AV1 will use your ..." for a graphics encoder that passed the AV1 check.
+FAMILY_CARD = {
+    "NVENC": "NVIDIA graphics card",
+    "QSV": "Intel graphics",
+    "AMF": "AMD graphics card",
+    "VideoToolbox": "Apple graphics",
+}
+
+_CPU_AV1_NAMES = {
+    "libsvtav1": "SVT-AV1",
+    "libaom-av1": "libaom, which is slower than SVT-AV1",
+}
+_FALLBACK_NAMES = {"hevc": "HEVC", "h264": "H.264"}
+
 
 @dataclass(frozen=True)
 class FoundHardware:
@@ -41,11 +59,18 @@ class FoundHardware:
 
 @dataclass(frozen=True)
 class HardwareProbe:
-    """Cached detector output plus the encoder the real picker chose."""
+    """Cached detector output plus the encoder the real picker chose.
+
+    ``av1_software`` is the CPU encoder Fast AV1 falls back to (``libsvtav1``
+    or ``libaom-av1``), ``""`` when this FFmpeg has no AV1 encoder (then
+    ``av1_fallback`` names the codec used instead), or None when unknown.
+    """
 
     found: tuple[FoundHardware, ...] = ()
     encoders: Mapping[str, Optional[str]] = field(default_factory=dict)
     failed: bool = False
+    av1_software: Optional[str] = None
+    av1_fallback: str = ""
 
     def encoder_for(self, codec: VideoCodec) -> Optional[str]:
         return self.encoders.get(codec.value)
@@ -105,7 +130,12 @@ def findings_from_info(info) -> tuple[FoundHardware, ...]:
 
 
 def probe_from_compressor(compressor) -> HardwareProbe:
-    """Read the detector and the real encoder picker. Does not encode."""
+    """Read the detector and the real encoder picker.
+
+    The AV1 entry runs Fast AV1's hardware test encodes the first time (a
+    fraction of a second each, read from the saved result afterwards), so
+    call this off the UI thread.
+    """
 
     detector = getattr(compressor, "hw_detector", None)
     select = getattr(compressor, "_select_hw_encoder", None)
@@ -125,7 +155,23 @@ def probe_from_compressor(compressor) -> HardwareProbe:
     except Exception:
         logger.debug("Hardware encoder selection failed", exc_info=True)
         return HardwareProbe(found=found, failed=True)
-    return HardwareProbe(found=found, encoders=encoders, failed=False)
+    av1_software: Optional[str] = None
+    av1_fallback = ""
+    route_for = getattr(compressor, "fast_av1_route", None)
+    if route_for is not None:
+        try:
+            route = route_for(use_hw_accel=False)
+            av1_software = route.encoder if route.kind == "software" else ""
+            av1_fallback = route.fallback_codec
+        except Exception:
+            logger.debug("Fast AV1 route lookup failed", exc_info=True)
+    return HardwareProbe(
+        found=found,
+        encoders=encoders,
+        failed=False,
+        av1_software=av1_software,
+        av1_fallback=av1_fallback,
+    )
 
 
 def describe_hw_status(
@@ -160,9 +206,7 @@ def describe_hw_status(
     if force_software:
         using = f"{action} keeps hardware off and will use software encoding."
         if codec == VideoCodec.SVT_AV1:
-            using += (
-                " SVT-AV1 is best compression on the CPU, not fast hardware AV1."
-            )
+            using += " SVT-AV1 is best compression on the CPU, not Fast AV1."
         return HwStatusText(
             badge="Software",
             found=found_line,
@@ -170,6 +214,8 @@ def describe_hw_status(
             state="software",
             tooltip=tooltip,
         )
+    if codec == VideoCodec.AV1:
+        return _describe_fast_av1(probe, found_line, use_hw=use_hw, software_name=software_name)
     if not use_hw:
         return HwStatusText(
             badge="Software",
@@ -188,8 +234,6 @@ def describe_hw_status(
         found_line = f"Found {FAMILY_PLAIN.get(family, family)}."
     if encoder and family:
         using = _hardware_using(action, family, probe.found)
-        if codec == VideoCodec.AV1:
-            using = f"Fast hardware AV1. {using}"
         return HwStatusText(
             badge=family if family != "VideoToolbox" else "Apple",
             found=found_line,
@@ -216,6 +260,72 @@ def describe_hw_status(
         using=f"{action} will use software encoding.",
         state="software",
         tooltip=tooltip,
+    )
+
+
+def _describe_fast_av1(
+    probe: HardwareProbe,
+    found_line: str,
+    *,
+    use_hw: bool,
+    software_name: str,
+) -> HwStatusText:
+    """What Fast AV1 will do on this PC, in one plain sentence."""
+
+    encoder = probe.encoder_for(VideoCodec.AV1) if use_hw else None
+    family = family_of(encoder or "")
+    if encoder and family:
+        if not probe.found:
+            found_line = f"Found {FAMILY_PLAIN.get(family, family)}."
+        return HwStatusText(
+            badge=family if family != "VideoToolbox" else "Apple",
+            found=found_line,
+            using=f"Fast AV1 will use your {FAMILY_CARD.get(family, 'graphics card')}.",
+            state="ready",
+            tooltip=encoder,
+        )
+    software = probe.av1_software
+    if software is None:
+        # A probe from before the route was known: assume the named encoder.
+        software = software_name if software_name in _CPU_AV1_NAMES else "libsvtav1"
+    if not software:
+        fallback = _FALLBACK_NAMES.get(probe.av1_fallback, "HEVC")
+        return HwStatusText(
+            badge=fallback,
+            found=found_line,
+            using=f"This copy of FFmpeg has no AV1 encoder; {fallback} will be used instead.",
+            state="software",
+            tooltip="",
+        )
+    cpu = _CPU_AV1_NAMES.get(software, software)
+    if use_hw and probe.found:
+        # The card was found (it may still encode H.264/HEVC), but its AV1
+        # test encode did not pass on this PC.
+        card = (
+            FAMILY_CARD.get(probe.found[0].family, "graphics card")
+            if len(probe.found) == 1
+            else "graphics hardware"
+        )
+        using = (
+            f"Your {card} did not pass the AV1 test, so Fast AV1 will use your "
+            f"processor ({cpu})."
+        )
+    elif use_hw:
+        using = (
+            "No AV1 graphics hardware was found, so Fast AV1 will use your "
+            f"processor ({cpu})."
+        )
+    else:
+        using = (
+            "Hardware encoding is turned off, so Fast AV1 will use your "
+            f"processor ({cpu})."
+        )
+    return HwStatusText(
+        badge="Software",
+        found=found_line,
+        using=using,
+        state="software",
+        tooltip=software,
     )
 
 

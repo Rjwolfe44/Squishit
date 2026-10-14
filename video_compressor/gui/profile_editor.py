@@ -22,14 +22,15 @@ _CODEC_LABELS = {
     "h264": "H.264 (AVC)",
     "vp9": "VP9",
     "svt-av1": "SVT-AV1 (best compression, CPU)",
-    "av1": "Fast hardware AV1",
+    "av1": "Fast AV1",
 }
 _CODEC_MAP = {
     "HEVC (H.265)": VideoCodec.HEVC,
     "H.264 (AVC)": VideoCodec.H264,
     "VP9": VideoCodec.VP9,
     "SVT-AV1 (best compression, CPU)": VideoCodec.SVT_AV1,
-    "Fast hardware AV1": VideoCodec.AV1,
+    "Fast hardware AV1": VideoCodec.AV1,  # older label, still read back
+    "Fast AV1": VideoCodec.AV1,
 }
 _CODEC_REVERSE = {v: k for k, v in _CODEC_MAP.items()}
 
@@ -226,7 +227,7 @@ class ProfileEditorDialog(ctk.CTkToplevel):
         try:
             with open(profile_path, "r", encoding="utf-8") as fh:
                 data = yaml.safe_load(fh) or {}
-            profile = CompressionProfile.from_dict(data)
+            profile = CompressionProfile.from_saved_dict(data)
             if not profile.name.strip():
                 raise ValueError("Profile file is missing a name")
             profile.created_by = "import"

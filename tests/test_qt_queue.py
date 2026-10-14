@@ -205,6 +205,27 @@ def test_join_clips_start_a_single_job(window, tmp_path):
     assert Path(calls[0]["output_file"]).name == "movie_compressed.mp4"
 
 
+def test_clips_without_sound_keep_that_choice_in_every_job(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    plan = ClipPlan((Clip(1, 3), Clip(5, 6.5)), ClipMode.SEPARATE, keep_audio=False)
+    win.set_clips(key, plan)
+    assert win._files[key]["row"]._badge.text() == "2 clips · saved separately · 0:04 · no sound"
+    win.start_compression()
+    calls = win._compressor.calls
+    assert [call["clips"].keep_audio for call in calls] == [False, False]
+
+
+def test_the_whole_video_without_sound_reads_as_such_on_the_row(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._files[key]["info"] = SimpleNamespace(video_codec="h264", size=1000, duration=60.0)
+    win.set_clips(key, ClipPlan((Clip(0, 60),), keep_audio=False))
+    assert win._files[key]["row"]._badge.text() == "Whole video · no sound"
+    win.start_compression()
+    assert win._compressor.calls[0]["clips"].keep_audio is False
+
+
 def test_without_clips_nothing_extra_is_passed(window, tmp_path):
     win, app = window
     _add(win, app, tmp_path)
@@ -451,6 +472,17 @@ def test_clip_summary_wording():
     assert clip_summary(three) == "3 clips \u00b7 saved separately \u00b7 1:23"
     joined = ClipPlan(three.clips, ClipMode.JOIN)
     assert clip_summary(joined) == "3 clips joined \u00b7 1:23"
+
+
+def test_clip_summary_says_when_the_sound_is_left_out():
+    one = ClipPlan((Clip(10, 52),), keep_audio=False)
+    assert clip_summary(one) == "Trimmed to 0:42 \u00b7 no sound"
+    assert clip_summary(one, 120.0) == "Trimmed to 0:42 \u00b7 no sound"
+    whole = ClipPlan((Clip(0, 119.98),), keep_audio=False)
+    assert clip_summary(whole, 120.0) == "Whole video \u00b7 no sound"
+    assert clip_summary(whole) == "Trimmed to 2:00 \u00b7 no sound"  # length unknown
+    three = ClipPlan((Clip(0, 20), Clip(30, 50), Clip(60, 103)), ClipMode.JOIN, keep_audio=False)
+    assert clip_summary(three) == "3 clips joined \u00b7 1:23 \u00b7 no sound"
 
 
 def test_clock_and_media_description():

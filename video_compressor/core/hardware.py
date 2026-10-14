@@ -40,7 +40,7 @@ _CIM_VIDEO_COMMAND = (
     "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
     "$OutputEncoding = [Console]::OutputEncoding; "
     "Get-CimInstance Win32_VideoController | "
-    "Select-Object Name,AdapterRAM,PNPDeviceID | "
+    "Select-Object Name,AdapterRAM,PNPDeviceID,DriverVersion | "
     "ConvertTo-Json -Compress"
 )
 
@@ -176,6 +176,7 @@ def _parse_cim_video_controllers(payload: Any) -> List[Dict[str, Any]]:
                 "name": name,
                 "memory_mb": _adapter_ram_mb(item.get("AdapterRAM")),
                 "pnp": pnp,
+                "driver_version": str(item.get("DriverVersion") or "").strip(),
             }
         )
     return controllers
@@ -231,12 +232,17 @@ class GPUVendor(Enum):
 
 @dataclass
 class GPUInfo:
-    """Information about a GPU."""
+    """Information about a GPU.
+
+    ``encoder_support`` is a name-based guess. Fast AV1 does not trust it:
+    ``fast_av1.HardwareAv1Probe`` runs a real test encode instead.
+    """
     name: str
     vendor: GPUVendor
     memory_mb: int = 0
     encoder_support: Dict[str, bool] = field(default_factory=dict)
-    
+    driver_version: str = ""
+
     def __str__(self) -> str:
         return f"{self.name} ({self.vendor.value})"
 
@@ -254,6 +260,14 @@ class HardwareInfo:
     recommended_threads: int = 4
     has_hw_encoder: bool = False
     preferred_hw_encoder: Optional[str] = None
+
+    def gpu_signature(self) -> str:
+        """Adapter names and driver versions. A change re-runs the AV1 check."""
+
+        parts = sorted(
+            f"{gpu.vendor.value}:{gpu.name}@{gpu.driver_version}" for gpu in self.gpus
+        )
+        return "|".join(parts)
 
     def encoding_label(self) -> str:
         """Status text for ``cli.py --hardware`` and the hardware summary.
@@ -448,11 +462,15 @@ class HardwareDetector:
         try:
             # Try nvidia-smi
             result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total,driver_version",
+                    "--format=csv,noheader,nounits",
+                ],
                 capture_output=True, text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
             )
-            
+
             if result.returncode == 0:
                 for line in result.stdout.strip().split('\n'):
                     parts = [p.strip() for p in line.split(',')]
@@ -462,7 +480,7 @@ class HardwareDetector:
                             memory = int(float(parts[1]))
                         except:
                             memory = 0
-                        
+
                         gpus.append(GPUInfo(
                             name=name,
                             vendor=GPUVendor.NVIDIA,
@@ -470,8 +488,10 @@ class HardwareDetector:
                             encoder_support={
                                 "h264": True,  # NVENC supports all recent GPUs
                                 "hevc": True,
-                                "av1": "RTX 40" in name or "RTX 40" in name,
-                            }
+                                # A guess only. Fast AV1 runs a test encode.
+                                "av1": bool(re.search(r"RTX\s*[45]0|RTX PRO", name)),
+                            },
+                            driver_version=parts[2] if len(parts) >= 3 else "",
                         ))
         except FileNotFoundError:
             logger.debug("nvidia-smi not found, no NVIDIA GPU detected")
@@ -505,7 +525,8 @@ class HardwareDetector:
                             "h264": True,
                             "hevc": True,
                             "av1": self._amd_supports_av1(name),
-                        }
+                        },
+                        driver_version=str(controller.get("driver_version") or ""),
                     ))
             except Exception as e:
                 logger.debug(f"Error detecting AMD GPU: {e}")
@@ -555,7 +576,8 @@ class HardwareDetector:
                                 "h264": True,
                                 "hevc": True,
                                 "av1": has_av1,
-                            }
+                            },
+                            driver_version=str(controller.get("driver_version") or ""),
                         ))
             except Exception as e:
                 logger.debug(f"Error detecting Intel GPU: {e}")

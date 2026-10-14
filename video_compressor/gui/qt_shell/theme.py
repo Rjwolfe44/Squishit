@@ -340,6 +340,12 @@ QSlider::sub-page:horizontal {
     background: #3b82f6;
     border-radius: 3px;
 }
+QSlider::sub-page:horizontal:disabled {
+    background: #52525b;
+}
+QSlider::handle:horizontal:disabled {
+    background: #71717a;
+}
 """
 
 

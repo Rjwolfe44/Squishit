@@ -3,12 +3,17 @@ Video preview service for the trim editor (no Qt, no Pillow).
 
 Everything here goes through the bundled ffmpeg and hands back raw ``rgb24``
 bytes (``width * height * 3``), so the GUI layer decides how to turn them
-into pixmaps. Four things are provided:
+into pixmaps. Provided:
 
 * single frame grabs while scrubbing (:func:`grab_frame`, :class:`FrameScheduler`),
 * a filmstrip of thumbnails and row poster thumbnails (background workers),
 * a byte-budgeted LRU cache of grabbed frames (:class:`ThumbnailCache`),
-* silent real-time playback from one ffmpeg process (:class:`PlaybackSession`),
+* real-time playback from one ffmpeg process (:class:`PlaybackSession`),
+  optionally with sound (:class:`AudioSession`, raw PCM from a second ffmpeg
+  into :mod:`~video_compressor.core.audio_out`) whose device clock paces the
+  picture,
+* a sound wave: the loudness of the whole track, measured in the background
+  (:class:`PeakReducer`),
 
 all behind the :class:`PreviewService` facade.
 
@@ -22,6 +27,8 @@ thread owned by this module, never on the caller's thread:
 * ``preview-posters``: :meth:`PreviewService.request_poster` (FIFO).
 * ``preview-filmstrip``: :meth:`PreviewService.request_filmstrip` (sequential).
 * ``preview-playback``: one reader thread per :class:`PlaybackSession`.
+* ``preview-audio``: one thread per :class:`AudioSession` (sound status).
+* ``preview-waveform``: :meth:`PreviewService.request_waveform` (latest wins).
 
 Callbacks must be quick and must not raise; a raising callback is logged and
 swallowed (for playback it ends the session with ``'error'``). Marshal into the
@@ -35,14 +42,27 @@ console window on Windows.
 
 from __future__ import annotations
 
+import array
 import collections
 import logging
 import math
 import os
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional, Tuple, Union
+
+from .audio_out import (
+    CHANNELS,
+    SAMPLE_BYTES,
+    SAMPLE_RATE,
+    AudioError,
+    AudioOutput,
+    SyncClock,
+    clamp_volume,
+    default_audio_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +70,21 @@ PathLike = Union[str, "os.PathLike[str]"]
 
 __all__ = [
     "DEFAULT_CACHE_BYTES",
+    "AudioSession",
     "FrameScheduler",
+    "PeakReducer",
     "PlaybackSession",
     "PreviewService",
     "ThumbnailCache",
+    "build_audio_cmd",
     "build_frame_cmd",
     "build_playback_cmd",
+    "build_waveform_cmd",
     "display_size",
     "filmstrip_count",
     "grab_frame",
+    "wave_level",
+    "waveform_buckets",
 ]
 
 DEFAULT_CACHE_BYTES = 64 * 1024 * 1024
@@ -74,6 +100,10 @@ _TAIL_FALLBACK_FPS = 30.0
 
 #: Playback waits end with a precise sleep of at most this many seconds.
 _COARSE_WAIT_TAIL = 0.05
+#: While paced by the sound, re-read its clock at least this often (seconds).
+_MASTER_POLL = 0.1
+#: A catch-up restart never aims further ahead of the sound than this (seconds).
+_MAX_CATCH_UP_LEAD = 5.0
 
 
 def _popen_flags() -> int:
@@ -260,6 +290,169 @@ def build_playback_cmd(
         "-",
     ]
     return cmd
+
+
+def build_audio_cmd(
+    ffmpeg: str,
+    path: PathLike,
+    start: float,
+    *,
+    sample_rate: int = SAMPLE_RATE,
+    channels: int = CHANNELS,
+) -> list:
+    """Build the argv that streams the first sound track as raw PCM from ``start``.
+
+    Signed 16-bit little-endian, ``channels`` x ``sample_rate`` Hz, to stdout.
+    The seek is accurate (ffmpeg decodes up to ``start``), so sample 0 belongs
+    at ``start`` exactly like frame 0 of :func:`build_playback_cmd`.
+    ``aresample=async=1:first_pts=0`` fills gaps in the sound's timestamps
+    with silence (and pads a track that starts late), so the sample count
+    keeps matching the timeline over long files. A file without sound makes
+    ffmpeg exit with an error and no output. Only the first sound track is
+    used; if that one cannot be decoded the preview is silent (``'none'``)
+    even when a later track could be.
+    """
+    return [
+        str(ffmpeg), "-nostdin", "-loglevel", "error",
+        "-ss", _format_seek(start),
+        "-i", os.fspath(path),
+        "-map", "0:a:0",
+        "-vn", "-sn", "-dn",
+        "-af", "aresample=async=1:first_pts=0",
+        "-f", "s16le",
+        "-ac", str(int(channels)),
+        "-ar", str(int(sample_rate)),
+        "-",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Sound wave (loudness overview)
+# ---------------------------------------------------------------------------
+
+#: Sample rate the sound wave is measured at (mono). Longer videos use less.
+WAVE_RATE = 8000
+WAVE_RATE_LONG = 2000
+#: Videos longer than this (seconds) are measured at ``WAVE_RATE_LONG``.
+WAVE_LONG_SECONDS = 3600.0
+#: Wave detail: buckets per second of video, and the most buckets kept.
+WAVE_BUCKETS_PER_SECOND = 50
+WAVE_MIN_BUCKETS = 100
+WAVE_MAX_BUCKETS = 20000
+#: Give up (keeping what was measured) after this much wall time.
+WAVE_MAX_SECONDS = 180.0
+
+
+def waveform_buckets(duration: float) -> int:
+    """How many loudness buckets to measure for a video ``duration`` seconds long."""
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(seconds) or seconds <= 0:
+        return 0
+    wanted = int(math.ceil(seconds * WAVE_BUCKETS_PER_SECOND))
+    return max(WAVE_MIN_BUCKETS, min(WAVE_MAX_BUCKETS, wanted))
+
+
+def waveform_rate(duration: float) -> int:
+    """Sample rate to measure the sound wave at (lower for very long videos)."""
+    try:
+        seconds = float(duration)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return WAVE_RATE_LONG if seconds > WAVE_LONG_SECONDS else WAVE_RATE
+
+
+def build_waveform_cmd(ffmpeg: str, path: PathLike, sample_rate: int = WAVE_RATE) -> list:
+    """Build the argv that decodes the first sound track as low-rate mono PCM.
+
+    One decoder thread (``-threads 1``) keeps it light; the caller also runs
+    it at a lower priority. As in :func:`build_audio_cmd`, gaps and a late
+    start are filled with silence so sample ``n`` sits at ``n / sample_rate``
+    seconds on the timeline.
+    """
+    return [
+        str(ffmpeg), "-nostdin", "-loglevel", "error",
+        "-threads", "1",
+        "-i", os.fspath(path),
+        "-map", "0:a:0",
+        "-vn", "-sn", "-dn",
+        "-af", "aresample=async=1:first_pts=0",
+        "-ac", "1",
+        "-ar", str(int(sample_rate)),
+        "-f", "s16le",
+        "-",
+    ]
+
+
+def wave_level(peak: float) -> float:
+    """Bar height (0..1) for a peak (0..1): a square root, so quiet speech still shows."""
+    try:
+        value = float(peak)
+    except (TypeError, ValueError):
+        return 0.0
+    if not value > 0:
+        return 0.0
+    return min(1.0, math.sqrt(value))
+
+
+class PeakReducer:
+    """Folds a stream of mono ``s16le`` PCM into ``buckets`` peak values (0..1).
+
+    Bucket ``i`` covers samples ``[i * total // buckets, (i + 1) * total // buckets)``
+    of an expected ``total_samples``. :meth:`feed` takes any chunk size (odd
+    byte counts included) and returns the buckets it completed as
+    ``(index, peak)``; :meth:`finish` returns the last, partly filled one.
+    Samples beyond the last bucket are ignored. Memory stays at one chunk.
+    """
+
+    def __init__(self, total_samples: int, buckets: int) -> None:
+        self.buckets = max(1, int(buckets))
+        self.total = max(1, int(total_samples))
+        self.index = 0
+        self._pos = 0
+        self._peak = 0
+        self._carry = b""
+
+    def _end(self, index: int) -> int:
+        return (index + 1) * self.total // self.buckets
+
+    def feed(self, data: bytes) -> list:
+        data = self._carry + bytes(data)
+        if len(data) % 2:
+            data, self._carry = data[:-1], data[-1:]
+        else:
+            self._carry = b""
+        samples = array.array("h")
+        samples.frombytes(data)
+        if sys.byteorder == "big":
+            samples.byteswap()
+        done: list = []
+        i, n = 0, len(samples)
+        while i < n and self.index < self.buckets:
+            take = min(n - i, max(0, self._end(self.index) - self._pos))
+            if take:
+                chunk = samples[i:i + take]
+                self._peak = max(self._peak, max(chunk), -min(chunk))
+                i += take
+                self._pos += take
+            if self._pos >= self._end(self.index):
+                done.append((self.index, min(1.0, self._peak / 32768.0)))
+                self.index += 1
+                self._peak = 0
+        return done
+
+    def finish(self) -> list:
+        """The partly filled bucket at the end of the stream, if any."""
+        start = self.index * self.total // self.buckets
+        if self.index < self.buckets and self._pos > start:
+            peak = min(1.0, self._peak / 32768.0)
+            done = [(self.index, peak)]
+            self.index += 1
+            self._peak = 0
+            return done
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +902,29 @@ class _TaskWorker:
 # ---------------------------------------------------------------------------
 
 
+def _kill_process(proc: Any) -> None:
+    """Kill ``proc`` if it is still running (never raises)."""
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:  # already gone / platform quirks
+        pass
+
+
+def _read_exactly(stream: Any, view: memoryview, size: int) -> Tuple[int, bool]:
+    """Fill ``view[:size]`` from a pipe; ``(bytes_read, pipe_broke)``. Short at EOF."""
+    got = 0
+    while got < size:
+        try:
+            n = stream.readinto(view[got:size])
+        except (OSError, ValueError):
+            return got, True
+        if not n:
+            break
+        got += n
+    return got, False
+
+
 class PlaybackSession:
     """Silent real-time playback of one file through a single ffmpeg process.
 
@@ -740,12 +956,32 @@ class PlaybackSession:
     ``popen(cmd, **kwargs)`` must return a
     ``subprocess.Popen``-like object (``stdout.readinto``, ``poll``, ``wait``,
     ``kill``).
+
+    With sound, pass ``master_clock``: seconds of media played since playback
+    began (an :class:`~video_compressor.core.audio_out.SyncClock` following
+    the sound device). Frame ``k`` is then due when that clock reads
+    ``k / fps_out``, so the picture follows the sound and cannot drift. The
+    clock is never re-anchored: late frames are dropped while newer ones are
+    already waiting, and if ffmpeg itself falls ``max_lag`` seconds behind,
+    the session restarts it ahead of the sound (``catch_ups`` counts those)
+    rather than lag further. How far ahead adapts to how long ffmpeg was
+    seen to take to start (plus ``catch_up_margin``, at least
+    ``catch_up_lead``). A catch-up that shows less than ``min_hold`` seconds
+    before the next one is needed did not help; after
+    ``max_failed_catch_ups`` of those in a row the session stops chasing the
+    sound, calls ``on_sync_lost()`` once and plays on in smooth slow motion.
+    Whenever the clock is not following a live sound (its ``following_audio``
+    is false: no device, no sound from here, the track ended) frames are paced
+    on real time exactly like silent playback. ``on_first_frame()`` runs right
+    after the first frame was delivered (it starts the sound, so both begin
+    together).
     """
 
     #: Counters, valid while and after the session runs (diagnostics/tests).
     frames_read: int
     frames_delivered: int
     frames_dropped: int
+    catch_ups: int
 
     def __init__(
         self,
@@ -762,11 +998,28 @@ class PlaybackSession:
         clock: Optional[Callable[[], float]] = None,
         sleep: Optional[Callable[[float], None]] = None,
         popen: Optional[Callable[..., Any]] = None,
+        master_clock: Optional[Callable[[], float]] = None,
+        on_first_frame: Optional[Callable[[], None]] = None,
+        max_lag: float = 0.6,
+        catch_up_lead: float = 0.3,
+        catch_up_margin: float = 0.3,
+        min_hold: float = 1.0,
+        max_failed_catch_ups: int = 3,
+        on_sync_lost: Optional[Callable[[], None]] = None,
     ) -> None:
         if int(w) <= 0 or int(h) <= 0:
             raise ValueError("w and h must be positive")
         if not (fps_out and fps_out > 0):
             raise ValueError("fps_out must be positive")
+        self._master = master_clock
+        self._on_first_frame = on_first_frame
+        self._max_lag = max(float(max_lag), 2.0 / float(fps_out))
+        self._catch_up_lead = max(0.0, float(catch_up_lead))
+        self._catch_up_margin = max(0.0, float(catch_up_margin))
+        self._min_hold = max(0.0, float(min_hold))
+        self._max_failed_catch_ups = max(1, int(max_failed_catch_ups))
+        self._on_sync_lost = on_sync_lost
+        self._sync_lost = False
         self._ffmpeg = ffmpeg
         self._path = path
         self._start = float(start)
@@ -779,6 +1032,9 @@ class PlaybackSession:
         self._on_frame = on_frame
         self._on_end = on_end
         self._clock = clock if clock is not None else time.monotonic
+        # Timing ffmpeg's reads against the sound needs better than the 15.6 ms
+        # ticks time.monotonic has on Windows.
+        self._read_clock = clock if clock is not None else time.perf_counter
         self._sleep = sleep
         self._popen = popen if popen is not None else subprocess.Popen
 
@@ -791,6 +1047,7 @@ class PlaybackSession:
         self.frames_read = 0
         self.frames_delivered = 0
         self.frames_dropped = 0
+        self.catch_ups = 0
 
     # -- public ---------------------------------------------------------
 
@@ -836,11 +1093,7 @@ class PlaybackSession:
 
     @staticmethod
     def _kill(proc: Any) -> None:
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:  # already gone / platform quirks
-            pass
+        _kill_process(proc)
 
     def _wait_until(self, deadline: float) -> bool:
         """Wait until the clock reaches ``deadline``; True if stopped meanwhile.
@@ -867,7 +1120,7 @@ class PlaybackSession:
     def _run(self) -> None:
         reason = "error"
         try:
-            reason = self._pump()
+            reason = self._pump() if self._master is None else self._pump_synced()
         except Exception:
             logger.exception("preview: playback reader crashed")
             reason = "error"
@@ -899,8 +1152,9 @@ class PlaybackSession:
         except Exception:
             pass
 
-    def _pump(self) -> str:
-        cmd = build_playback_cmd(self._ffmpeg, self._path, self._start, self._w, self._h, self._fps, self._duration)
+    def _launch(self, start: float, duration: Optional[float]) -> Any:
+        """Start ffmpeg streaming frames from ``start``; ``None`` if it could not start."""
+        cmd = build_playback_cmd(self._ffmpeg, self._path, start, self._w, self._h, self._fps, duration)
         try:
             proc = self._popen(
                 cmd,
@@ -912,11 +1166,20 @@ class PlaybackSession:
             )
         except OSError as exc:
             logger.warning("preview: could not start ffmpeg for playback: %s", exc)
-            return "error"
+            return None
         with self._lock:
             self._proc = proc
-            stopped = self._stop_event.is_set()
-        if stopped:
+        return proc
+
+    @staticmethod
+    def _read_frame(stream: Any, view: memoryview, size: int) -> Tuple[int, bool]:
+        return _read_exactly(stream, view, size)
+
+    def _pump(self) -> str:
+        proc = self._launch(self._start, self._duration)
+        if proc is None:
+            return "error"
+        if self._stop_event.is_set():
             return "stopped"
 
         size = self._frame_bytes
@@ -930,17 +1193,7 @@ class PlaybackSession:
 
         while not self._stop_event.is_set():
             read_started = clock()
-            got = 0
-            broken = False
-            while got < size:
-                try:
-                    n = stream.readinto(view[got:])
-                except (OSError, ValueError):
-                    broken = True
-                    break
-                if not n:
-                    break
-                got += n
+            got, broken = self._read_frame(stream, view, size)
             if got < size:
                 return self._exit_reason(proc, broken)
             now = clock()
@@ -973,6 +1226,177 @@ class PlaybackSession:
             k += 1
         return "stopped"
 
+    # -- paced by the sound ---------------------------------------------
+
+    def _wait_master(self, deadline: float) -> bool:
+        """Wait until the master clock reaches ``deadline``; True if stopped meanwhile.
+
+        The master clock can stand still (the sound is starting or caught a
+        hiccup), so it is re-read at least every ``_MASTER_POLL`` seconds.
+        """
+        master = self._master
+        while self._sleep is not None and not self._stop_event.is_set():
+            remaining = deadline - master()
+            if remaining <= 1e-9:  # float noise must not keep us waiting
+                return False
+            self._sleep(remaining)
+        while not self._stop_event.is_set():
+            remaining = deadline - master()
+            if remaining <= 1e-9:
+                return False
+            if remaining > _COARSE_WAIT_TAIL:
+                if self._stop_event.wait(min(remaining - _COARSE_WAIT_TAIL, _MASTER_POLL)):
+                    return True
+            else:
+                time.sleep(remaining)
+        return True
+
+    def _retire(self, proc: Any) -> None:
+        """Kill a replaced ffmpeg and close its pipe."""
+        self._kill(proc)
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+    def _following_sound(self) -> bool:
+        """True while frames are paced by a live sound clock (not given up on)."""
+        if self._sync_lost:
+            return False
+        return bool(getattr(self._master, "following_audio", True))
+
+    def _lose_sync(self) -> None:
+        """Catching up keeps failing: pace on real time (slow motion) from here."""
+        self._sync_lost = True
+        if self._on_sync_lost is not None:
+            try:
+                self._on_sync_lost()
+            except Exception:
+                logger.exception("preview: on_sync_lost callback raised")
+
+    def _pump_synced(self) -> str:
+        master = self._master
+        rclock = self._read_clock
+        launched_at = rclock()
+        proc = self._launch(self._start, self._duration)
+        if proc is None:
+            return "error"
+        if self._stop_event.is_set():
+            return "stopped"
+
+        size = self._frame_bytes
+        buf = bytearray(size)
+        view = memoryview(buf)
+        dt = self._dt
+        offset = 0.0  # media seconds from self._start to this ffmpeg's first frame
+        k = 0
+        fresh = True  # the first frame after a (re)start is always shown
+        announced = False
+        startup = 0.0  # longest wait seen from starting ffmpeg to its first frame
+        free_t0: Optional[float] = None  # real-time anchor once there is no sound to follow
+        held: Optional[int] = None  # frames shown since the last catch-up
+        failed = 0  # catch-ups in a row that did not hold
+
+        while not self._stop_event.is_set():
+            read_started = rclock()
+            got, broken = self._read_frame(proc.stdout, view, size)
+            if got < size:
+                return self._exit_reason(proc, broken)
+            read_done = rclock()
+            if fresh:
+                startup = max(startup, read_done - launched_at)
+            slow_read = read_done - read_started >= dt
+            self.frames_read += 1
+
+            if not self._following_sound():
+                # No live sound clock (no device, no sound from here, the track
+                # ended, or catching up was hopeless): plain real-time pacing as
+                # in silent playback, slowing down when ffmpeg is the bottleneck.
+                now = self._clock()
+                if free_t0 is None:
+                    free_t0 = now - k * dt  # carry on from this frame
+                due = free_t0 + k * dt
+                if due > now:
+                    if self._wait_until(due):
+                        return "stopped"
+                elif now - due >= dt - 1e-9 and not fresh:
+                    if slow_read:
+                        free_t0 = now - k * dt
+                    else:
+                        self.frames_dropped += 1
+                        k += 1
+                        continue
+            else:
+                due = offset + k * dt
+                now = master()
+                if due > now:
+                    if self._wait_master(due):
+                        return "stopped"
+                elif not fresh:
+                    late = now - due
+                    if late >= self._max_lag and slow_read:
+                        if held is not None:
+                            failed = failed + 1 if held * dt < self._min_hold else 0
+                        if failed >= self._max_failed_catch_ups:
+                            self._lose_sync()  # show this frame now, then slow motion
+                        else:
+                            # ffmpeg cannot keep up with the sound: restart it far
+                            # enough ahead (its own measured start-up time plus a
+                            # margin) that its first frame is not already late.
+                            lead = min(
+                                _MAX_CATCH_UP_LEAD,
+                                max(self._catch_up_lead, startup + self._catch_up_margin),
+                            )
+                            jump = now + lead
+                            left: Optional[float] = None
+                            if self._duration is not None:
+                                left = self._duration - jump
+                                if left <= 0:
+                                    return "eof"
+                            self._retire(proc)
+                            if self._stop_event.is_set():
+                                return "stopped"
+                            launched_at = rclock()
+                            proc = self._launch(self._start + jump, left)
+                            if proc is None:
+                                return "error"
+                            if self._stop_event.is_set():
+                                return "stopped"
+                            offset, k, fresh, held = jump, 0, True, 0
+                            self.catch_ups += 1
+                            continue
+                    elif late >= dt - 1e-9 and not slow_read:
+                        # A newer frame is already due: drop this one.
+                        self.frames_dropped += 1
+                        k += 1
+                        continue
+
+            if self._stop_event.is_set():
+                break
+            try:
+                self._on_frame(self._start + offset + k / self._fps, bytes(buf))
+            except Exception:
+                logger.exception("preview: on_frame callback raised; ending playback")
+                return "error"
+            self.frames_delivered += 1
+            if held is not None:
+                held += 1
+            fresh = False
+            k += 1
+            if not announced:
+                announced = True
+                if self._on_first_frame is not None:
+                    try:
+                        self._on_first_frame()
+                    except Exception:
+                        logger.exception("preview: on_first_frame callback raised")
+        return "stopped"
+
     def _exit_reason(self, proc: Any, broken: bool) -> str:
         """Classify the end of the pipe: 'eof' for a clean exit, else 'error'."""
         if self._stop_event.is_set():
@@ -989,6 +1413,317 @@ class PlaybackSession:
 
 
 # ---------------------------------------------------------------------------
+# Sound
+# ---------------------------------------------------------------------------
+
+
+class AudioSession:
+    """Plays a file's sound from ``start`` and keeps the clock the picture follows.
+
+    :meth:`start` runs a ``preview-audio`` thread that opens the sound output
+    (``output_factory()``, then ``open``), starts ffmpeg
+    (:func:`build_audio_cmd`) and copies PCM from the pipe into the output.
+    The output's back-pressure paces the decoder, so only a few hundred
+    milliseconds are ever decoded ahead. The output is held paused until
+    :meth:`release` (call it once the first video frame is on screen), so
+    picture and sound start together. :attr:`clock` is a
+    :class:`~video_compressor.core.audio_out.SyncClock` on the output's
+    position: pass it to :class:`PlaybackSession` as ``master_clock``.
+
+    Nothing here may stop the picture. With no sound device, no sound track or
+    any error, the sound is dropped, the clock carries on in real time, and
+    ``on_status(state)`` (worker thread) says why:
+
+    * ``'playing'``: the sound is on its way,
+    * ``'unavailable'``: no sound device could be opened,
+    * ``'none'``: ffmpeg failed and produced no sound (no track, or it could
+      not be read),
+    * ``'past_end'``: the sound track ends before ``start`` (ffmpeg finished
+      cleanly without a sample),
+    * ``'failed'``: the device or ffmpeg failed, or the sound never started,
+    * ``'behind'``: the picture could not keep up, so the sound was dropped
+      (:meth:`fall_behind`),
+    * ``'ended'``: the sound track finished (it may be shorter than the video).
+
+    :meth:`stop` is idempotent, safe from any thread (also from a callback)
+    and kills ffmpeg; with ``wait=False`` it does not wait for the worker,
+    which finishes and tidies up on its own. ``popen`` and ``mono`` are test
+    seams.
+    """
+
+    def __init__(
+        self,
+        ffmpeg: str,
+        path: PathLike,
+        start: float,
+        *,
+        volume: float = 1.0,
+        output_factory: Optional[Callable[[], AudioOutput]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+        popen: Optional[Callable[..., Any]] = None,
+        mono: Optional[Callable[[], float]] = None,
+        grace: float = 2.0,
+    ) -> None:
+        self._ffmpeg = ffmpeg
+        self._path = path
+        self._start = max(0.0, float(start))
+        self._volume = clamp_volume(volume)
+        self._factory = output_factory if output_factory is not None else default_audio_output
+        self._on_status = on_status
+        self._popen = popen if popen is not None else subprocess.Popen
+        self._lock = threading.Lock()
+        self._stopping = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._proc: Any = None
+        self._output: Optional[AudioOutput] = None
+        self._released = False
+        self._started = False
+        self._states: list = []
+        self.clock = SyncClock(self._position, mono=mono, grace=grace, on_give_up=self._give_up)
+
+    # -- public ---------------------------------------------------------
+
+    @property
+    def output(self) -> Optional[AudioOutput]:
+        """The open sound output (``None`` before it opens or without sound)."""
+        return self._output
+
+    @property
+    def states(self) -> list:
+        """Every state reported so far, in order (diagnostics/tests)."""
+        return list(self._states)
+
+    def start(self) -> None:
+        """Open the sound and start decoding; a no-op if started or stopped."""
+        with self._lock:
+            if self._started or self._stopping.is_set():
+                return
+            self._started = True
+            self._thread = threading.Thread(target=self._run, name="preview-audio", daemon=True)
+            self._thread.start()
+
+    def release(self) -> None:
+        """The picture has started: start the sound and the clock. Idempotent."""
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            output = self._output
+        self.clock.start()
+        if output is not None:
+            try:
+                output.resume()
+            except Exception:
+                logger.debug("preview: could not start the sound", exc_info=True)
+
+    def set_volume(self, volume: float) -> None:
+        with self._lock:
+            self._volume = clamp_volume(volume)
+            output = self._output
+            level = self._volume
+        if output is not None:
+            try:
+                output.set_volume(level)
+            except Exception:
+                logger.debug("preview: could not set the volume", exc_info=True)
+
+    def stop(self, wait: bool = True) -> None:
+        """Silence the sound and kill ffmpeg now; with ``wait``, also join the worker (<= ~1 s).
+
+        ``wait=False`` is for the GUI thread: the worker may be stuck for a
+        moment inside the sound driver (opening a device that is waking up),
+        and it closes the device and reaps ffmpeg by itself once it gets out.
+        """
+        self._halt()
+        if wait:
+            self.join(1.0)
+
+    def join(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the worker to finish; True if it has (or never started)."""
+        thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
+
+    @property
+    def finished(self) -> bool:
+        thread = self._thread
+        return thread is None or not thread.is_alive()
+
+    def fall_behind(self) -> None:
+        """The picture cannot keep step with the sound: drop the sound (``'behind'``)."""
+        if self._stopping.is_set():
+            return
+        self._report("behind")
+        self.clock.detach()
+        self._halt()
+
+    # -- internals ------------------------------------------------------
+
+    def _position(self) -> float:
+        output = self._output
+        return output.position_seconds() if output is not None else 0.0
+
+    def _halt(self) -> None:
+        with self._lock:
+            self._stopping.set()
+            proc, output = self._proc, self._output
+        if proc is not None:
+            _kill_process(proc)
+        if output is not None:
+            try:
+                output.stop()
+            except Exception:
+                logger.debug("preview: could not stop the sound", exc_info=True)
+
+    def _give_up(self) -> None:
+        """The sound never started (clock callback): drop it, keep the picture."""
+        if self._stopping.is_set():
+            return
+        self._report("failed")
+        self._halt()
+
+    def _report(self, state: str) -> None:
+        if self._stopping.is_set():
+            return
+        self._states.append(state)
+        if self._on_status is not None:
+            try:
+                self._on_status(state)
+            except Exception:
+                logger.exception("preview: on_status callback raised")
+
+    def _silent(self, state: str) -> None:
+        self.clock.detach()
+        self._report(state)
+
+    def _open_output(self) -> Optional[AudioOutput]:
+        try:
+            output = self._factory()
+        except Exception:
+            logger.info("preview: no sound output", exc_info=True)
+            return None
+        try:
+            ok = bool(output.open(SAMPLE_RATE, CHANNELS))
+        except Exception:
+            logger.info("preview: the sound output did not open", exc_info=True)
+            ok = False
+        if not ok or output.is_null:
+            try:
+                output.stop()
+            except Exception:
+                pass
+            return None
+        with self._lock:
+            if self._stopping.is_set():
+                output.stop()
+                return None
+            self._output = output
+            if not self._released:
+                output.pause()  # pre-roll: the device starts with the first frame
+            else:
+                output.resume()  # the picture is already up (a no-op for a running device)
+            output.set_volume(self._volume)
+        return output
+
+    def _launch(self) -> Any:
+        cmd = build_audio_cmd(self._ffmpeg, self._path, self._start)
+        try:
+            proc = self._popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                creationflags=_popen_flags(),
+            )
+        except OSError as exc:
+            logger.info("preview: could not start ffmpeg for sound: %s", exc)
+            return None
+        with self._lock:
+            self._proc = proc
+            stopping = self._stopping.is_set()
+        if stopping:
+            _kill_process(proc)
+        return proc
+
+    def _copy(self, proc: Any, output: AudioOutput) -> bool:
+        """Pipe -> output until the track ends or we stop; True if any sound came."""
+        frame = CHANNELS * SAMPLE_BYTES
+        block = int(getattr(output, "buffer_bytes", 0) or (SAMPLE_RATE // 20) * frame)
+        block = max(frame, block - block % frame)
+        buf = bytearray(block)
+        view = memoryview(buf)
+        got_any = False
+        while not self._stopping.is_set():
+            got, broken = _read_exactly(proc.stdout, view, block)
+            usable = got - got % frame
+            if usable:
+                got_any = True
+                if output.write(view[:usable]) < usable:
+                    break  # stopped while waiting for room
+            if got < block or broken:
+                break
+        return got_any
+
+    @staticmethod
+    def _exit_code(proc: Any) -> Optional[int]:
+        """ffmpeg's exit status once its output has ended (``None`` if unknown)."""
+        try:
+            return proc.wait(timeout=2.0)
+        except Exception:
+            return None
+
+    def _run(self) -> None:
+        output: Optional[AudioOutput] = None
+        proc: Any = None
+        try:
+            output = self._open_output()
+            if output is None:
+                self._silent("unavailable")
+                return
+            proc = self._launch()
+            if proc is None:
+                self._silent("none")
+                return
+            self._report("playing")
+            got_any = self._copy(proc, output)
+            if self._stopping.is_set():
+                return
+            if not got_any:
+                # A clean exit with no samples means the track is over by
+                # ``start`` (a shorter sound track); anything else is a failure.
+                self._silent("past_end" if self._exit_code(proc) == 0 else "none")
+                return
+            output.drain()  # let the device play what it holds (stop() cuts it short)
+            self._silent("ended")
+        except AudioError as exc:
+            logger.info("preview: the sound stopped working: %s", exc)
+            self._silent("failed")
+        except Exception:
+            logger.exception("preview: sound reader crashed")
+            self._silent("failed")
+        finally:
+            if output is not None:
+                try:
+                    output.stop()
+                except Exception:
+                    pass
+            if proc is not None:
+                _kill_process(proc)
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+                try:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # Facade
 # ---------------------------------------------------------------------------
 
@@ -999,12 +1734,17 @@ class PreviewService:
     Three kinds of work run on separate threads so they never block each
     other: interactive frame grabs for scrubbing (latest request wins), row
     poster thumbnails (FIFO) and the filmstrip (sequential, cancellable).
-    Playback is its own ffmpeg process with a dedicated reader thread. All
-    grabs share one :class:`ThumbnailCache`. Every callback runs on a worker
-    thread (see the module docstring); a cache hit is also delivered from the
-    worker thread, never inline on the caller's thread.
+    Playback is its own ffmpeg process with a dedicated reader thread; with
+    sound, a second ffmpeg feeds an :class:`AudioSession` whose clock paces
+    the picture. The sound wave is measured on its own low-priority thread.
+    All grabs share one :class:`ThumbnailCache`. Every callback runs on a
+    worker thread (see the module docstring); a cache hit is also delivered
+    from the worker thread, never inline on the caller's thread.
 
-    ``grab`` is a test seam replacing :func:`grab_frame`.
+    ``grab`` is a test seam replacing :func:`grab_frame`;
+    ``audio_output_factory`` makes the sound output (default: waveOut on
+    Windows, silent elsewhere) and ``popen`` starts the sound and sound-wave
+    ffmpeg processes.
     """
 
     def __init__(
@@ -1014,6 +1754,8 @@ class PreviewService:
         cache_bytes: int = DEFAULT_CACHE_BYTES,
         *,
         grab: Optional[Callable[..., Optional[bytes]]] = None,
+        audio_output_factory: Optional[Callable[[], AudioOutput]] = None,
+        popen: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
@@ -1029,9 +1771,17 @@ class PreviewService:
         self._interactive = FrameScheduler("preview-interactive", grab=self._cached_grab)
         self._posters = _TaskWorker("preview-posters")
         self._filmstrips = _TaskWorker("preview-filmstrip")
+        self._waves = _TaskWorker("preview-waveform")
         self._lock = threading.Lock()
         self._filmstrip_cancel: Optional[threading.Event] = None
         self._session: Optional[PlaybackSession] = None
+        self._sound: Optional[AudioSession] = None
+        self._retired: list = []  # stopped sound sessions whose worker may still be finishing
+        self._audio_factory = audio_output_factory
+        self._popen = popen if popen is not None else subprocess.Popen
+        self._volume = 1.0
+        self._wave_cancel: Optional[threading.Event] = None
+        self._wave_proc: Any = None
         self._closed = False
 
     # -- shared grab ----------------------------------------------------
@@ -1182,37 +1932,253 @@ class PreviewService:
         on_frame: Callable[[float, bytes], None],
         on_end: Callable[[str], None],
         duration: Optional[float] = None,
+        *,
+        audio: bool = False,
+        volume: Optional[float] = None,
+        on_audio: Optional[Callable[[str], None]] = None,
     ) -> PlaybackSession:
-        """Start silent playback at ``start`` seconds, stopping any previous session.
+        """Start playback at ``start`` seconds, stopping any previous session.
 
         Returns the started :class:`PlaybackSession` (callbacks as documented
         there; ``duration`` is how long to play, ``None`` for to the end).
         After :meth:`shutdown` the returned session is already stopped and
         never starts.
+
+        ``audio=True`` also plays the sound (at ``volume``, 0..1; default the
+        last volume set) through an :class:`AudioSession`, and the picture is
+        paced by the sound's clock. ``on_audio(state)`` reports how the sound
+        is doing (see :class:`AudioSession`). Without sound, or if it fails,
+        playback runs silently on real time. When the picture ends for any
+        reason the sound stops too.
         """
+        sound: Optional[AudioSession] = None
+        ended = on_end
+        paced: dict = {}
+        if audio:
+            if volume is not None:
+                self._volume = clamp_volume(volume)
+            sound = AudioSession(
+                self.ffmpeg_path, path, start,
+                volume=self._volume,
+                output_factory=self._audio_factory,
+                on_status=on_audio,
+                popen=self._popen,
+            )
+            paced = {
+                "master_clock": sound.clock,
+                "on_first_frame": sound.release,
+                "on_sync_lost": sound.fall_behind,
+            }
+
+            def ended_with_sound(reason: str, _sound: AudioSession = sound) -> None:
+                _sound.stop(wait=False)
+                on_end(reason)
+
+            ended = ended_with_sound
+
         session = PlaybackSession(
             self.ffmpeg_path, path, start, int(size[0]), int(size[1]), fps_out,
-            on_frame, on_end, duration,
+            on_frame, ended, duration, **paced,
         )
         with self._lock:
-            previous = self._session
+            previous, previous_sound = self._session, self._sound
             closed = self._closed
             self._session = None if closed else session
+            self._sound = None if closed else sound
+        if previous_sound is not None:
+            self._retire_sound(previous_sound)
         if previous is not None:
             previous.stop()
         if closed:
             session.stop()
             return session
+        if sound is not None:
+            sound.start()
         session.start()
         return session
 
-    def stop_playback(self) -> None:
-        """Stop the current playback session, if any."""
+    def _retire_sound(self, sound: AudioSession) -> None:
+        """Silence a sound session without waiting for its worker (GUI thread).
+
+        The worker may be stuck for a moment in the sound driver; it closes
+        the device and reaps its ffmpeg by itself. :meth:`shutdown` waits for
+        any still running.
+        """
+        sound.stop(wait=False)
         with self._lock:
-            session = self._session
+            self._retired = [s for s in self._retired if not s.finished]
+            if not sound.finished:
+                self._retired.append(sound)
+
+    def stop_playback(self) -> None:
+        """Stop the current playback session and its sound, if any.
+
+        The sound goes silent and its ffmpeg is killed at once; this never
+        waits for the sound driver.
+        """
+        with self._lock:
+            session, sound = self._session, self._sound
             self._session = None
+            self._sound = None
+        if sound is not None:
+            self._retire_sound(sound)  # silence first: the picture's reader may take a moment
         if session is not None:
             session.stop()
+
+    def set_volume(self, volume: float) -> None:
+        """Change the sound volume (0..1), now and for later playback."""
+        with self._lock:
+            self._volume = clamp_volume(volume)
+            sound = self._sound
+            level = self._volume
+        if sound is not None:
+            sound.set_volume(level)
+
+    # -- sound wave -----------------------------------------------------
+
+    def request_waveform(
+        self,
+        path: PathLike,
+        duration: float,
+        on_peaks: Callable[[int, list], None],
+        on_done: Optional[Callable[[bool], None]] = None,
+        *,
+        buckets: Optional[int] = None,
+        max_seconds: float = WAVE_MAX_SECONDS,
+    ) -> None:
+        """Measure the loudness of the whole sound track in the background.
+
+        The track is decoded once as low-rate mono PCM (:func:`build_waveform_cmd`,
+        one thread, below-normal priority on Windows) and folded into
+        ``buckets`` peaks (default :func:`waveform_buckets`) of 0..1.
+        ``on_peaks(first_index, peaks)`` delivers runs of finished buckets as
+        they come (a few times a second); ``on_done(complete)`` follows, with
+        ``complete`` False if the track could not be read completely or the
+        ``max_seconds`` budget ran out. Nothing is called after
+        :meth:`cancel_waveform`, a newer request, :meth:`cancel_all` or
+        :meth:`shutdown`, all of which kill ffmpeg. Runs on the
+        ``preview-waveform`` thread.
+        """
+        count = int(buckets) if buckets else waveform_buckets(duration)
+        if count <= 0:
+            return
+        rate = waveform_rate(duration)
+        with self._lock:
+            if self._closed:
+                return
+            if self._wave_cancel is not None:
+                self._wave_cancel.set()
+            cancel = threading.Event()
+            self._wave_cancel = cancel
+        self._kill_wave()
+
+        def task(cancelled: Callable[[], bool]) -> None:
+            def stale() -> bool:
+                return cancel.is_set() or cancelled()
+
+            if stale():
+                return
+            complete = self._measure_wave(path, duration, rate, count, max_seconds, on_peaks, stale)
+            if on_done is not None and not stale():
+                on_done(complete)
+
+        if not self._waves.submit(task):
+            cancel.set()
+
+    def _measure_wave(
+        self,
+        path: PathLike,
+        duration: float,
+        rate: int,
+        count: int,
+        max_seconds: float,
+        on_peaks: Callable[[int, list], None],
+        stale: Callable[[], bool],
+    ) -> bool:
+        reducer = PeakReducer(int(round(float(duration) * rate)), count)
+        flags = _popen_flags() | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+        try:
+            proc = self._popen(
+                build_waveform_cmd(self.ffmpeg_path, path, rate),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+                creationflags=flags,
+            )
+        except OSError as exc:
+            logger.info("preview: could not start ffmpeg for the sound wave: %s", exc)
+            return False
+        with self._lock:
+            self._wave_proc = proc
+        if stale():
+            _kill_process(proc)
+        pending: list = []
+
+        def flush() -> None:
+            if pending and not stale():
+                on_peaks(pending[0][0], [peak for _index, peak in pending])
+            pending.clear()
+
+        complete = False
+        began = last = time.monotonic()
+        try:
+            while not stale():
+                try:
+                    chunk = proc.stdout.read(65536)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    pending.extend(reducer.finish())
+                    complete = reducer.index > 0 and self._exit_ok(proc)
+                    break
+                pending.extend(reducer.feed(chunk))
+                now = time.monotonic()
+                if now - last >= 0.25:
+                    flush()
+                    last = now
+                if now - began > max_seconds:
+                    logger.info("preview: sound wave took too long; keeping what was measured")
+                    break
+            flush()
+        finally:
+            _kill_process(proc)
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            with self._lock:
+                if self._wave_proc is proc:
+                    self._wave_proc = None
+        return complete and not stale()
+
+    @staticmethod
+    def _exit_ok(proc: Any) -> bool:
+        try:
+            rc = proc.wait(timeout=2.0)
+        except Exception:
+            return True  # it produced the whole stream; the exit code is a detail
+        return rc in (0, None)
+
+    def _kill_wave(self) -> None:
+        with self._lock:
+            proc = self._wave_proc
+        if proc is not None:
+            _kill_process(proc)
+
+    def cancel_waveform(self) -> None:
+        """Stop measuring the sound wave (kills ffmpeg); nothing more is delivered."""
+        with self._lock:
+            cancel = self._wave_cancel
+            self._wave_cancel = None
+        if cancel is not None:
+            cancel.set()
+        self._kill_wave()
 
     # -- lifecycle ------------------------------------------------------
 
@@ -1225,7 +2191,8 @@ class PreviewService:
         self._interactive.cancel()
 
     def cancel_all(self) -> None:
-        """Cancel pending/running grabs, posters, the filmstrip and playback.
+        """Cancel pending/running grabs, posters, the filmstrip, the sound wave
+        and playback (with its sound).
 
         The service stays usable afterwards (e.g. to switch to another file).
         """
@@ -1233,6 +2200,8 @@ class PreviewService:
         self._posters.clear()
         self.cancel_filmstrip()
         self._filmstrips.clear()
+        self.cancel_waveform()
+        self._waves.clear()
         self._tracker.kill_all()
         self.stop_playback()
 
@@ -1240,19 +2209,27 @@ class PreviewService:
         """Kill every process and stop every thread; idempotent.
 
         Blocks at most about ``timeout`` seconds in total (plus the playback
-        reader's one second join). Nothing is delivered afterwards.
+        reader's one second join); stopped sound sessions still finishing get
+        the rest of ``timeout``. Nothing is delivered afterwards.
         """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
         self.cancel_filmstrip()
+        self.cancel_waveform()
         self.stop_playback()
         self._interactive.signal_shutdown()
         self._posters.signal_shutdown()
         self._filmstrips.signal_shutdown()
+        self._waves.signal_shutdown()
         self._tracker.close()
+        self._kill_wave()
         deadline = time.monotonic() + max(0.0, timeout)
-        for worker in (self._interactive, self._posters, self._filmstrips):
+        for worker in (self._interactive, self._posters, self._filmstrips, self._waves):
             worker.join(max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            retired, self._retired = self._retired, []
+        for sound in retired:
+            sound.join(max(0.0, deadline - time.monotonic()))
         self.cache.clear()

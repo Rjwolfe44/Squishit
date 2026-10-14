@@ -35,6 +35,15 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _percent(value, default: int) -> int:
+    """A 0-100 whole number from a saved setting, or ``default`` for junk."""
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, min(100, number))
+
+
 @dataclass
 class AppConfig:
     """Application configuration settings."""
@@ -85,6 +94,11 @@ class AppConfig:
     open_folder_when_done: bool = False
     last_output_folder: str = ""
 
+    # Trim editor preview
+    editor_sound_on: bool = True
+    editor_volume: int = 80  # percent
+    editor_sound_wave: bool = True
+
     # Logging
     log_level: str = "INFO"
     log_to_file: bool = True
@@ -132,6 +146,9 @@ class AppConfig:
             "batch_queue_order": self.batch_queue_order,
             "open_folder_when_done": self.open_folder_when_done,
             "last_output_folder": self.last_output_folder,
+            "editor_sound_on": self.editor_sound_on,
+            "editor_volume": self.editor_volume,
+            "editor_sound_wave": self.editor_sound_wave,
         }
     
     @classmethod
@@ -174,6 +191,9 @@ class AppConfig:
             batch_queue_order=data.get("batch_queue_order", "manual"),
             open_folder_when_done=data.get("open_folder_when_done", False),
             last_output_folder=data.get("last_output_folder", ""),
+            editor_sound_on=bool(data.get("editor_sound_on", True)),
+            editor_volume=_percent(data.get("editor_volume", 80), 80),
+            editor_sound_wave=bool(data.get("editor_sound_wave", True)),
         )
 
 

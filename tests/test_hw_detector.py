@@ -174,8 +174,15 @@ def test_missing_wmic_reports_rx_9070_xt_and_prefers_amf(monkeypatch, quiet_tool
     assert "software" not in status.using.lower()
 
 
-def test_rx_9070_xt_selects_av1_amf_when_ffmpeg_lists_it(monkeypatch, quiet_tools):
-    """Fast hardware AV1 on Deus: the 9070 XT advertises AV1 and FFmpeg has av1_amf."""
+def test_rx_9070_xt_selects_av1_amf_when_its_test_encode_passes(
+    monkeypatch, quiet_tools, working_av1_hardware
+):
+    """Fast AV1 on Deus: av1_amf passes the test encode, NVENC and QSV fail.
+
+    Changed with the hardware check: FFmpeg listing av1_amf plus a 9070 XT
+    name used to be enough. Now av1_amf is picked only after its test encode
+    passes, and the AMD iGPU next to it does not matter.
+    """
 
     _install_queries(monkeypatch, cim=_cim_bytes(_DEUS_ADAPTERS), wmic=None)
     detector = HardwareDetector()
@@ -189,9 +196,15 @@ def test_rx_9070_xt_selects_av1_amf_when_ffmpeg_lists_it(monkeypatch, quiet_tool
         _FFMPEG_STUBS
         | {"av1_nvenc", "av1_qsv", "av1_amf", "libsvtav1", "libaom-av1"},
     )
+    # Listed and named is not enough: no test encode passed yet.
+    assert compressor._select_hw_encoder(VideoCodec.AV1) is None
+
+    compressor.av1_probe = working_av1_hardware("av1_amf")
     assert compressor._select_hw_encoder(VideoCodec.AV1) == "av1_amf"
     assert compressor._select_hw_encoder(VideoCodec.SVT_AV1) is None
     assert compressor._select_hw_encoder(VideoCodec.H264) == "h264_amf"
+    assert compressor.av1_probe.peek("av1_nvenc").ok is False
+    assert compressor.av1_probe.peek("av1_qsv").ok is False
 
 
 def test_no_display_adapter_stays_on_software_despite_ffmpeg_stubs(

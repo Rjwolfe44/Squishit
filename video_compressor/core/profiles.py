@@ -12,6 +12,7 @@ from .codecs import VideoCodec, AudioCodec, CodecSettings, RateControl, AudioMod
 from .descriptions import STREAMING_UPLOAD_DESCRIPTION, YOUTUBE_UPLOAD_DESCRIPTION
 from .quality_ladder import (
     ARCHIVAL_PROFILE_NAME,
+    LEGACY_FAST_AV1_RUNGS,
     PROFILE_FLAG_RUNGS,
     QUICK_COMPRESS_LITE_LABEL,
     QUICK_COMPRESS_MAX_LABEL,
@@ -25,6 +26,44 @@ from ..config import PROFILES_DIR, AppConfig
 # themselves; missing keys must not silently switch to that preset.
 _DEFAULT_AUDIO_CODEC = CodecSettings.__dataclass_fields__["audio_codec"].default
 _DEFAULT_AUDIO_BITRATE = AppConfig.__dataclass_fields__["default_audio_bitrate"].default
+
+# Written by ``to_dict``. 2 = Fast AV1 numbers are SVT-AV1 CRF/preset; files
+# without it were saved by 2.1.0 or older, when Fast AV1 meant libaom.
+PROFILE_SETTINGS_VERSION = 2
+
+
+def migrate_saved_profile_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Bring a profile dict read from disk up to the current settings.
+
+    Only a file from before ``settings_version`` 2 whose Fast AV1 CRF/preset
+    is exactly one of 2.1.0's libaom rungs is changed: it takes that rung's
+    current SVT-AV1 numbers instead of running as a slow custom preset. A
+    profile saved by this version is never rewritten, so a new custom
+    CRF 26 / preset 8 stays as typed.
+    """
+
+    if not isinstance(data, dict):
+        return data
+    try:
+        version = int(data.get("settings_version") or 1)
+    except (TypeError, ValueError):
+        version = 1
+    if version >= PROFILE_SETTINGS_VERSION:
+        return data
+    if str(data.get("video_codec") or "").lower() != VideoCodec.AV1.value:
+        return data
+    try:
+        pair = (int(data.get("crf")), str(data.get("preset")))
+    except (TypeError, ValueError):
+        return data
+    rung = LEGACY_FAST_AV1_RUNGS.get(pair)
+    if rung is None:
+        return data
+    step = get_step(VideoCodec.AV1, rung)
+    migrated = dict(data)
+    migrated["crf"] = step.crf
+    migrated["preset"] = step.preset
+    return migrated
 
 
 class ProfileType(Enum):
@@ -227,8 +266,14 @@ class CompressionProfile:
             "custom_encoder_opts": self.custom_encoder_opts,
             "profile_level": self.profile_level,
             "codec_profile": self.codec_profile,
+            "settings_version": PROFILE_SETTINGS_VERSION,
         }
-    
+
+    @classmethod
+    def from_saved_dict(cls, data: Dict[str, Any]) -> 'CompressionProfile':
+        """``from_dict`` for a profile read from a file (migrates old Fast AV1 rungs)."""
+        return cls.from_dict(migrate_saved_profile_data(data))
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'CompressionProfile':
         """Create profile from dictionary.
@@ -459,7 +504,7 @@ class ProfileManager:
                 with open(profile_file, 'r') as f:
                     data = yaml.safe_load(f)
                     if data and "name" in data:
-                        profile = CompressionProfile.from_dict(data)
+                        profile = CompressionProfile.from_saved_dict(data)
                         self._profiles[profile.name] = profile
             except Exception as e:
                 print(f"Warning: Failed to load profile {profile_file}: {e}")

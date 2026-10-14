@@ -322,17 +322,19 @@ class _Snapshot:
     clips: Tuple[Clip, ...]
     selected: Optional[int]
     mode: ClipMode
+    keep_audio: bool = True
 
 
 class ClipEditModel:
-    """The clips being edited, plus selection, mode and undo/redo.
+    """The clips being edited, plus selection, mode, the sound choice and undo/redo.
 
     List order is export order (it matters for join mode). Neighbour limits while
     editing use *time* order, so reordering for a join never changes drag limits.
     Starts as one clip covering the whole video unless ``clips`` is given. Every
     edit validates and clamps; a request that cannot be honoured is a no-op that
     returns ``None``/``False``. A ``True``/index result means the request was valid
-    (it may have been clamped, or have left the clip unchanged).
+    (it may have been clamped, or have left the clip unchanged). ``keep_audio``
+    (keep the sound in the saved clips) is an undoable edit like the mode.
     """
 
     UNDO_LIMIT = 100
@@ -343,6 +345,7 @@ class ClipEditModel:
         fps: float = 30.0,
         clips: Optional[Sequence[Clip]] = None,
         mode: ClipMode = ClipMode.SEPARATE,
+        keep_audio: bool = True,
     ) -> None:
         seconds = _finite(duration)
         self._dur_ms = int(math.floor(seconds * 1000.0 + 1e-6))
@@ -362,6 +365,7 @@ class ClipEditModel:
         self._clips: Tuple[Clip, ...] = initial or (Clip(0.0, self.duration),)
         self._selected: Optional[int] = 0
         self._mode = ClipMode(mode)
+        self._keep_audio = bool(keep_audio)
 
         self._undo: List[_Snapshot] = []
         self._redo: List[_Snapshot] = []
@@ -377,7 +381,7 @@ class ClipEditModel:
         """Model for an existing plan (``None`` or empty means the whole video)."""
         if plan is None or not plan.clips:
             return cls(duration, fps)
-        return cls(duration, fps, plan.clips, plan.mode)
+        return cls(duration, fps, plan.clips, plan.mode, getattr(plan, "keep_audio", True))
 
     # ── state ────────────────────────────────────────────────────────────────
 
@@ -392,6 +396,11 @@ class ClipEditModel:
     @property
     def mode(self) -> ClipMode:
         return self._mode
+
+    @property
+    def keep_audio(self) -> bool:
+        """True to keep the sound in the saved clips."""
+        return self._keep_audio
 
     @property
     def count(self) -> int:
@@ -502,7 +511,7 @@ class ClipEditModel:
         return lo, hi
 
     def _snapshot(self) -> _Snapshot:
-        return _Snapshot(self._clips, self._selected, self._mode)
+        return _Snapshot(self._clips, self._selected, self._mode, self._keep_audio)
 
     def _push_undo(self, snap: _Snapshot) -> None:
         self._undo.append(snap)
@@ -510,11 +519,17 @@ class ClipEditModel:
             del self._undo[0]
 
     def _commit(
-        self, clips: Tuple[Clip, ...], selected: Optional[int], mode: ClipMode
+        self,
+        clips: Tuple[Clip, ...],
+        selected: Optional[int],
+        mode: ClipMode,
+        keep_audio: Optional[bool] = None,
     ) -> bool:
         """Apply a new state. Records undo (or marks the open gesture dirty) when
-        clips or mode changed; selection alone never creates an undo step."""
-        changed = clips != self._clips or mode != self._mode
+        clips, mode or the sound choice changed; selection alone never creates an
+        undo step. ``keep_audio=None`` keeps the current sound choice."""
+        keep = self._keep_audio if keep_audio is None else bool(keep_audio)
+        changed = clips != self._clips or mode != self._mode or keep != self._keep_audio
         if not changed and selected == self._selected:
             return False
         if changed:
@@ -524,6 +539,7 @@ class ClipEditModel:
                 self._push_undo(self._snapshot())
                 self._redo.clear()
         self._clips, self._selected, self._mode = clips, selected, mode
+        self._keep_audio = keep
         self._notify()
         return True
 
@@ -720,6 +736,11 @@ class ClipEditModel:
         self._commit(self._clips, self._selected, new_mode)
         return True
 
+    def set_keep_audio(self, keep: bool) -> bool:
+        """Keep (True) or leave out (False) the sound in the saved clips (undoable)."""
+        self._commit(self._clips, self._selected, self._mode, bool(keep))
+        return True
+
     def select(self, index: Optional[int]) -> bool:
         """Select a clip (``None`` clears). Not an undo step."""
         if index is not None and not self._valid(index):
@@ -763,7 +784,11 @@ class ClipEditModel:
         self._gesture_base, self._gesture_dirty = None, False
         if not dirty or base is None:
             return False
-        if base.clips == self._clips and base.mode == self._mode:
+        if (
+            base.clips == self._clips
+            and base.mode == self._mode
+            and base.keep_audio == self._keep_audio
+        ):
             return False  # dragged away and back: nothing to undo
         self._push_undo(base)
         self._redo.clear()
@@ -797,18 +822,23 @@ class ClipEditModel:
 
     def _restore(self, snap: _Snapshot) -> None:
         self._clips, self._selected, self._mode = snap.clips, snap.selected, snap.mode
+        self._keep_audio = snap.keep_audio
         self._notify()
 
     # ── output ───────────────────────────────────────────────────────────────
 
     def to_plan(self) -> Optional[ClipPlan]:
-        """The plan to encode, or ``None`` when the whole video is kept as is."""
+        """The plan to encode, or ``None`` when the whole video is kept as is.
+
+        Leaving the sound out changes the output, so a whole-video clip without
+        sound is still a plan.
+        """
         clips = normalize_clips(self._clips, self.duration)
         if not clips:
             return None
-        if len(clips) == 1 and self._covers_whole(clips[0]):
+        if len(clips) == 1 and self._covers_whole(clips[0]) and self._keep_audio:
             return None
-        return ClipPlan(clips, self._mode)
+        return ClipPlan(clips, self._mode, self._keep_audio)
 
 
 # ── text helpers ─────────────────────────────────────────────────────────────
@@ -839,14 +869,17 @@ def describe_selection(
 ) -> str:
     """One-line summary such as ``3 clips · 1:23 of 10:00 · about 143.05 MB of source``.
 
-    The size part appears only when ``source_size_bytes`` is given; it is the
-    source size scaled by the share of the video the clips cover.
+    ``no sound`` follows the length when the clips leave the sound out. The
+    size part appears only when ``source_size_bytes`` is given; it is the source
+    size scaled by the share of the video the clips cover.
     """
     count = model.count
     parts = [
         f"{count} clip" if count == 1 else f"{count} clips",
         f"{_clock(model.total_duration)} of {_clock(model.duration)}",
     ]
+    if not getattr(model, "keep_audio", True):
+        parts.append("no sound")
     if source_size_bytes and source_size_bytes > 0 and model.duration > 0:
         share = min(model.total_duration, model.duration) / model.duration
         parts.append(f"about {format_size(source_size_bytes * share)} of source")

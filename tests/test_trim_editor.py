@@ -17,8 +17,9 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from video_compressor.core.clips import MAX_JOIN_CLIPS, Clip, ClipMode, ClipPlan
+from video_compressor.core.preview import waveform_buckets
 from video_compressor.gui.qt_shell import trim_editor as te
-from video_compressor.gui.qt_shell.timeline import RULER_H
+from video_compressor.gui.qt_shell.timeline import RULER_H, TRACK_H, WAVE_H
 
 
 class StubPreview:
@@ -28,10 +29,16 @@ class StubPreview:
         self.frames: list[tuple[float, bool]] = []
         self.filmstrips: list[int] = []
         self.playbacks: list[float] = []
+        self.sound: list[dict] = []  # the sound options of each playback
+        self.volumes: list[float] = []
+        self.waves: list[tuple] = []
+        self.wave_callbacks: list[tuple] = []
+        self.wave_cancels = 0
         self.stopped = 0
         self.cancelled = 0
         self.on_frame = None
         self.on_end = None
+        self.on_audio = None
 
     def request_frame(self, path, t, size, *, fast, callback, duration=None, fps=None):
         self.frames.append((round(t, 3), fast))
@@ -44,9 +51,21 @@ class StubPreview:
         if on_done:
             on_done()
 
-    def start_playback(self, path, start, size, fps_out, on_frame, on_end, duration=None):
+    def start_playback(self, path, start, size, fps_out, on_frame, on_end, duration=None, **sound):
         self.playbacks.append(start)
+        self.sound.append(sound)
         self.on_frame, self.on_end = on_frame, on_end
+        self.on_audio = sound.get("on_audio")
+
+    def set_volume(self, volume):
+        self.volumes.append(volume)
+
+    def request_waveform(self, path, duration, on_peaks, on_done=None, *, buckets=None):
+        self.waves.append((duration, buckets))
+        self.wave_callbacks.append((on_peaks, on_done))
+
+    def cancel_waveform(self):
+        self.wave_cancels += 1
 
     def stop_playback(self):
         self.stopped += 1
@@ -61,8 +80,8 @@ class StubPreview:
         self.frames_cancelled = getattr(self, "frames_cancelled", 0) + 1
 
 
-def _info(duration=60.0):
-    return SimpleNamespace(
+def _info(duration=60.0, audio=False):
+    info = SimpleNamespace(
         video_codec="h264",
         duration=duration,
         fps=30.0,
@@ -73,6 +92,31 @@ def _info(duration=60.0):
         rotation=0,
         sar="1:1",
     )
+    if audio:
+        info.audio_codec = "aac"
+    return info
+
+
+@pytest.fixture(autouse=True)
+def sound_settings(monkeypatch):
+    """Default sound settings in memory; saving is recorded and never touches the real config."""
+
+    from video_compressor.config import AppConfig
+
+    config = AppConfig()
+    saved: list = []
+
+    class Manager:
+        def update_config(self, **changes):
+            saved.append(changes)
+            for key, value in changes.items():
+                setattr(config, key, value)
+
+    monkeypatch.setattr(te, "get_config", lambda: config)
+    monkeypatch.setattr(te, "get_config_manager", lambda: Manager())
+    monkeypatch.setattr("video_compressor.config.ConfigManager.update_config", lambda self, **kw: None)
+    monkeypatch.setattr("video_compressor.config.ConfigManager.save_config", lambda self: None)
+    return SimpleNamespace(config=config, saved=saved)
 
 
 @pytest.fixture
@@ -80,10 +124,10 @@ def editor(tmp_path):
     app = QApplication.instance() or QApplication([])
     made = []
 
-    def make(plan=None, duration=60.0, note=""):
+    def make(plan=None, duration=60.0, note="", audio=False):
         preview = StubPreview()
         dialog = te.TrimEditorDialog(
-            None, tmp_path / "movie.mp4", _info(duration), plan, preview, target_note=note
+            None, tmp_path / "movie.mp4", _info(duration, audio), plan, preview, target_note=note
         )
         dialog.show()
         app.processEvents()
@@ -642,3 +686,261 @@ def test_closing_leaves_the_shared_preview_service_usable(editor):
     dialog.done(0)
     assert getattr(preview, "frames_cancelled", 0) >= 1
     assert preview.cancelled >= 1  # only the filmstrip, not "everything"
+
+
+# ── sound ────────────────────────────────────────────────────────────────────
+
+
+def _frame_bytes(dialog) -> bytes:
+    return bytes(dialog._frame_size[0] * dialog._frame_size[1] * 3)
+
+
+def test_a_video_without_sound_hides_the_sound_controls(editor):
+    dialog, preview, app = editor()
+    assert dialog.has_audio is False
+    for widget in (dialog.sound_btn, dialog.volume_slider, dialog.wave_check, dialog.keep_audio_check):
+        assert widget.isHidden()
+    assert dialog.sound_note.text() == "This video has no sound."
+    assert not dialog.timeline.wave_visible and preview.waves == []
+    QTest.keyClick(dialog, Qt.Key.Key_M)  # nothing to mute
+    assert dialog._sound_on is True
+    dialog.toggle_play()
+    assert preview.sound == [{}]  # silent playback exactly as before
+    dialog.toggle_play()
+    dialog.seek(10.0)
+    dialog.set_in()
+    dialog.save()
+    assert dialog.result_plan().keep_audio is True
+
+
+def test_a_saved_silent_plan_of_a_video_without_sound_keeps_the_sound_flag_on(editor):
+    plan = ClipPlan((Clip(5, 10),), ClipMode.SEPARATE, keep_audio=False)
+    dialog, preview, app = editor(plan)
+    assert dialog.model.keep_audio is True  # there is no sound to leave out
+    assert "no sound" not in dialog.summary.text()
+
+
+def test_sound_plays_with_the_picture_at_the_remembered_volume(editor, sound_settings):
+    sound_settings.config.editor_volume = 40
+    dialog, preview, app = editor(audio=True)
+    assert not dialog.sound_btn.isHidden() and dialog.sound_btn.text() == "Sound on"
+    assert dialog.volume_slider.value() == 40 and dialog.volume_slider.isEnabled()
+    assert dialog.sound_note.text() == ""
+    dialog.seek(5.0)
+    dialog.toggle_play()
+    options = preview.sound[-1]
+    assert options["audio"] is True and options["volume"] == pytest.approx(0.4)
+    preview.on_audio("unavailable")
+    app.processEvents()
+    assert "No sound device" in dialog.sound_note.text()
+    preview.on_audio("playing")
+    app.processEvents()
+    assert dialog.sound_note.text() == ""
+    preview.on_frame(6.0, _frame_bytes(dialog))
+    app.processEvents()
+    assert dialog._t == pytest.approx(6.0)
+    stale = preview.on_audio
+    dialog.toggle_play()  # pause
+    stale("failed")  # a report from the stopped session
+    app.processEvents()
+    assert dialog.sound_note.text() == ""
+    assert sound_settings.saved == []  # nothing changed, nothing written
+
+
+def test_m_turns_the_sound_off_and_on_and_is_remembered(editor, sound_settings):
+    dialog, preview, app = editor(audio=True)
+    QTest.keyClick(dialog, Qt.Key.Key_M)
+    assert dialog.sound_on is False
+    assert sound_settings.saved == [{"editor_sound_on": False}]
+    assert dialog.sound_btn.text() == "Sound off" and not dialog.volume_slider.isEnabled()
+    assert dialog.sound_note.text() == "Sound is off. Press M to turn it on."
+    dialog.toggle_play()
+    assert preview.sound[-1] == {}  # sound off: no sound pipeline at all
+    stops = preview.stopped
+    QTest.keyClick(dialog, Qt.Key.Key_M)  # while playing: restart from here with sound
+    assert sound_settings.saved[-1] == {"editor_sound_on": True}
+    assert preview.stopped == stops + 1
+    assert preview.sound[-1]["audio"] is True and dialog._playing
+    assert len(preview.playbacks) == 2
+
+
+def test_the_editor_opens_muted_when_it_was_left_muted(editor, sound_settings):
+    sound_settings.config.editor_sound_on = False
+    sound_settings.config.editor_volume = 15
+    dialog, preview, app = editor(audio=True)
+    assert dialog.sound_on is False and dialog.sound_btn.text() == "Sound off"
+    assert dialog.volume_slider.value() == 15
+    dialog.sound_btn.click()
+    assert dialog.sound_on is True
+
+
+def test_the_volume_slider_applies_at_once_and_is_saved_when_it_settles(editor, sound_settings):
+    dialog, preview, app = editor(audio=True)
+    dialog.volume_slider.setValue(30)
+    assert preview.volumes[-1] == pytest.approx(0.3)
+    assert sound_settings.saved == []  # not on every step of a drag
+    QTest.qWait(te.VOLUME_SAVE_MS + 150)
+    assert sound_settings.saved == [{"editor_volume": 30}]
+    dialog.volume_slider.setValue(55)
+    dialog.done(0)  # closing right away still keeps the last value
+    assert sound_settings.saved[-1] == {"editor_volume": 55}
+
+
+def test_scrubbing_and_frame_steps_stay_silent(editor):
+    dialog, preview, app = editor(audio=True)
+    dialog.step_frames(3)
+    dialog.step_seconds(1)
+    dialog.timeline.scrubbing.emit(12.0)
+    dialog.timeline.scrubFinished.emit(12.0)
+    assert preview.playbacks == [] and preview.sound == []
+
+
+def test_the_sound_wave_is_measured_and_drawn_under_the_filmstrip(editor):
+    dialog, preview, app = editor(audio=True)
+    timeline = dialog.timeline
+    assert dialog.wave_check.isChecked() and timeline.wave_visible
+    assert timeline.height() == RULER_H + TRACK_H + WAVE_H + 6
+    count = waveform_buckets(60.0)
+    assert preview.waves == [(60.0, count)]
+    on_peaks, on_done = preview.wave_callbacks[-1]
+    on_peaks(0, [0.5] * 1000)  # from the worker thread, in pieces
+    on_peaks(1000, [0.0] * 1000)
+    app.processEvents()
+    assert timeline.wave_measured == 2000
+    assert timeline._wave_message == "Reading the sound…"
+    on_peaks(2000, [1.0] * (count - 2000))
+    on_done(True)
+    app.processEvents()
+    assert timeline.wave_measured == count and timeline._wave_message == ""
+    assert not timeline.grab().isNull()
+    lines = timeline._wave_lines(timeline.width(), WAVE_H)
+    assert lines and all(line.x1() == line.x2() for line in lines)
+    timeline.zoom(8.0)
+    timeline.set_playhead(30.0, follow=True)
+    assert not timeline.grab().isNull()
+
+
+def test_a_sound_wave_that_cannot_be_read_says_so(editor):
+    dialog, preview, app = editor(audio=True)
+    on_peaks, on_done = preview.wave_callbacks[-1]
+    on_done(False)
+    app.processEvents()
+    assert dialog.timeline._wave_message == "The sound could not be read."
+    assert not dialog.timeline.grab().isNull()
+
+
+def test_hiding_the_sound_wave_stops_the_work_and_is_remembered(editor, sound_settings):
+    dialog, preview, app = editor(audio=True)
+    old_peaks, old_done = preview.wave_callbacks[-1]
+    dialog.wave_check.setChecked(False)
+    assert sound_settings.saved == [{"editor_sound_wave": False}]
+    assert preview.wave_cancels == 1 and not dialog.timeline.wave_visible
+    assert dialog.timeline.height() == RULER_H + TRACK_H + 6
+    dialog.wave_check.setChecked(True)  # shown again: measured again from the start
+    assert len(preview.waves) == 2 and dialog.timeline.wave_visible
+    old_peaks(0, [0.9] * 10)  # late results of the cancelled run are ignored
+    old_done(True)
+    app.processEvents()
+    assert dialog.timeline.wave_measured == 0 and dialog._wave_running
+
+
+def test_the_sound_wave_stays_hidden_when_it_was_switched_off(editor, sound_settings):
+    sound_settings.config.editor_sound_wave = False
+    dialog, preview, app = editor(audio=True)
+    assert not dialog.wave_check.isChecked() and not dialog.timeline.wave_visible
+    assert preview.waves == []  # no work for a lane nobody sees
+
+
+def test_including_the_sound_is_a_choice_saved_on_the_plan(editor):
+    plan = ClipPlan((Clip(5, 15), Clip(20, 30)), ClipMode.JOIN)
+    dialog, preview, app = editor(plan, audio=True)
+    assert not dialog.keep_audio_check.isHidden() and dialog.keep_audio_check.isChecked()
+    dialog.keep_audio_check.setChecked(False)
+    assert dialog.model.keep_audio is False
+    assert "no sound" in dialog.summary.text()
+    dialog.undo()  # an ordinary edit: undo brings the sound back
+    assert dialog.model.keep_audio is True and dialog.keep_audio_check.isChecked()
+    dialog.redo()
+    assert not dialog.keep_audio_check.isChecked()
+    dialog.save()
+    result = dialog.result_plan()
+    assert result.keep_audio is False and result.mode is ClipMode.JOIN and result.count == 2
+
+
+def test_the_whole_video_without_sound_is_still_a_change(editor, monkeypatch):
+    dialog, preview, app = editor(audio=True)
+    dialog.keep_audio_check.setChecked(False)
+    asked: list = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: (asked.append(1), QMessageBox.StandardButton.No)[1]),
+    )
+    dialog.reject()
+    assert asked  # an unsaved change
+    dialog.save()
+    plan = dialog.result_plan()
+    assert plan is not None and plan.keep_audio is False
+    assert plan.count == 1 and plan.clips[0].start == 0.0 and plan.clips[0].end == pytest.approx(60.0)
+
+
+def test_a_plan_without_sound_reopens_unticked(editor):
+    plan = ClipPlan((Clip(5, 15),), ClipMode.SEPARATE, keep_audio=False)
+    dialog, preview, app = editor(plan, audio=True)
+    assert not dialog.keep_audio_check.isChecked()
+    assert "no sound" in dialog.summary.text()
+    dialog.save()
+    assert dialog.result_plan().keep_audio is False
+
+
+def test_clip_edges_can_be_dragged_in_the_sound_wave_lane(editor):
+    dialog, preview, app = editor(audio=True)
+    timeline = dialog.timeline
+    lane_y = RULER_H + TRACK_H + WAVE_H // 2
+    _drag(timeline, timeline.view.time_to_x(60.0) - 3, timeline.view.time_to_x(40.0), y=lane_y)
+    assert dialog.model.clips[0].end == pytest.approx(40.0, abs=0.6)
+
+
+def test_closing_stops_the_sound_wave_too(editor):
+    dialog, preview, app = editor(audio=True)
+    dialog.done(0)
+    assert preview.wave_cancels >= 1 and preview.stopped >= 1
+
+
+def test_use_whole_video_keeps_an_unticked_sound_choice(editor):
+    plan = ClipPlan((Clip(5, 10), Clip(20, 30)), ClipMode.JOIN)
+    dialog, preview, app = editor(plan, audio=True)
+    assert "without its sound" not in dialog.whole_btn.toolTip()
+    dialog.keep_audio_check.setChecked(False)
+    assert "without its sound" in dialog.whole_btn.toolTip()
+    dialog.use_whole_video()
+    result = dialog.result_plan()
+    assert result == ClipPlan((Clip(0.0, 60.0),), ClipMode.SEPARATE, keep_audio=False)
+    assert dialog.result() == dialog.DialogCode.Accepted
+
+
+def test_use_whole_video_with_the_sound_ticked_is_no_change(editor):
+    dialog, preview, app = editor(ClipPlan((Clip(5, 10),), keep_audio=False), audio=True)
+    dialog.keep_audio_check.setChecked(True)
+    dialog.use_whole_video()
+    assert dialog.result_plan() is None
+
+
+@pytest.mark.parametrize(
+    "state, words",
+    [
+        ("past_end", "The sound ends before this point."),
+        ("none", "could not be read"),
+        ("behind", "cannot show the picture fast enough"),
+        ("ended", ""),
+    ],
+)
+def test_the_sound_note_explains_each_kind_of_silence(editor, state, words):
+    dialog, preview, app = editor(audio=True)
+    dialog.toggle_play()
+    preview.on_audio(state)
+    app.processEvents()
+    if words:
+        assert words in dialog.sound_note.text()
+    else:
+        assert dialog.sound_note.text() == ""

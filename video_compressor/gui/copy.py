@@ -38,9 +38,13 @@ PROFILE_FRIENDLY = {
     "Balanced": "Everyday choice in the full preset list.",
     "Max / Archival": (
         "SVT-AV1, best compression, on the CPU. "
-        "Fast hardware AV1 is a different codec."
+        "Fast AV1 is the quicker AV1 choice."
     ),
 }
+AV1_PLAYBACK_HINT = (
+    "AV1 files need a player with AV1 support: VLC, Edge or Chrome, or "
+    "Windows' free AV1 Video Extension."
+)
 TRAY_HINT = "Closing or minimizing this window does not put SquishIt in the tray."
 TRAY_HELP = (
     "Closing or minimizing this window does not put SquishIt in the tray.\n\n"
@@ -64,6 +68,7 @@ PROGRESS_PHASES: Sequence[str] = ("Queued", "Encoding", "Finishing")
 FINISHING_PROGRESS = 92.0
 
 __all__ = [
+    "AV1_PLAYBACK_HINT",
     "DROP_ZONE_NEXT",
     "DROP_ZONE_TITLE",
     "EMPTY_QUEUE",

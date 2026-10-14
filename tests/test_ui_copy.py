@@ -18,6 +18,7 @@ from video_compressor.core.descriptions import (
 from video_compressor.core.profiles import ProfileManager
 from video_compressor.core.utils import format_time
 from video_compressor.gui.copy import (
+    AV1_PLAYBACK_HINT,
     DROP_ZONE_NEXT,
     DROP_ZONE_TITLE,
     EMPTY_QUEUE,
@@ -97,6 +98,7 @@ def test_profile_and_quick_copy_describes_file_upload(tmp_path):
         EMPTY_QUEUE,
         MORE_PROFILES_TOOLTIP,
         WAITING_FOR_SOFTWARE_FALLBACK,
+        AV1_PLAYBACK_HINT,
         youtube_label,
         youtube_tip,
         streaming_label,

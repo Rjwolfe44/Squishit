@@ -5,8 +5,12 @@ one FFmpeg argument set. Two Max labels stay separate:
 
 * Max / Archival is the SVT-AV1 lane (best compression, CPU). Hardware encode
   stays off. It is not replaced with AMF AV1.
-* The AV1 codec is the fast hardware lane: NVENC, then QSV, then AMF, else
-  libaom. That is not Max / Archival.
+* The AV1 codec is Fast AV1: a hardware AV1 encoder that passed a test
+  encode on this PC (NVENC, then QSV, then AMF), else SVT-AV1 at a fast
+  preset, else libaom in realtime mode, else HEVC. That is not Max /
+  Archival. Its software CRF/preset below are for SVT-AV1; the compressor
+  may pick a faster SVT-AV1 preset on a small CPU or a 4K frame
+  (``fast_av1.fast_av1_svt_preset``), never a slower one.
 * Quick Compress Max is the HEVC lane (``HEVC Max``). Hardware may stay on.
 
 Quick Lite, the fastest Quick Compress button, is the H.264 Quick rung.
@@ -125,6 +129,7 @@ def _step(
     hint: str,
     *,
     force_software: bool = False,
+    hw_cq: Optional[int] = None,
 ) -> LadderStep:
     return LadderStep(
         rung=rung,
@@ -133,7 +138,7 @@ def _step(
         preset=preset,
         allow_hw_accel=not force_software,
         force_software=force_software,
-        hw_cq=crf,
+        hw_cq=crf if hw_cq is None else hw_cq,
         hw_presets=_HW_PRESETS[rung],
         hint=hint,
     )
@@ -176,7 +181,7 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             "10",
             "SVT-AV1 Quick: faster archival encode, larger files "
             "(CRF 32, preset 10). Hardware stays off. "
-            "This is the CPU lane, not fast hardware AV1.",
+            "This is the CPU lane, not Fast AV1.",
             force_software=True,
         ),
         QualityRung.BALANCED: _step(
@@ -186,7 +191,7 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             "8",
             "SVT-AV1 Balanced: default archival tradeoff "
             "(CRF 35, preset 8). Hardware stays off. "
-            "Best compression stays on the CPU, not fast hardware AV1.",
+            "Best compression stays on the CPU, not Fast AV1.",
             force_software=True,
         ),
         QualityRung.MAX: _step(
@@ -195,38 +200,48 @@ _LADDER: Dict[VideoCodec, Dict[QualityRung, LadderStep]] = {
             36,
             "6",
             "Max / Archival: SVT-AV1 (best compression, CPU) at CRF 36, preset 6. "
-            "Hardware stays off. Not the fast hardware AV1 lane. "
+            "Hardware stays off. Not the Fast AV1 lane. "
             "Not Quick Compress Max (HEVC).",
             force_software=True,
         ),
     },
+    # Fast AV1. Software numbers are SVT-AV1 (measured on 10 s of 1080p: SVT
+    # preset 9 beat preset 10 at the same CRF in size and VMAF, at 8x instead
+    # of 9x real time on 32 threads). hw_cq stays 26/30/34; av1_amf turns it
+    # into a q-index (x4) in CodecSettings.
     VideoCodec.AV1: {
         QualityRung.QUICK: _step(
             VideoCodec.AV1,
             QualityRung.QUICK,
-            26,
-            "8",
-            "Fast hardware AV1: NVENC, then QSV, then AMF when hardware is on. "
-            "Software is libaom (CRF 26, cpu-used 8). "
+            30,
+            "10",
+            "Fast AV1 Quick: the graphics card when it passed an AV1 test "
+            "encode (NVENC, then QSV, then AMF), otherwise SVT-AV1 on the "
+            "processor (CRF 30, preset 10, faster on a small CPU). "
             "Not Max / Archival SVT-AV1 (best compression, CPU).",
+            hw_cq=26,
         ),
         QualityRung.BALANCED: _step(
             VideoCodec.AV1,
             QualityRung.BALANCED,
-            30,
-            "6",
-            "Fast hardware AV1: NVENC, then QSV, then AMF when hardware is on. "
-            "Software is libaom (CRF 30, cpu-used 6). "
+            33,
+            "9",
+            "Fast AV1 Balanced: the graphics card when it passed an AV1 test "
+            "encode (NVENC, then QSV, then AMF), otherwise SVT-AV1 on the "
+            "processor (CRF 33, preset 9, faster on a small CPU). "
             "Not Max / Archival SVT-AV1 (best compression, CPU).",
+            hw_cq=30,
         ),
         QualityRung.MAX: _step(
             VideoCodec.AV1,
             QualityRung.MAX,
-            34,
-            "4",
-            "Fast hardware AV1 at its slowest rung: NVENC, then QSV, then AMF "
-            "when hardware is on. Software is libaom (CRF 34, cpu-used 4). "
+            36,
+            "8",
+            "Fast AV1 at its smallest-file rung: the graphics card when it "
+            "passed an AV1 test encode (NVENC, then QSV, then AMF), otherwise "
+            "SVT-AV1 on the processor (CRF 36, preset 8, faster on a small CPU). "
             "Max / Archival is SVT-AV1 (best compression, CPU), not this lane.",
+            hw_cq=34,
         ),
     },
     VideoCodec.H264: {
@@ -330,6 +345,17 @@ def coerce_preset_override(
     if uses_numeric_preset(codec) and not text.isdigit():
         return None
     return text
+
+
+# Fast AV1 rungs up to v2.1.0, when its software encoder was libaom (CRF and
+# cpu-used). These pairs mean nothing on their own today (CRF 26 + preset 8
+# is a fine new custom SVT-AV1 setting), so they are only read when an old
+# profile file is loaded: see ``profiles.migrate_saved_profile_data``.
+LEGACY_FAST_AV1_RUNGS: Dict[tuple, QualityRung] = {
+    (26, "8"): QualityRung.QUICK,
+    (30, "6"): QualityRung.BALANCED,
+    (34, "4"): QualityRung.MAX,
+}
 
 
 def matching_rung(codec: VideoCodec, crf: int, preset: str) -> Optional[QualityRung]:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -335,3 +335,66 @@ def test_audio_only_extensions_hold_the_codec():
     assert get_audio_extension("pcm_s16le") == "wav"
     assert get_audio_extension("aac") == "m4a"
     assert get_audio_extension("alac") == "m4a"
+
+
+# ── keeping or dropping the sound ────────────────────────────────────────────
+
+
+@dataclass
+class _SoundInfo:
+    duration: float = 60.0
+    size: int = 60_000_000
+    fps: float = 30.0
+    frame_count: int = 1800
+    audio_codec: str = "aac"
+    audio_bitrate: int = 128_000
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.audio_codec)
+
+
+def test_a_plan_keeps_the_sound_unless_told_otherwise():
+    plan = ClipPlan((Clip(1, 2),))
+    assert plan.keep_audio is True
+    assert ClipPlan((Clip(1, 2),), ClipMode.JOIN, 0).keep_audio is False  # coerced to bool
+    assert ClipPlan((Clip(1, 2),), keep_audio=False) != plan
+    with pytest.raises(FrozenInstanceError):
+        plan.keep_audio = False  # type: ignore[misc]
+
+
+def test_resolve_keeps_a_silent_whole_video_plan():
+    whole = ClipPlan((Clip(0, 60),), keep_audio=False)
+    resolved = resolve_clip_plan(whole, SimpleNamespace(), 60.0)
+    assert resolved == ClipPlan((Clip(0.0, 60.0),), ClipMode.SEPARATE, False)
+    # With the sound it is still "the whole file, untouched".
+    assert resolve_clip_plan(ClipPlan((Clip(0, 60),)), SimpleNamespace(), 60.0) is None
+
+
+def test_resolve_carries_the_sound_choice_and_legacy_trims_keep_sound():
+    plan = ClipPlan((Clip(5, 10), Clip(20, 25)), ClipMode.JOIN, keep_audio=False)
+    assert resolve_clip_plan(plan, SimpleNamespace(), 60.0).keep_audio is False
+    legacy = SimpleNamespace(trim_enabled=True, trim_start="0:05", trim_end="0:10")
+    assert resolve_clip_plan(None, legacy, 60.0).keep_audio is True
+
+
+def test_separate_jobs_each_carry_the_sound_choice():
+    plan = ClipPlan((Clip(1, 2), Clip(3, 4)), ClipMode.SEPARATE, keep_audio=False)
+    jobs = expand_clip_jobs(plan)
+    assert [job.plan.keep_audio for job in jobs] == [False, False]
+    assert expand_clip_jobs(ClipPlan((Clip(1, 2),), keep_audio=False), force_tokens=True)[0].plan.keep_audio is False
+    joined = ClipPlan(plan.clips, ClipMode.JOIN, keep_audio=False)
+    assert expand_clip_jobs(joined)[0].plan is joined
+
+
+def test_effective_info_of_a_silent_plan_has_no_audio():
+    info = _SoundInfo()
+    silent = effective_media_info(info, ClipPlan((Clip(0, 30),), keep_audio=False))
+    assert silent.duration == 30.0 and silent.audio_codec == "" and silent.audio_bitrate == 0
+    assert silent.has_audio is False
+    loud = effective_media_info(info, ClipPlan((Clip(0, 30),)))
+    assert loud.audio_codec == "aac" and loud.audio_bitrate == 128_000
+    open_end = effective_media_info(info, ClipPlan((Clip(5, math.inf),), keep_audio=False))
+    assert open_end.audio_codec == "" and open_end.duration == 60.0
+    # Infos without audio fields are fine too.
+    assert effective_media_info(_Info(), ClipPlan((Clip(0, 10),), keep_audio=False)).duration == 10.0

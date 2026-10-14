@@ -651,7 +651,8 @@ def test_codec_change_constrains_preset_tune_rate_and_container(editor):
     _set(editor._codec, "svt-av1")
     assert _data(editor._preset) == [str(number) for number in range(14)]
     _set(editor._codec, "av1")
-    assert _data(editor._preset) == [str(number) for number in range(11)]
+    # Fast AV1's software encoder is SVT-AV1 now (presets 0-13), not libaom (0-10).
+    assert _data(editor._preset) == [str(number) for number in range(14)]
     assert "webm" in _data(editor._container)
     for codec in CODEC_CHOICES:
         options = encoder_options(codec)

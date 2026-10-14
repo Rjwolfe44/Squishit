@@ -15,6 +15,8 @@ Budget
     Max, or auto on a large machine) gets ``lp`` equal to the logical CPU
     count. That count is not clamped to physical cores, and the low-RAM 85%
     haircut does not apply to that single job. A wave still splits one budget.
+    Fast AV1 on the CPU (codec ``av1``) resolves auto to ``max`` for a single
+    job on any machine with 8 GB or more, so small PCs get every core.
 
 Admission
     ``EncodeResourceGovernor`` is the live ledger. ``max_concurrent`` is the
@@ -145,6 +147,10 @@ def resolve_governor_mode(
         return "low" if codec_name in {"h264", "libx264"} else "balanced"
 
     if heavy_cpu_codec:
+        if codec_name == "av1" and n_parallel == 1 and total_ram_gb >= 8:
+            # Fast AV1 on the CPU: one job gets every logical CPU, so a 4-thread
+            # PC still encodes 1080p near real time.
+            return "max"
         if n_parallel == 1 and logical >= 12 and total_ram_gb >= 16:
             return "max"
         return "balanced"
@@ -270,11 +276,15 @@ def _svt_single_job_uses_logical_cpus(
     cpu_threads: int,
     total_ram_gb: float,
 ) -> bool:
-    """True when one software SVT-AV1 job should set ``lp`` to every logical CPU."""
+    """True when one software AV1 job should use every logical CPU.
+
+    That is ``lp`` for SVT-AV1 (Max / Archival, and Fast AV1 on the CPU) and
+    ``-threads`` for libaom, Fast AV1's fallback.
+    """
 
     if hw_encoder or n_parallel != 1:
         return False
-    if codec_name not in {"svt-av1", "libsvtav1"}:
+    if codec_name not in {"svt-av1", "libsvtav1", "av1"}:
         return False
     resolved = resolve_governor_mode(
         governor=resource_governor,

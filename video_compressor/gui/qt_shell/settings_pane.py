@@ -23,6 +23,7 @@ from ...core.codecs import AudioCodec, VideoCodec
 from ...core.profiles import CompressionProfile
 from ...core.quality_ladder import profile_picker_label
 from ..copy import (
+    AV1_PLAYBACK_HINT,
     EXTRA_SETTINGS_LABEL,
     MORE_MENU_LABEL,
     MORE_OPTIONS_HINT,
@@ -408,7 +409,7 @@ class SettingsPane(QWidget):
     def _refresh_hints(self) -> None:
         choice = self.form.ladder_choice()
         if choice.codec == VideoCodec.AV1 and not choice.force_software:
-            self._hw.setText("Fast hardware AV1")
+            self._hw.setText("Use the graphics card for AV1 when it can")
         elif choice.codec == VideoCodec.SVT_AV1:
             self._hw.setText("Hardware encode stays off (SVT-AV1, CPU)")
         else:
@@ -423,10 +424,16 @@ class SettingsPane(QWidget):
     def _apply_hw_hint_text(self) -> None:
         detected = (self._detected_hw or "").strip()
         policy = self.form.hw_hint()
-        if not detected:
-            self._hw_hint.setText(policy)
-            return
         choice = self.form.ladder_choice()
+        # Both AV1 lanes write AV1 files; say what plays them.
+        playback = (
+            f"\n\n{AV1_PLAYBACK_HINT}"
+            if choice.codec in (VideoCodec.AV1, VideoCodec.SVT_AV1)
+            else ""
+        )
+        if not detected:
+            self._hw_hint.setText(f"{policy}{playback}")
+            return
         exact = (
             self.form.target_size_enabled
             and self.form.target_size_mode == "exact"
@@ -434,9 +441,9 @@ class SettingsPane(QWidget):
             and not choice.force_software
         )
         if exact:
-            self._hw_hint.setText(f"{detected}\n\n{policy}")
+            self._hw_hint.setText(f"{detected}\n\n{policy}{playback}")
         else:
-            self._hw_hint.setText(detected)
+            self._hw_hint.setText(f"{detected}{playback}")
 
     def _friendly_profile_blurb(self, name: str, description: str) -> str:
         if name in PROFILE_FRIENDLY:

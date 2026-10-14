@@ -2,7 +2,10 @@
 
 The dialog edits a copy. Cancel throws the changes away; "Save clips" hands the
 plan back to the window (``result_plan()``), and "Use whole video" clears it.
-Pictures come from ``core.preview`` (ffmpeg). Playback is silent on purpose.
+Pictures and sound come from ``core.preview`` (ffmpeg). While playing, the
+sound plays too (unless it is turned off) and its clock paces the picture;
+scrubbing and frame steps stay silent. The sound on/off choice, the volume and
+the sound wave lane are remembered in the app config.
 
 Threading: the preview service calls back on worker threads. Everything is
 posted to ``_Bridge`` signals so widgets are only ever touched on the GUI
@@ -14,13 +17,14 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from PySide6.QtCore import QObject, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -31,6 +35,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSizePolicy,
+    QSlider,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -38,8 +43,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.clips import MAX_JOIN_CLIPS, ClipMode, ClipPlan
-from ...core.preview import display_size, filmstrip_count
+from ...config import get_config, get_config_manager
+from ...core.clips import MAX_JOIN_CLIPS, Clip, ClipMode, ClipPlan
+from ...core.preview import display_size, filmstrip_count, waveform_buckets
 from ...core.utils import format_timecode
 from ..timeline_model import (
     ClipEditModel,
@@ -56,6 +62,52 @@ THUMB_MAX = (160, 90)
 THUMB_SLOT_PX = 96
 SCRUB_SETTLE_MS = 120
 NEW_CLIP_SECONDS = 5.0
+VOLUME_SAVE_MS = 600
+DEFAULT_VOLUME = 80
+
+#: What the line under the picture says about the sound.
+SOUND_NOTES = {
+    "no_track": "This video has no sound.",
+    "off": "Sound is off. Press M to turn it on.",
+    "unavailable": "No sound device was found, so the preview is silent.",
+    "none": "The sound could not be read, so the preview is silent.",
+    "past_end": "The sound ends before this point.",
+    "failed": "The sound stopped working, so the preview is silent.",
+    "behind": "This PC cannot show the picture fast enough to keep up with the sound, "
+    "so the rest of this play is silent.",
+}
+
+
+def load_sound_prefs() -> Tuple[bool, int, bool]:
+    """``(sound_on, volume_percent, show_sound_wave)`` remembered from last time."""
+
+    try:
+        config = get_config()
+    except Exception:
+        logger.debug("Could not read the sound settings", exc_info=True)
+        return True, DEFAULT_VOLUME, True
+    try:
+        volume = int(round(float(getattr(config, "editor_volume", DEFAULT_VOLUME))))
+    except (TypeError, ValueError, OverflowError):
+        volume = DEFAULT_VOLUME
+    return (
+        bool(getattr(config, "editor_sound_on", True)),
+        max(0, min(100, volume)),
+        bool(getattr(config, "editor_sound_wave", True)),
+    )
+
+
+def save_sound_prefs(**changes) -> None:
+    """Remember sound settings (``editor_sound_on``, ``editor_volume``, ``editor_sound_wave``)."""
+
+    try:
+        get_config_manager().update_config(**changes)
+    except Exception:
+        logger.debug("Could not save the sound settings", exc_info=True)
+
+
+def _has_sound(info) -> bool:
+    return bool(str(getattr(info, "audio_codec", "") or "").strip())
 
 
 class _Bridge(QObject):
@@ -65,6 +117,9 @@ class _Bridge(QObject):
     thumb = Signal(int, float, int, int, object)
     play_tick = Signal()
     play_end = Signal(int, str)
+    sound_state = Signal(int, str)
+    wave = Signal(int, int, object)
+    wave_done = Signal(int, bool)
 
 
 class _VideoView(QWidget):
@@ -130,7 +185,15 @@ class TrimEditorDialog(QDialog):
         self.duration = float(getattr(info, "duration", 0) or 0)
         fps = float(getattr(info, "avg_fps", 0) or getattr(info, "fps", 0) or 30.0)
         self.fps = fps if 1.0 <= fps <= 240.0 else 30.0
+        self.has_audio = _has_sound(info)
+        if plan is not None and not self.has_audio and not plan.keep_audio:
+            plan = ClipPlan(plan.clips, plan.mode)  # nothing to leave out
         self.model = ClipEditModel.from_plan(plan, self.duration, self.fps)
+        self._sound_on, self._volume, self._wave_on = load_sound_prefs()
+        self._sound_state = ""
+        self._wave_id = 0
+        self._wave_running = False
+        self._wave_done = False
         self._result: Optional[ClipPlan] = None
         self._t = 0.0
         self._playing = False
@@ -152,16 +215,25 @@ class TrimEditorDialog(QDialog):
         self._bridge.thumb.connect(self._on_thumb)
         self._bridge.play_tick.connect(self._drain_play)
         self._bridge.play_end.connect(self._on_play_end)
+        self._bridge.sound_state.connect(self._on_sound_state)
+        self._bridge.wave.connect(self._on_wave)
+        self._bridge.wave_done.connect(self._on_wave_done)
         self._settle = QTimer(self)
         self._settle.setSingleShot(True)
         self._settle.setInterval(SCRUB_SETTLE_MS)
         self._settle.timeout.connect(self._show_exact_frame)
+        self._volume_save = QTimer(self)
+        self._volume_save.setSingleShot(True)
+        self._volume_save.setInterval(VOLUME_SAVE_MS)
+        self._volume_save.timeout.connect(self._save_volume)
 
         self.setWindowTitle(f"Trim — {self.path.name}")
         self._build()
         self._install_shortcuts()
         self._unsubscribe = self.model.subscribe(self._on_model_changed)
         self._on_model_changed()
+        self._refresh_sound()
+        self.timeline.set_wave_visible(self.has_audio and self._wave_on)
         self._place()
         QTimer.singleShot(0, self._start_preview)
         self.video.setFocus()
@@ -245,6 +317,14 @@ class TrimEditorDialog(QDialog):
         ):
             edit_row.addWidget(widget)
         edit_row.addStretch(1)
+        self.wave_check = QCheckBox("Sound wave")
+        self.wave_check.setToolTip("Show how loud the sound is along the timeline")
+        self.wave_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.wave_check.setChecked(self._wave_on)
+        self.wave_check.toggled.connect(self._on_wave_toggled)
+        self.wave_check.setVisible(self.has_audio)
+        edit_row.addWidget(self.wave_check)
+        edit_row.addSpacing(10)
         zoom_label = QLabel("Zoom")
         zoom_label.setObjectName("hint")
         edit_row.addWidget(zoom_label)
@@ -300,14 +380,29 @@ class TrimEditorDialog(QDialog):
         row.addWidget(self._button("+1 s", "Forward one second (Shift+Right)", lambda: self.step_seconds(1)))
         row.addWidget(self._button("End", "Go to the end (End)", lambda: self.seek(self.duration)))
         row.addStretch(1)
+        self.sound_btn = self._button(
+            "Sound on", "Turn the sound on or off (M)", self.toggle_sound, icon="SP_MediaVolume"
+        )
+        self.sound_btn.setMinimumWidth(104)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setSingleStep(5)
+        self.volume_slider.setPageStep(10)
+        self.volume_slider.setValue(self._volume)
+        self.volume_slider.setFixedWidth(110)
+        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.volume_slider.setToolTip("Volume")
+        self.volume_slider.valueChanged.connect(self._on_volume)
+        row.addWidget(self.sound_btn)
+        row.addWidget(self.volume_slider)
         return row
 
     def _build_time_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(6)
-        note = QLabel("Preview has no sound.")
-        note.setObjectName("hint")
-        row.addWidget(note)
+        self.sound_note = QLabel("")
+        self.sound_note.setObjectName("hint")
+        row.addWidget(self.sound_note)
         row.addStretch(1)
         self.time_field = QLineEdit(format_timecode(0))
         self.time_field.setFixedWidth(120)
@@ -374,6 +469,14 @@ class TrimEditorDialog(QDialog):
         self.mode_hint.setWordWrap(True)
         mode_layout.addWidget(self.mode_hint)
         layout.addWidget(self.mode_box)
+
+        self.keep_audio_check = QCheckBox("Include the sound in the saved clips")
+        self.keep_audio_check.setToolTip("Turn this off to save the clips without any sound")
+        self.keep_audio_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.keep_audio_check.setChecked(self.model.keep_audio)
+        self.keep_audio_check.toggled.connect(self._on_keep_audio_toggled)
+        self.keep_audio_check.setVisible(self.has_audio)
+        layout.addWidget(self.keep_audio_check)
         return panel
 
     # -- keys -----------------------------------------------------------
@@ -384,6 +487,7 @@ class TrimEditorDialog(QDialog):
             ("I", self.set_in),
             ("O", self.set_out),
             ("S", self.split),
+            ("M", self.toggle_sound),
             ("Left", lambda: self.step_frames(-1)),
             ("Right", lambda: self.step_frames(1)),
             ("Shift+Left", lambda: self.step_seconds(-1)),
@@ -472,8 +576,13 @@ class TrimEditorDialog(QDialog):
         try:
             self.join_radio.setChecked(model.mode is ClipMode.JOIN)
             self.separate_radio.setChecked(model.mode is not ClipMode.JOIN)
+            self.keep_audio_check.setChecked(model.keep_audio)
         finally:
             self._syncing = False
+        if self.has_audio and not model.keep_audio:
+            self.whole_btn.setToolTip("Remove all clips and keep the entire video, without its sound")
+        else:
+            self.whole_btn.setToolTip("Remove all clips and keep the entire video")
         parts = [describe_selection(model, getattr(self.info, "size", None) or None)]
         if self.target_note:
             parts.append(self.target_note)
@@ -573,6 +682,129 @@ class TrimEditorDialog(QDialog):
             return
         self.model.set_mode(ClipMode.JOIN)
 
+    def _on_keep_audio_toggled(self, checked: bool) -> None:
+        if self._syncing:
+            return
+        self.model.set_keep_audio(checked)
+
+    # -- sound ------------------------------------------------------------
+
+    @property
+    def sound_on(self) -> bool:
+        """True when playback plays the sound (the video has some and it is not off)."""
+        return self.has_audio and self._sound_on
+
+    def toggle_sound(self) -> None:
+        """Turn the preview sound on or off (M); remembered for next time."""
+
+        if not self.has_audio:
+            return
+        self._sound_on = not self._sound_on
+        self._sound_state = ""
+        save_sound_prefs(editor_sound_on=self._sound_on)
+        self._refresh_sound()
+        if self._playing:
+            # Start again from here with (or without) the sound, still in step.
+            self._pause()
+            self._play()
+
+    def _refresh_sound(self) -> None:
+        on = self.sound_on
+        self.sound_btn.setVisible(self.has_audio)
+        self.volume_slider.setVisible(self.has_audio)
+        self.sound_btn.setText("Sound on" if on else "Sound off")
+        self.sound_btn.setIcon(self._icon("SP_MediaVolume" if on else "SP_MediaVolumeMuted"))
+        self.volume_slider.setEnabled(on)
+        if not self.has_audio:
+            note = SOUND_NOTES["no_track"]
+        elif not on:
+            note = SOUND_NOTES["off"]
+        else:
+            note = SOUND_NOTES.get(self._sound_state, "")
+        self.sound_note.setText(note)
+
+    def _on_volume(self, value: int) -> None:
+        self._volume = max(0, min(100, int(value)))
+        setter = getattr(self.preview, "set_volume", None)
+        if setter is not None:
+            try:
+                setter(self._volume / 100.0)
+            except Exception:
+                logger.debug("Could not change the volume", exc_info=True)
+        self._volume_save.start()  # remember it once the slider settles
+
+    def _save_volume(self) -> None:
+        save_sound_prefs(editor_volume=self._volume)
+
+    def _on_sound_state(self, session: int, state: str) -> None:
+        if session != self._play_id or self._closed:
+            return
+        self._sound_state = state
+        self._refresh_sound()
+
+    # -- sound wave -------------------------------------------------------
+
+    def _on_wave_toggled(self, checked: bool) -> None:
+        self._wave_on = bool(checked)
+        save_sound_prefs(editor_sound_wave=self._wave_on)
+        self.timeline.set_wave_visible(self.has_audio and self._wave_on)
+        if self._wave_on:
+            if not (self._wave_running or self._wave_done):
+                self._request_wave()
+        elif self._wave_running:
+            # Hidden before it finished: stop the work; showing it again restarts it.
+            self._wave_running = False
+            self._wave_id += 1
+            self._call_preview("cancel_waveform")
+
+    def _request_wave(self) -> None:
+        if self._closed or not self.has_audio or self.duration <= 0:
+            return
+        request = getattr(self.preview, "request_waveform", None)
+        count = waveform_buckets(self.duration)
+        if request is None or count <= 0:
+            return
+        self._wave_id += 1
+        wave_id = self._wave_id
+        self._wave_running, self._wave_done = True, False
+        self.timeline.set_wave_buckets(count)
+        self.timeline.set_wave_message("Reading the sound…")
+        try:
+            request(
+                self.path,
+                self.duration,
+                lambda first, peaks, _id=wave_id: self._bridge.wave.emit(_id, first, peaks),
+                lambda complete, _id=wave_id: self._bridge.wave_done.emit(_id, complete),
+                buckets=count,
+            )
+        except Exception:
+            logger.debug("Could not start the sound wave", exc_info=True)
+            self._wave_running = False
+            self.timeline.set_wave_message("")
+
+    def _on_wave(self, wave_id: int, first: int, peaks) -> None:
+        if wave_id != self._wave_id or self._closed:
+            return
+        self.timeline.set_wave_peaks(first, peaks)
+
+    def _on_wave_done(self, wave_id: int, complete: bool) -> None:
+        if wave_id != self._wave_id or self._closed:
+            return
+        self._wave_running, self._wave_done = False, True
+        if self.timeline.wave_measured:
+            self.timeline.set_wave_message("")
+        else:
+            self.timeline.set_wave_message("The sound could not be read.")
+
+    def _call_preview(self, name: str) -> None:
+        method = getattr(self.preview, name, None)
+        if method is None:
+            return
+        try:
+            method()
+        except Exception:
+            logger.debug("Preview call failed (%s)", name, exc_info=True)
+
     # -- editing actions --------------------------------------------------
 
     def _dragging(self) -> bool:
@@ -669,8 +901,14 @@ class TrimEditorDialog(QDialog):
         self.accept()
 
     def use_whole_video(self) -> None:
+        """Drop every clip. An unticked "Include the sound" still holds: the
+        whole video is then saved without its sound (a plan, not ``None``)."""
+
         self.timeline.cancel_drag()
-        self._result = None
+        if self.has_audio and not self.model.keep_audio:
+            self._result = ClipPlan((Clip(0.0, self.model.duration),), ClipMode.SEPARATE, keep_audio=False)
+        else:
+            self._result = None
         self.accept()
 
     def reject(self) -> None:
@@ -699,13 +937,20 @@ class TrimEditorDialog(QDialog):
             return
         self._closed = True
         self._settle.stop()
+        if self._volume_save.isActive():
+            self._volume_save.stop()
+            self._save_volume()  # the user moved the slider just before closing
         self._playing = False
         self._play_id += 1
+        self._wave_id += 1
         # The service is shared with the main window's row thumbnails, so stop
         # only this editor's own work, not everything.
-        for name in ("cancel_filmstrip", "stop_playback", "cancel_frames"):
+        for name in ("cancel_filmstrip", "stop_playback", "cancel_frames", "cancel_waveform"):
+            method = getattr(self.preview, name, None)
+            if method is None:
+                continue
             try:
-                getattr(self.preview, name)()
+                method()
             except Exception:
                 logger.debug("Could not stop preview work (%s)", name, exc_info=True)
         self.timeline.dispose()
@@ -739,6 +984,8 @@ class TrimEditorDialog(QDialog):
         except Exception:
             logger.debug("Could not start the filmstrip", exc_info=True)
         self._request_frame(0.0, fast=False)
+        if self.has_audio and self._wave_on and not (self._wave_running or self._wave_done):
+            self._request_wave()
 
     def _request_frame(self, t: float, *, fast: bool) -> None:
         if self._closed:
@@ -847,6 +1094,13 @@ class TrimEditorDialog(QDialog):
             str(getattr(self.info, "sar", "1:1") or "1:1"),
             *FRAME_MAX,
         )
+        sound: dict = {}
+        if self.sound_on:
+            sound = {
+                "audio": True,
+                "volume": self._volume / 100.0,
+                "on_audio": lambda state, _id=session: self._bridge.sound_state.emit(_id, state),
+            }
         try:
             self.preview.start_playback(
                 self.path,
@@ -855,6 +1109,7 @@ class TrimEditorDialog(QDialog):
                 min(self.fps, 30.0),
                 lambda t, rgb, _size=size: self._on_play_frame(t, rgb, _size),
                 lambda reason, _id=session: self._bridge.play_end.emit(_id, reason),
+                **sound,
             )
         except Exception:
             logger.debug("Could not start playback", exc_info=True)

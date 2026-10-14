@@ -54,14 +54,21 @@ class Clip:
 
 @dataclass(frozen=True)
 class ClipPlan:
-    """The clips to encode for one source file, in output order."""
+    """The clips to encode for one source file, in output order.
+
+    ``keep_audio=False`` leaves the sound out of every clip (separate files and
+    a joined video alike). Such a plan always changes the output, so it is never
+    "the whole file, untouched", even when its one clip covers the whole video.
+    """
 
     clips: Tuple[Clip, ...]
     mode: ClipMode = ClipMode.SEPARATE
+    keep_audio: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "clips", tuple(self.clips))
         object.__setattr__(self, "mode", ClipMode(self.mode))
+        object.__setattr__(self, "keep_audio", bool(self.keep_audio))
 
     @property
     def total_duration(self) -> float:
@@ -148,13 +155,17 @@ def resolve_clip_plan(
 
     Explicit ``clips`` win. Otherwise the legacy single-range trim on the profile
     (``trim_enabled`` / ``trim_start`` / ``trim_end``) becomes a one-clip plan, so
-    old saved profiles and the old command line keep working.
+    old saved profiles and the old command line keep working. A plan that leaves
+    the sound out (``keep_audio=False``) is kept even when it covers the whole
+    file, because dropping the sound still changes the output.
     """
     mode = ClipMode.SEPARATE
+    keep_audio = True
     raw: Sequence[Clip]
     if clips is not None and clips.clips:
         raw = clips.clips
         mode = clips.mode
+        keep_audio = clips.keep_audio
     elif getattr(profile, "trim_enabled", False):
         start = parse_timecode(getattr(profile, "trim_start", None)) or 0.0
         end = parse_timecode(getattr(profile, "trim_end", None))
@@ -167,11 +178,11 @@ def resolve_clip_plan(
     normalized = normalize_clips(raw, duration)
     if not normalized:
         return None
-    if len(normalized) == 1 and duration and duration > 0:
+    if len(normalized) == 1 and duration and duration > 0 and keep_audio:
         only = normalized[0]
         if only.start <= tolerance and only.end >= duration - tolerance:
             return None
-    return ClipPlan(normalized, mode)
+    return ClipPlan(normalized, mode, keep_audio)
 
 
 def effective_media_info(info: Any, plan: Optional[ClipPlan]) -> Any:
@@ -179,19 +190,25 @@ def effective_media_info(info: Any, plan: Optional[ClipPlan]) -> Any:
 
     Duration, frame count and size shrink to match, so progress, ETA and
     target-size planning are right for trimmed jobs. Bitrates and resolution are
-    rates/shape, not totals, so they are left alone. Works on any dataclass with
-    ``duration`` (``VideoInfo``).
+    rates/shape, not totals, so they are left alone. A plan that leaves the sound
+    out also clears the audio fields, so the result reads as a silent source.
+    Works on any dataclass with ``duration`` (``VideoInfo``).
     """
     if plan is None or not plan.clips:
         return info
+    silent: dict = {}
+    if not plan.keep_audio:
+        for name, empty in (("audio_codec", ""), ("audio_bitrate", 0)):
+            if hasattr(info, name):
+                silent[name] = empty
     source_duration = float(getattr(info, "duration", 0.0) or 0.0)
     total = plan.total_duration
     if math.isinf(total):
-        return info
+        return replace(info, **silent) if silent else info
     if source_duration > 0 and plan.mode is not ClipMode.JOIN:
         # A join may repeat parts of the video, so only other plans are capped.
         total = min(total, source_duration)
-    changes: dict = {"duration": total}
+    changes: dict = {"duration": total, **silent}
     fps = float(getattr(info, "avg_fps", 0.0) or getattr(info, "fps", 0.0) or 0.0)
     if hasattr(info, "frame_count") and fps > 0:
         changes["frame_count"] = int(round(total * fps))
@@ -246,7 +263,7 @@ def expand_clip_jobs(
         number = int(numbers[i]) if numbers is not None and i < len(numbers) else i + 1
         jobs.append(
             ClipJob(
-                ClipPlan((clip,), ClipMode.SEPARATE),
+                ClipPlan((clip,), ClipMode.SEPARATE, plan.keep_audio),
                 index=i,
                 count=count,
                 token=_clip_token(clip, number - 1, used),

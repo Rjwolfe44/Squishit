@@ -41,7 +41,7 @@ CODEC_LABELS = {
     VideoCodec.HEVC: "HEVC",
     VideoCodec.VP9: "VP9",
     VideoCodec.SVT_AV1: "SVT-AV1 (best compression, CPU)",
-    VideoCodec.AV1: "Fast hardware AV1",
+    VideoCodec.AV1: "Fast AV1",
 }
 RUNG_LABELS = [rung.label for rung in QualityRung]
 TARGET_MODES = ["auto", "fast", "balanced", "strict", "exact"]
@@ -133,6 +133,20 @@ class EncodeForm:
     extra_ffmpeg_args: str = ""
     audio_mode: str = "auto"
     queue_order: str = "manual"
+    # What Fast AV1 runs on the CPU here, from the window's hardware check:
+    # "libsvtav1", "libaom-av1", "" (no AV1 encoder; av1_fallback names the
+    # codec used instead), or None before the check finishes.
+    av1_software: Optional[str] = None
+    av1_fallback: str = ""
+
+    def _fast_av1_cpu_phrase(self) -> str:
+        """``your processor (SVT-AV1)`` and friends, from the real route."""
+
+        if self.av1_software == "libsvtav1":
+            return "your processor (SVT-AV1)"
+        if self.av1_software == "libaom-av1":
+            return "your processor (libaom, which is slower than SVT-AV1)"
+        return "your processor"
 
     def rung(self) -> QualityRung:
         try:
@@ -167,22 +181,35 @@ class EncodeForm:
         if choice.codec == VideoCodec.SVT_AV1:
             return (
                 "SVT-AV1 (best compression, CPU). Hardware encode stays off. "
-                "Fast hardware AV1 is the AV1 codec with hardware encoding on."
+                "Fast AV1 is the quicker AV1 choice."
             )
         if choice.force_software:
             return (
                 "Hardware encode stays off for this preset. "
                 "SquishIt will use a software encoder."
             )
+        if choice.codec == VideoCodec.AV1 and self.av1_software == "":
+            fallback = {"h264": "H.264"}.get(self.av1_fallback, "HEVC")
+            return (
+                "This copy of FFmpeg has no AV1 encoder; "
+                f"{fallback} will be used instead."
+            )
         if choice.codec == VideoCodec.AV1 and self.use_hw_accel:
             if self.target_size_enabled and self.target_size_mode == "exact":
                 return (
-                    "Fast hardware AV1 tries NVENC, then QSV, then AMF first. "
-                    + _EXACT_HW_HINT
+                    "Fast AV1 tries a graphics card that passed an AV1 test "
+                    "encode first. " + _EXACT_HW_HINT
                 )
             return (
-                "Fast hardware AV1: NVENC, then QSV, then AMF (av1_amf on AMD). "
-                "Max / Archival stays SVT-AV1 on the CPU for best compression."
+                "Fast AV1 uses your graphics card when it passes a quick AV1 "
+                "test (NVIDIA, then Intel, then AMD), otherwise "
+                f"{self._fast_av1_cpu_phrase()}. Max / Archival stays SVT-AV1 "
+                "on the CPU for best compression."
+            )
+        if choice.codec == VideoCodec.AV1:
+            return (
+                "Hardware encoding is off, so Fast AV1 will use "
+                f"{self._fast_av1_cpu_phrase()}."
             )
         if not self.use_hw_accel:
             return "Hardware acceleration off. SquishIt will use a software encoder."

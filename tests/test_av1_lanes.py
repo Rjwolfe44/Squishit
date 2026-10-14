@@ -1,8 +1,10 @@
-"""Fast hardware AV1 versus Max / Archival SVT-AV1.
+"""Fast AV1 versus Max / Archival SVT-AV1.
 
 Max / Archival stays on libsvtav1. On Windows that encode may decode with
 D3D11VA and, on Resource Max with one job, sets lp to the logical CPU count.
-VideoCodec.AV1 with hardware on picks av1_nvenc, then av1_qsv, then av1_amf.
+VideoCodec.AV1 (Fast AV1) with hardware on picks av1_nvenc, then av1_qsv,
+then av1_amf, but only an encoder that passed the real test encode
+(``fast_av1.HardwareAv1Probe``). GPU names no longer decide AV1.
 """
 
 from __future__ import annotations
@@ -164,7 +166,14 @@ def test_decode_hwaccel_is_windows_svt_only():
     )
 
 
-def test_hw_av1_picker_is_nvenc_then_qsv_then_amf(monkeypatch):
+def test_hw_av1_picker_is_nvenc_then_qsv_then_amf(monkeypatch, working_av1_hardware):
+    """Order is NVENC, QSV, AMF among encoders whose test encode passed.
+
+    Changed with the hardware check: the GPU's ``encoder_support["av1"]`` name
+    guess used to decide. Now a passing test encode does, so a GPU the name
+    table misses still works and a listed-but-broken encoder is skipped.
+    """
+
     gpus = [
         GPUInfo("AMD Radeon(TM) Graphics", GPUVendor.AMD, encoder_support={"h264": True, "hevc": True, "av1": False}),
         _amd_9070(),
@@ -172,16 +181,25 @@ def test_hw_av1_picker_is_nvenc_then_qsv_then_amf(monkeypatch):
         GPUInfo("RTX 4070", GPUVendor.NVIDIA, encoder_support={"h264": True, "hevc": True, "av1": True}),
     ]
     compressor = _compressor(monkeypatch, gpus=gpus, encoders=_HW_AV1)
+    # No encoder passed the test encode: the GPU names do not make one usable.
+    assert compressor._select_hw_encoder(VideoCodec.AV1) is None
+
+    compressor.av1_probe = working_av1_hardware("av1_nvenc", "av1_qsv", "av1_amf")
     assert compressor._select_hw_encoder(VideoCodec.AV1) == "av1_nvenc"
     assert compressor._select_hw_encoder(VideoCodec.SVT_AV1) is None
 
-    gpus[3].encoder_support["av1"] = False
+    compressor.av1_probe = working_av1_hardware("av1_qsv", "av1_amf")
     assert compressor._select_hw_encoder(VideoCodec.AV1) == "av1_qsv"
 
-    gpus[2].encoder_support["av1"] = False
+    compressor.av1_probe = working_av1_hardware("av1_amf")
+    assert compressor._select_hw_encoder(VideoCodec.AV1) == "av1_amf"
+
+    # The 9070 XT's name says nothing here: only the check result counts.
+    gpus[1].encoder_support["av1"] = False
     assert compressor._select_hw_encoder(VideoCodec.AV1) == "av1_amf"
 
     compressor.codec_manager._available_encoders.discard("av1_amf")
+    compressor.av1_probe = working_av1_hardware("av1_amf")
     assert compressor._select_hw_encoder(VideoCodec.AV1) is None
 
 
@@ -256,9 +274,10 @@ def test_unrelated_svt_failure_does_not_retry(monkeypatch, tmp_path):
     assert _encoder(cmds[0]) == "libsvtav1"
 
 
-def test_av1_with_hw_on_amd_selects_av1_amf_not_svt(monkeypatch, tmp_path):
+def test_av1_with_hw_on_amd_selects_av1_amf_not_svt(monkeypatch, tmp_path, working_av1_hardware):
     monkeypatch.setattr(platform, "system", lambda: "Windows")
     compressor = _compressor(monkeypatch, gpus=[_amd_9070()], encoders=_HW_AV1, ram_gb=32.0)
+    compressor.av1_probe = working_av1_hardware("av1_amf")
     source = tmp_path / "input.mp4"
     source.write_bytes(b"0")
     profile = CompressionProfile(
@@ -284,37 +303,45 @@ def test_av1_with_hw_on_amd_selects_av1_amf_not_svt(monkeypatch, tmp_path):
     assert "libsvtav1" not in cmd
     assert "libaom-av1" not in cmd
     assert cmd[cmd.index("-quality") + 1] == "speed"
+    # av1_amf takes AV1 q-index QPs: the Quick rung's CQ 26 is q-index 104,
+    # not the near-lossless 26 it used to send.
+    assert cmd[cmd.index("-qp_i") + 1] == "104"
+    assert cmd[cmd.index("-qp_p") + 1] == "104"
 
 
-def test_copy_separates_fast_hardware_av1_from_archival_svt():
-    assert CODEC_LABELS[VideoCodec.AV1] == "Fast hardware AV1"
+def test_copy_separates_fast_av1_from_archival_svt():
+    # Renamed from "Fast hardware AV1": the lane now runs on the CPU too.
+    assert CODEC_LABELS[VideoCodec.AV1] == "Fast AV1"
     assert "best compression" in CODEC_LABELS[VideoCodec.SVT_AV1]
     assert "CPU" in CODEC_LABELS[VideoCodec.SVT_AV1]
-    assert VideoCodec.AV1.display_name == "Fast hardware AV1"
+    assert VideoCodec.AV1.display_name == "Fast AV1"
+    assert VideoCodec.AV1.value == "av1"
     assert "best compression" in VideoCodec.SVT_AV1.display_name
 
     archival = get_step(VideoCodec.SVT_AV1, QualityRung.MAX)
     assert "best compression" in archival.hint
     assert "CPU" in archival.hint
-    assert "fast hardware AV1" in archival.hint
+    assert "Fast AV1" in archival.hint
     assert "Hardware stays off" in archival.hint
     assert archival.force_software is True
 
     fast = get_step(VideoCodec.AV1, QualityRung.QUICK)
-    assert "Fast hardware AV1" in fast.hint
+    assert "Fast AV1" in fast.hint
     assert "NVENC" in fast.hint
+    assert "SVT-AV1" in fast.hint
     assert "best compression" in fast.hint
     assert fast.force_software is False
 
     form = EncodeForm()
     form.set_codec(VideoCodec.SVT_AV1)
     assert "best compression" in form.hw_hint()
-    assert "Fast hardware AV1" in form.hw_hint()
+    assert "Fast AV1" in form.hw_hint()
     assert form.effective_hw() is False
     form.set_codec(VideoCodec.AV1)
     form.use_hw_accel = True
-    assert form.hw_hint().startswith("Fast hardware AV1")
-    assert "av1_amf" in form.hw_hint()
+    assert form.hw_hint().startswith("Fast AV1")
+    assert "graphics card" in form.hw_hint()
+    assert "SVT-AV1" in form.hw_hint()
 
     form.set_codec(VideoCodec.HEVC)
     hevc = form.ladder_choice()
@@ -342,9 +369,8 @@ def test_copy_separates_fast_hardware_av1_from_archival_svt():
         use_hw=True,
         force_software=False,
         action="This preset",
-        software_name="libaom-av1",
+        software_name="libsvtav1",
     )
     assert status.badge == "AMF"
-    assert status.using.startswith("Fast hardware AV1.")
-    assert "AMD hardware (AMF)" in status.using
+    assert status.using == "Fast AV1 will use your AMD graphics card."
     assert status.tooltip == "av1_amf"

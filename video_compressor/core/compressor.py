@@ -49,6 +49,15 @@ from .profiles import (
     resolve_requested_target_size_mb,
 )
 from .hardware import HardwareDetector, get_hardware_detector
+from .fast_av1 import (
+    HW_AV1_ENCODERS,
+    FastAv1Route,
+    HardwareAv1Probe,
+    fast_av1_svt_preset,
+    output_pixels,
+    remote_session,
+    svt_lp_memory_cap,
+)
 from .governor import (
     EncodeCancelled,
     EncodeResourceGovernor,
@@ -56,7 +65,13 @@ from .governor import (
     apply_thread_policy,
     threads_for_job,
 )
-from .quality_ladder import apply_hardware_ladder, ordered_hw_vendors
+from .quality_ladder import (
+    QualityRung,
+    apply_hardware_ladder,
+    get_step,
+    matching_rung,
+    ordered_hw_vendors,
+)
 from .utils import (
     format_size, format_time, format_bitrate,
     validate_video_file, validate_image_file, detect_media_type,
@@ -271,6 +286,12 @@ class CompressionJob:
     software_fallback_settled: bool = False
     # Set after D3D11VA decode fails so the retry omits -hwaccel. Encode stays put.
     decode_hwaccel_disabled: bool = False
+    # One plain sentence for the result when Fast AV1 could not run as asked
+    # (no AV1 encoder in FFmpeg, or the graphics card failed this file).
+    encoder_note: str = ""
+    # Set after an AV1 software encoder rejected its options. The retry uses
+    # the most widely supported settings (SVT-AV1 preset 8, libaom good mode).
+    av1_safe_retry: bool = False
     # Clips this job encodes (None = whole file). compress() resolves it once;
     # video_info then holds the trimmed numbers and source_info the real file.
     clip_plan: Optional[ClipPlan] = None
@@ -415,12 +436,18 @@ class VideoCompressor:
     Handles video analysis, compression, and progress tracking.
     """
     
-    def __init__(self, hw_detector: Optional[HardwareDetector] = None):
+    def __init__(
+        self,
+        hw_detector: Optional[HardwareDetector] = None,
+        av1_probe: Optional[HardwareAv1Probe] = None,
+    ):
         """
         Initialize the compressor.
-        
+
         Args:
             hw_detector: Hardware detector instance (optional)
+            av1_probe: Hardware AV1 test-encode checker (optional; tests pass
+                a fake). The default probes with this compressor's FFmpeg.
         """
         self.hw_detector = hw_detector or get_hardware_detector()
         self.governor = EncodeResourceGovernor(self._machine_resources)
@@ -428,7 +455,16 @@ class VideoCompressor:
         self._ffprobe_path = self._find_ffprobe()
         self._cjxl_path = self._find_cjxl()
         self.codec_manager = CodecManager(self._ffmpeg_path)
-        
+        self.av1_probe = av1_probe or HardwareAv1Probe(
+            self._ffmpeg_path,
+            gpu_signature=self._gpu_signature,
+        )
+        # The window's UI thread. On it, Fast AV1 never runs or waits for a
+        # hardware test encode: previews and slot counts treat an unverified
+        # GPU as the CPU. None (CLI, tests) lets every caller probe, except
+        # that the main thread never waits for another thread's probe.
+        self.ui_thread: Optional[threading.Thread] = None
+
         # Active jobs
         self._jobs: Dict[str, CompressionJob] = {}
         self._processes: Dict[str, subprocess.Popen] = {}
@@ -1032,7 +1068,8 @@ class VideoCompressor:
             parts.append(final_profile.video_codec.value)
         if final_profile.disable_audio and not requested_profile.disable_audio:
             parts.append("audio removed")
-        elif final_profile.audio_codec != requested_profile.audio_codec:
+        elif not final_profile.disable_audio and final_profile.audio_codec != requested_profile.audio_codec:
+            # (With no audio in the file, its codec is no adjustment worth naming.)
             parts.append(final_profile.audio_codec.value)
         if not final_profile.disable_audio and final_profile.audio_bitrate != requested_profile.audio_bitrate:
             parts.append(f"audio {final_profile.audio_bitrate // 1000} kbps")
@@ -1156,6 +1193,11 @@ class VideoCompressor:
             return None
 
         plan_profile = self._prepare_target_size_profile(profile, media_info)
+        if profile.disable_audio and not getattr(media_info, "has_audio", True):
+            # Exact mode turns audio back on to have something to trim later;
+            # with the sound dropped from a silent (or muted clip) source there
+            # is nothing to budget for.
+            plan_profile.disable_audio = True
 
         audio_bitrate = 0 if plan_profile.disable_audio else (plan_profile.audio_bitrate or media_info.audio_bitrate or AudioCodec.AAC.default_bitrate)
         if not plan_profile.disable_audio and plan_profile.audio_codec == AudioCodec.FLAC and media_info.audio_bitrate > 0:
@@ -1325,12 +1367,14 @@ class VideoCompressor:
 
         A GPU must advertise support for the codec and FFmpeg must provide
         that vendor's encoder. None means the caller keeps the software
-        encoder. ``VideoCodec.AV1`` with hardware on uses ``av1_nvenc``, then
-        ``av1_qsv``, then ``av1_amf`` (an RX 9070 XT that advertises AV1 and
-        has ``av1_amf`` in FFmpeg selects AMF). SVT-AV1 has no hardware
-        encoder here, so Max / Archival stays on libsvtav1 even when
-        ``av1_amf`` is installed.
+        encoder. ``VideoCodec.AV1`` (Fast AV1) uses ``av1_nvenc``, then
+        ``av1_qsv``, then ``av1_amf``, and only one that passed a real test
+        encode on this PC (``self.av1_probe``): GPU names and FFmpeg's encoder
+        list are not trusted for AV1. SVT-AV1 has no hardware encoder here,
+        so Max / Archival stays on libsvtav1 even when ``av1_amf`` works.
         """
+        if codec == VideoCodec.AV1:
+            return self._select_verified_hw_av1()
         info = self.hw_detector.info
         if not info.gpus:
             return None
@@ -1349,6 +1393,89 @@ class VideoCompressor:
                 return encoder
 
         return None
+
+    def _gpu_signature(self) -> str:
+        """Adapters, drivers, and session kind for the AV1 check's saved results."""
+
+        try:
+            signature = self.hw_detector.info.gpu_signature()
+        except Exception:
+            logger.debug("Hardware detection failed for the AV1 check", exc_info=True)
+            signature = ""
+        return f"{signature}|remote" if remote_session() else signature
+
+    def _hw_av1_candidates(self) -> List[str]:
+        """Hardware AV1 encoders this FFmpeg lists, NVENC then QSV then AMF."""
+
+        return [
+            encoder
+            for encoder in HW_AV1_ENCODERS
+            if self.codec_manager.is_encoder_available(encoder)
+        ]
+
+    def _select_verified_hw_av1(self) -> Optional[str]:
+        """First listed hardware AV1 encoder whose test encode passed, or None.
+
+        The first call probes (a fraction of a second per encoder; the Qt
+        window does it on its hardware-check thread at startup). Later calls,
+        and later launches with the same drivers and FFmpeg, read the cache.
+        On ``self.ui_thread`` nothing is probed or waited for: an encoder not
+        verified yet counts as missing (the encode itself runs on a worker
+        and checks properly). The main thread also never waits for a check
+        another thread is running; with nothing in flight it may check itself
+        (the CLI encodes on its main thread).
+        """
+
+        try:
+            candidates = self._hw_av1_candidates()
+            if self._on_ui_thread() or (
+                threading.current_thread() is threading.main_thread()
+                and self.av1_probe.in_flight(candidates)
+            ):
+                return self.av1_probe.first_verified(candidates)
+            return self.av1_probe.first_working(candidates)
+        except Exception:
+            logger.warning("Hardware AV1 check failed; Fast AV1 will use the CPU", exc_info=True)
+            return None
+
+    def _on_ui_thread(self) -> bool:
+        return self.ui_thread is not None and threading.current_thread() is self.ui_thread
+
+    def fast_av1_route(self, use_hw_accel: bool = True) -> FastAv1Route:
+        """What Fast AV1 will encode with on this PC (for the UI and CLI).
+
+        Runs the hardware AV1 check when it has not run yet, except on the UI
+        thread, where an unverified GPU reads as the CPU route.
+        """
+
+        if use_hw_accel:
+            encoder = self._select_verified_hw_av1()
+            if encoder:
+                return FastAv1Route("hardware", encoder, hardware_checked=True)
+        software = self.codec_manager.software_encoder_for(VideoCodec.AV1)
+        if software:
+            return FastAv1Route("software", software, hardware_checked=bool(use_hw_accel))
+        fallback = self._fast_av1_fallback_codec(use_hw_accel)
+        return FastAv1Route(
+            "fallback",
+            "",
+            fallback_codec=fallback.value,
+            hardware_checked=bool(use_hw_accel),
+        )
+
+    def _fast_av1_fallback_codec(self, use_hw_accel: bool) -> VideoCodec:
+        """HEVC when this FFmpeg can encode it (hardware or software), else H.264."""
+
+        if self.codec_manager.is_codec_available(VideoCodec.HEVC):
+            return VideoCodec.HEVC
+        if use_hw_accel and self._select_hw_encoder(VideoCodec.HEVC):
+            return VideoCodec.HEVC
+        return VideoCodec.H264
+
+    def _software_encoder_name(self, codec: VideoCodec) -> str:
+        """The software encoder a retry on this codec will really use."""
+
+        return self.codec_manager.software_encoder_for(codec) or codec.ffmpeg_encoder
 
     @classmethod
     def _is_hardware_encoder(cls, encoder_name: Optional[str]) -> bool:
@@ -1412,7 +1539,8 @@ class VideoCompressor:
         ):
             return False
 
-        software_encoder = profile.video_codec.ffmpeg_encoder
+        # Fast AV1 retries on SVT-AV1 (libaom when this FFmpeg has no SVT-AV1).
+        software_encoder = self._software_encoder_name(profile.video_codec)
         actual_mb = (actual_size_bytes or 0) / 1_000_000
         if reason is SoftwareFallbackReason.ENCODE_FAILED:
             message = (
@@ -1489,6 +1617,54 @@ class VideoCompressor:
             allow_short_hardware_pad=True,
         )
 
+    def _retry_fast_av1_on_cpu(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        target_plan: Optional[TargetSizePlan],
+        error_text: str = "",
+    ) -> bool:
+        """Retry a failed hardware Fast AV1 encode on the CPU, without asking.
+
+        Only for jobs without a size target (Quick Compress presets and plain
+        Compress). A target-size job asks first through
+        ``_offer_target_software_fallback``. The hardware check passed, so a
+        failure here is about this file (for example a frame narrower than
+        the encoder allows); the saved check result is left alone.
+        """
+
+        if target_plan is not None:
+            return False
+        if profile.video_codec != VideoCodec.AV1 or not profile.use_hw_accel:
+            return False
+        if job.encoder_name not in HW_AV1_ENCODERS:
+            return False
+        software = self.codec_manager.software_encoder_for(VideoCodec.AV1)
+        if not software:
+            return False
+        lines = (error_text or "").strip().splitlines()
+        logger.warning(
+            "%s failed for %s; Fast AV1 retries on %s. %s",
+            job.encoder_name,
+            job.input_file,
+            software,
+            lines[-1] if lines else "",
+        )
+        profile.use_hw_accel = False
+        name = "SVT-AV1" if software == "libsvtav1" else "libaom"
+        job.encoder_note = (
+            "The graphics card could not encode this file in AV1, "
+            f"so Fast AV1 used the processor ({name}) instead."
+        )
+        job.progress = 0.0
+        job.speed = 0.0
+        job.eta = 0.0
+        job.current_frame = 0
+        if job.output_file.exists():
+            job.output_file.unlink(missing_ok=True)
+        self._report_progress(job)
+        return True
+
     def _arm_software_target_retry(
         self,
         profile: CompressionProfile,
@@ -1513,8 +1689,15 @@ class VideoCompressor:
         result: CompressionResult,
         job: CompressionJob,
     ) -> CompressionResult:
-        """Copy the ask-before-software flag onto a finished result."""
+        """Copy the ask-before-software flag onto a finished result.
 
+        The Fast AV1 encoder note (``job.encoder_note``) goes first on the
+        result note, so the card says why the file is not what was asked for.
+        """
+
+        encoder_note = (job.encoder_note or "").strip()
+        if encoder_note and encoder_note not in (result.note or ""):
+            result.note = f"{encoder_note} {result.note or ''}".strip()
         result.software_fallback_required = job.software_fallback_required
         result.software_fallback_reason = job.software_fallback_reason
         result.software_fallback_message = job.software_fallback_message
@@ -1558,18 +1741,13 @@ class VideoCompressor:
         if optimized.video_codec == VideoCodec.SVT_AV1:
             optimized.use_hw_accel = False
 
-        if optimized.video_codec == VideoCodec.AV1 and target_mode not in {
-            TargetSizeMode.STRICT,
-            TargetSizeMode.EXACT,
-        }:
+        if optimized.video_codec == VideoCodec.AV1:
+            # Fast AV1 stays the AV1 lane: a verified hardware encoder, else
+            # SVT-AV1, else libaom (picked per command). Only when this FFmpeg
+            # has no AV1 encoder at all does the same rung run on HEVC/H.264.
             hw_av1 = self._select_hw_encoder(VideoCodec.AV1) if optimized.use_hw_accel else None
-            if hw_av1:
-                optimized.use_hw_accel = True
-            elif self.codec_manager.is_codec_available(VideoCodec.SVT_AV1):
-                optimized.video_codec = VideoCodec.SVT_AV1
-                optimized.use_hw_accel = False
-                if optimized.preset in {"slow", "slower", "veryslow"}:
-                    optimized.preset = "medium"
+            if not hw_av1 and not self.codec_manager.is_codec_available(VideoCodec.AV1):
+                self._retarget_fast_av1(optimized)
 
         # Usable means the ordered hardware picker found an encoder, or the
         # software encoder exists. preferred_hw_encoder is not a second path.
@@ -1583,6 +1761,90 @@ class VideoCompressor:
                 optimized.use_hw_accel = False
 
         return optimized
+
+    def _retarget_fast_av1(self, profile: CompressionProfile) -> None:
+        """No AV1 encoder in this FFmpeg: run the same rung on HEVC (or H.264).
+
+        A custom CRF/preset has no meaning on another codec, so it takes the
+        Balanced rung. The container is fixed up by the caller.
+        """
+
+        rung = matching_rung(VideoCodec.AV1, profile.crf, profile.preset)
+        fallback = self._fast_av1_fallback_codec(profile.use_hw_accel)
+        step = get_step(fallback, rung or QualityRung.BALANCED)
+        logger.info("FFmpeg has no AV1 encoder; Fast AV1 runs on %s", fallback.value)
+        profile.video_codec = fallback
+        profile.crf = step.crf
+        profile.preset = step.preset
+
+    def _fast_av1_substitution_note(self, requested: VideoCodec, used: VideoCodec) -> str:
+        """Result sentence when Fast AV1 ran on another codec for lack of an encoder.
+
+        Exact-size planning may also move a job to HEVC on purpose; that is
+        not this note.
+        """
+
+        if requested != VideoCodec.AV1 or used == VideoCodec.AV1:
+            return ""
+        if self.codec_manager.is_codec_available(VideoCodec.AV1) or self._select_verified_hw_av1():
+            return ""
+        name = "HEVC" if used == VideoCodec.HEVC else "H.264" if used == VideoCodec.H264 else used.display_name
+        return f"This copy of FFmpeg has no AV1 encoder, so SquishIt used {name} instead."
+
+    def _plan_fast_av1_software(
+        self,
+        job: CompressionJob,
+        profile: CompressionProfile,
+        settings: CodecSettings,
+        encoder: str,
+        media: Optional["VideoInfo"],
+    ) -> None:
+        """Preset, threads, and frame size for Fast AV1 on the CPU.
+
+        A ladder rung runs its SVT-AV1 preset, or a faster one when this
+        job's share of the CPU or the frame size needs it
+        (``fast_av1_svt_preset``). A custom CRF/preset is used as given. The
+        rung is read from the profile, so a size target (which clears the
+        CRF) keeps the rung's speed floor. libaom always runs its realtime
+        mode at cpu-used 8. After an option error (``job.av1_safe_retry``)
+        SVT-AV1 uses preset 8 and libaom its good mode, which every build
+        accepts.
+        """
+
+        width = int(getattr(media, "width", 0) or 0)
+        height = int(getattr(media, "height", 0) or 0)
+        pixels = output_pixels(width, height, profile.max_resolution)
+        if width and height and profile.max_resolution and height > profile.max_resolution:
+            width = int(round(width * profile.max_resolution / height))
+            height = int(profile.max_resolution)
+        settings.frame_width = width
+        settings.frame_height = height
+
+        if encoder == "libaom-av1":
+            settings.preset = "good" if job.av1_safe_retry else "8"
+            return
+        machine = self._machine_resources()
+        # The floor follows this job's thread share (several jobs at once each
+        # get less), measured before the memory cap below lowers lp.
+        job_threads = int(settings.threads or machine.cpu_threads)
+        # A 4K frame at full parallelism peaks above 5 GB; keep lp inside RAM.
+        lp_cap = svt_lp_memory_cap(pixels, machine.total_ram_gb)
+        if lp_cap is not None and settings.threads and settings.threads > lp_cap:
+            settings.threads = lp_cap
+        if job.av1_safe_retry:
+            settings.preset = "8"
+            return
+        rung = matching_rung(VideoCodec.AV1, profile.crf, str(profile.preset or ""))
+        if rung is not None:
+            step_preset = int(get_step(VideoCodec.AV1, rung).preset)
+            settings.preset = str(fast_av1_svt_preset(step_preset, job_threads, pixels))
+            return
+        asked = str(settings.preset or "")
+        try:
+            custom = int(asked)
+        except ValueError:
+            custom = CodecSettings._map_svtav1_preset(asked)
+        settings.preset = str(max(0, min(13, custom)))
 
     def _machine_resources(self) -> MachineResources:
         info = self.hw_detector.info
@@ -1727,8 +1989,16 @@ class VideoCompressor:
             parallel_jobs=parallel_jobs,
             media_info=media,
         )
-        job.encoder_name = hw_encoder or profile.video_codec.ffmpeg_encoder
+        software_encoder = None if hw_encoder else self._software_encoder_name(profile.video_codec)
+        if software_encoder and software_encoder != profile.video_codec.ffmpeg_encoder:
+            codec_settings.software_encoder = software_encoder
+        job.encoder_name = hw_encoder or software_encoder or profile.video_codec.ffmpeg_encoder
         job.threads_used = codec_settings.threads or 0
+
+        clip_plan = self._job_clip_plan(job, profile)
+        if clip_plan is not None and not clip_plan.keep_audio:
+            # The clips were saved without their sound: -an, and no audio in a join.
+            codec_settings.disable_audio = True
 
         if not codec_settings.disable_audio:
             codec_settings.audio_codec = self.codec_manager.coerce_audio_codec(
@@ -1749,7 +2019,7 @@ class VideoCompressor:
 
         if codec_settings.video_bitrate:
             target_rate_control = self._select_target_rate_control(
-                hw_encoder or profile.video_codec.ffmpeg_encoder,
+                job.encoder_name,
                 effective_target_plan.mode if effective_target_plan is not None else None,
             )
             if target_rate_control is not None:
@@ -1758,8 +2028,12 @@ class VideoCompressor:
         if hw_encoder and codec_settings.crf is not None and not codec_settings.video_bitrate:
             apply_hardware_ladder(codec_settings, hw_encoder)
 
+        if profile.video_codec == VideoCodec.AV1 and not hw_encoder:
+            self._plan_fast_av1_software(job, profile, codec_settings, job.encoder_name, media)
+            job.threads_used = codec_settings.threads or 0
+
         extra_args = self._parse_extra_ffmpeg_args(profile.extra_ffmpeg_args)
-        join_count = self._join_input_count(self._job_clip_plan(job, profile))
+        join_count = self._join_input_count(clip_plan)
         join_audio = False
         user_video_filters: List[str] = []
         user_audio_filters: List[str] = []
@@ -1935,7 +2209,10 @@ class VideoCompressor:
             return False
         if not profile.exact_two_pass or profile.use_hw_accel or profile.output_mode != "video":
             return False
-        return profile.video_codec in {VideoCodec.AV1, VideoCodec.HEVC, VideoCodec.H264, VideoCodec.VP9}
+        if profile.video_codec == VideoCodec.AV1:
+            # Older libsvtav1 wrappers do not take -pass; libaom always has.
+            return self._software_encoder_name(VideoCodec.AV1) == "libaom-av1"
+        return profile.video_codec in {VideoCodec.HEVC, VideoCodec.H264, VideoCodec.VP9}
 
     def _build_two_pass_commands(
         self,
@@ -2098,6 +2375,11 @@ class VideoCompressor:
     ) -> List[str]:
         """Build an FFmpeg command for audio extraction."""
         plan = self._job_clip_plan(job, profile)
+        if plan is not None and not plan.keep_audio:
+            raise ValueError(
+                "These clips leave the sound out, so there is no audio to save. "
+                "Turn on 'Include the sound in the saved clips' in the Trim editor."
+            )
         if plan is not None and not getattr(job.video_info, "has_audio", True):
             raise ValueError("This video has no audio track to save.")
         cmd = self._build_input_command(job, profile)
@@ -2166,13 +2448,20 @@ class VideoCompressor:
         return True
 
     def _should_retry_with_safe_av1_settings(self, profile: CompressionProfile, error_text: str) -> bool:
-        """Detect libaom-av1 option failures that can be retried with safer settings."""
+        """Detect Fast AV1 software option failures worth one safer retry.
+
+        An old libsvtav1 can reject preset 9-12 and an old libaom its realtime
+        mode. The retry (``job.av1_safe_retry``) uses SVT-AV1 preset 8 or
+        libaom good mode.
+        """
         if profile.video_codec != VideoCodec.AV1 or profile.use_hw_accel:
             return False
 
         normalized = error_text.lower()
         retry_markers = [
             "libaom-av1",
+            "libsvtav1",
+            "svt[error]",
             "cpu-used",
             "error applying encoder options",
             "error setting option",
@@ -2660,6 +2949,11 @@ class VideoCompressor:
                 if plan is not None:
                     self._check_clip_plan(plan)
                     media_info = effective_media_info(source_info, plan)
+                    if not plan.keep_audio and not profile.disable_audio:
+                        # The user asked for no sound: that is the request, so
+                        # exact mode must not report it as "audio removed".
+                        profile = self._clone_profile(profile)
+                        profile.disable_audio = True
                 job.clip_plan = plan
                 job.source_info = source_info
 
@@ -2738,11 +3032,19 @@ class VideoCompressor:
             job.total_frames = media_info.frame_count
 
             optimized_profile = self._optimize_video_profile(profile, media_info)
+            if job.clip_plan is not None and not job.clip_plan.keep_audio:
+                # The clips leave the sound out: no audio in the file, none in
+                # the size budget, and nothing for exact mode to trim later.
+                optimized_profile.disable_audio = True
             job.profile = optimized_profile
             optimized_profile.video_container = self.codec_manager.get_compatible_container(
                 optimized_profile.video_codec,
                 optimized_profile.video_container,
             ).value
+            job.encoder_note = self._fast_av1_substitution_note(
+                profile.video_codec,
+                optimized_profile.video_codec,
+            )
 
             desired_suffix = f".{get_video_extension(optimized_profile.video_codec.value, optimized_profile.video_container)}"
             if job.output_file.suffix.lower() != desired_suffix:
@@ -3075,6 +3377,9 @@ class VideoCompressor:
                         and not oversized_retry_done
                         and optimized_profile.video_codec == VideoCodec.AV1
                         and optimized_profile.use_hw_accel
+                        # Only an encode that really ran on a GPU. Fast AV1
+                        # on the CPU keeps the AV1 codec with hardware on.
+                        and job.encoder_name in HW_AV1_ENCODERS
                         and self.codec_manager.is_codec_available(VideoCodec.AV1)
                         and not optimized_profile.target_size_mb
                         and not optimized_profile.target_reduction_percent
@@ -3102,8 +3407,12 @@ class VideoCompressor:
                     and self._should_retry_with_safe_av1_settings(optimized_profile, stderr_text)
                 ):
                     retry_count += 1
-                    logger.warning("Retrying AV1 encode with safer preset after encoder option failure")
-                    optimized_profile.preset = "veryfast"
+                    logger.warning("Retrying AV1 encode with safer settings after encoder option failure")
+                    job.av1_safe_retry = True
+                    continue
+
+                if self._retry_fast_av1_on_cpu(job, optimized_profile, target_plan, stderr_text):
+                    retry_count = 0
                     continue
 
                 if self._offer_target_software_fallback(

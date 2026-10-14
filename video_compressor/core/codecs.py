@@ -13,6 +13,8 @@ import subprocess
 import platform
 import logging
 
+from .fast_av1 import SOFTWARE_AV1_ENCODERS, aom_tiles
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,7 @@ class VideoCodec(Enum):
     @property
     def display_name(self) -> str:
         names = {
-            VideoCodec.AV1: "Fast hardware AV1",
+            VideoCodec.AV1: "Fast AV1",
             VideoCodec.SVT_AV1: "SVT-AV1 (best compression, CPU)",
             VideoCodec.HEVC: "HEVC (H.265)",
             VideoCodec.H264: "H.264 (AVC)",
@@ -62,14 +64,25 @@ class VideoCodec(Enum):
 
     @property
     def ffmpeg_encoder(self) -> str:
+        """Preferred software encoder. Fast AV1 runs SVT-AV1 at a fast preset."""
         encoders = {
-            VideoCodec.AV1: "libaom-av1",
+            VideoCodec.AV1: "libsvtav1",
             VideoCodec.SVT_AV1: "libsvtav1",
             VideoCodec.HEVC: "libx265",
             VideoCodec.H264: "libx264",
             VideoCodec.VP9: "libvpx-vp9",
         }
         return encoders.get(self, "libx264")
+
+    @property
+    def software_encoders(self) -> Tuple[str, ...]:
+        """Software encoders for this lane, best first.
+
+        Fast AV1 falls back to libaom-av1 when FFmpeg has no libsvtav1.
+        """
+        if self == VideoCodec.AV1:
+            return SOFTWARE_AV1_ENCODERS
+        return (self.ffmpeg_encoder,)
 
     @property
     def hw_encoders(self) -> Dict[str, str]:
@@ -117,7 +130,7 @@ class VideoCodec(Enum):
             VideoCodec.HEVC: 3,
             VideoCodec.SVT_AV1: 2,
             VideoCodec.VP9: 2,
-            VideoCodec.AV1: 1,
+            VideoCodec.AV1: 3,
         }
         return order.get(self, 1)
 
@@ -418,11 +431,17 @@ class CodecSettings:
     film_grain: int = 0
     audio_mode: AudioMode = AudioMode.AUTO
     custom_encoder_opts: str = ""
+    # Software encoder this FFmpeg actually has (Fast AV1: libsvtav1, else
+    # libaom-av1). None uses ``video_codec.ffmpeg_encoder``.
+    software_encoder: Optional[str] = None
+    # Output frame size, when known. libaom picks its tile layout from it.
+    frame_width: int = 0
+    frame_height: int = 0
 
     def to_ffmpeg_args(self, hw_encoder: Optional[str] = None) -> List[str]:
         """Convert settings to FFmpeg command-line arguments."""
         args: List[str] = []
-        encoder = hw_encoder or self.video_codec.ffmpeg_encoder
+        encoder = hw_encoder or self.software_encoder or self.video_codec.ffmpeg_encoder
         args.extend(["-c:v", encoder])
 
         reg = ENCODER_REGISTRY.get(encoder, {})
@@ -584,6 +603,14 @@ class CodecSettings:
 
     # â”€â”€ AOM-AV1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     def _build_aom_args(self, reg: Dict) -> List[str]:
+        """libaom-av1, the Fast AV1 fallback when FFmpeg has no SVT-AV1.
+
+        libaom's "good" mode runs about 0.2x real time on 1080p even at
+        cpu-used 8 with every core. Its realtime mode at cpu-used 8, with row
+        and tile threading, runs about 2.6x on 4 cores at a similar size and
+        quality to SVT-AV1 preset 9-10, so the lane always uses that. A
+        named preset (the safe retry after an option error) uses good mode.
+        """
         args: List[str] = []
         rc = self.rate_control
 
@@ -599,13 +626,11 @@ class CodecSettings:
         else:
             args.extend(["-crf", str(self.crf if self.crf is not None else 30), "-b:v", "0"])
 
-        speed = self._map_av1_preset(self.preset)
-        args.extend(["-usage", "good", "-cpu-used", str(speed)])
-        args.extend(["-aq-mode", "1", "-lag-in-frames", "25", "-row-mt", "1"])
-        if self.threads and self.threads >= 8:
-            args.extend(["-tile-columns", "2"])
-        if self.threads and self.threads >= 16:
-            args.extend(["-tile-rows", "1"])
+        usage = "realtime" if str(self.preset).isdigit() else "good"
+        args.extend(["-usage", usage, "-cpu-used", "8", "-row-mt", "1"])
+        tiles = aom_tiles(self.frame_width, self.frame_height)
+        if tiles:
+            args.extend(["-tiles", tiles])
         if self.threads:
             args.extend(["-threads", str(self.threads)])
         return args
@@ -704,10 +729,7 @@ class CodecSettings:
         preset = self.preset if self.preset in (reg.get("presets") or []) else (reg.get("default_preset") or "balanced")
         args.extend(["-quality", preset])
 
-        if rc == RateControl.CQP:
-            qp = self.crf if self.crf is not None else 28
-            args.extend(["-rc", "cqp", "-qp_i", str(qp), "-qp_p", str(min(51, qp + 2))])
-        elif rc == RateControl.QVBR:
+        if rc == RateControl.QVBR:
             quality = self.crf if self.crf is not None else 28
             args.extend(["-rc", "qvbr", "-qvbr_quality_level", str(quality)])
         elif rc == RateControl.CBR:
@@ -718,6 +740,17 @@ class CodecSettings:
             br = str(self.video_bitrate or 5_000_000)
             mx = str(self.max_bitrate or int((self.video_bitrate or 5_000_000) * 1.5))
             args.extend(["-rc", "vbr_peak", "-b:v", br, "-maxrate", mx])
+        elif encoder == "av1_amf":
+            # av1_amf takes AV1 q-index QPs (0-255), not the 0-51 H.264/HEVC
+            # scale. CQ 30 used to mean near-lossless (40 MB for a 10 s 1080p
+            # clip that SVT-AV1 makes 18 MB). CRF-like CQ x4 is the AV1
+            # CRF-to-q-index scale: CQ 30 -> 120 matched SVT-AV1 CRF 33-34
+            # in VMAF at the same speed, with files 2.4x (detailed) to 60x
+            # (grainy) smaller than before. AMF AV1 sends I and P frames only
+            # here, so no B-frame QP is set.
+            cq = self.crf if self.crf is not None else 30
+            qindex = str(max(0, min(255, int(cq) * 4)))
+            args.extend(["-rc", "cqp", "-qp_i", qindex, "-qp_p", qindex])
         else:
             qp = self.crf if self.crf is not None else 28
             args.extend(["-rc", "cqp", "-qp_i", str(qp), "-qp_p", str(min(51, qp + 2))])
@@ -870,7 +903,18 @@ class CodecManager:
         return encoder in self.available_encoders
 
     def is_codec_available(self, codec: VideoCodec) -> bool:
-        return self.is_encoder_available(codec.ffmpeg_encoder)
+        """True when FFmpeg has a software encoder for this lane."""
+        return self.software_encoder_for(codec) is not None
+
+    def software_encoder_for(self, codec: VideoCodec) -> Optional[str]:
+        """The first software encoder for ``codec`` that this FFmpeg lists.
+
+        Fast AV1 is libsvtav1, else libaom-av1. None when FFmpeg has neither.
+        """
+        for encoder in codec.software_encoders:
+            if self.is_encoder_available(encoder):
+                return encoder
+        return None
 
     def is_codec_usable(self, codec: VideoCodec, hw_vendor: Optional[str] = None) -> bool:
         if self.is_codec_available(codec):
