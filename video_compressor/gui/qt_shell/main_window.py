@@ -502,7 +502,16 @@ class SquishItWindow(QMainWindow):
             if not plan:
                 self._settings.set_size_preview("")
                 return
-            self._settings.set_size_preview(describe_target_size_plan(plan, info.size))
+            text = describe_target_size_plan(plan, info.size)
+            advice = getattr(self._compressor, "recommend_profile_adjustments", None)
+            if advice is not None:
+                try:
+                    tip = advice(profile, info)
+                except Exception:
+                    tip = ""
+                if tip:
+                    text = f"{text}\n{tip}"
+            self._settings.set_size_preview(text)
         except Exception:
             self._settings.set_size_preview("Preview unavailable for the current selection.")
 

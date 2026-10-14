@@ -920,6 +920,13 @@ def process_file(
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point."""
+    # A piped or legacy Windows console cannot print the check marks below;
+    # show "?" for those instead of crashing after the encode has finished.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = create_parser()
     args = parser.parse_args(attach_clip_values(sys.argv[1:] if argv is None else argv))
     
