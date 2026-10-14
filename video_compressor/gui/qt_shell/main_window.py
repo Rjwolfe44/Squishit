@@ -38,7 +38,8 @@ from PySide6.QtWidgets import (
 )
 
 from ...config import APP_NAME, get_config, get_config_manager
-from ...core.clips import ClipPlan, expand_clip_jobs
+from ...core.clips import ClipPlan, effective_media_info, expand_clip_jobs
+from ...core.codecs import VideoCodec
 from ...core.history import HistoryEntry, HistoryManager
 from ...core.profiles import (
     QUICK_COMPRESS_ORDER,
@@ -162,6 +163,7 @@ class SquishItWindow(QMainWindow):
         self._preview = None
         self._update_info = None
         self._update_check = None
+        self._compare_mode = False
         self._current_profile: Optional[CompressionProfile] = None
         self._selected_profile = get_config().default_profile or "Balanced"
         self.form = EncodeForm(
@@ -318,6 +320,13 @@ class SquishItWindow(QMainWindow):
         self._compress_btn.setObjectName("primary")
         self._compress_btn.clicked.connect(self.start_compression)
         actions.addWidget(self._compress_btn)
+        self._compare_btn = QPushButton("Compare sample")
+        self._compare_btn.setToolTip(
+            "Try a few settings on a short piece of the first video, so you can "
+            "pick one before compressing everything."
+        )
+        self._compare_btn.clicked.connect(self._compare_first)
+        actions.addWidget(self._compare_btn)
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.clicked.connect(self.cancel_all)
         self._cancel_btn.setEnabled(False)
@@ -474,10 +483,17 @@ class SquishItWindow(QMainWindow):
         if not profile.target_size_mb or profile.output_mode != "video":
             self._settings.set_size_preview("")
             return
-        info = self._first_video_info()
+        item = self._first_video_item()
+        info = item.get("info") if item else None
         if info is None:
             self._settings.set_size_preview("Preview pending source analysis…")
             return
+        clips = (item or {}).get("clips")
+        if clips is not None:
+            # A size target applies to each output, so judge it against a clip.
+            first = clips.clips[0] if clips.mode.value != "join" else None
+            shown = ClipPlan((first,)) if first is not None else clips
+            info = effective_media_info(info, shown)
         if self._compressor is None:
             self._settings.set_size_preview("")
             return
@@ -495,6 +511,13 @@ class SquishItWindow(QMainWindow):
             info = item.get("info")
             if info is not None and hasattr(info, "video_codec"):
                 return info
+        return None
+
+    def _first_video_item(self):
+        for item in self._files.values():
+            info = item.get("info")
+            if info is not None and hasattr(info, "video_codec"):
+                return item
         return None
 
     def _get_compressor(self):
@@ -539,6 +562,7 @@ class SquishItWindow(QMainWindow):
             clear_trim=self.clear_trim,
             move_top=self.move_to_top,
             compress_only=self.compress_only,
+            compare_sample=self.compare_sample,
         )
 
     def _add_file(self, path: Path, key: str) -> None:
@@ -830,6 +854,7 @@ class SquishItWindow(QMainWindow):
 
         self._running = running
         self._compress_btn.setEnabled(not running)
+        self._compare_btn.setEnabled(not running)
         self._clear_btn.setEnabled(not running)
         self._cancel_btn.setEnabled(running)
         for item in self._files.values():
@@ -934,6 +959,140 @@ class SquishItWindow(QMainWindow):
                 row.update_job(job, awaiting=job_id in self._awaiting_fallback)
         self._queue_label.setText("Compressing…")
 
+    # -- compare sample -------------------------------------------------
+
+    def _compare_first(self) -> None:
+        """Header button: compare settings on the first readable video."""
+
+        if self._running:
+            return
+        for key in self._files:
+            info = self._files[key].get("info")
+            if info is not None and hasattr(info, "video_codec"):
+                self.compare_sample(Path(self._files[key]["path"]))
+                return
+        self._queue_label.setText("Add a video first. Compare works on videos.")
+
+    def _build_compare_profiles(self, base: CompressionProfile) -> list[CompressionProfile]:
+        """A small set of settings to try next to the current ones."""
+
+        compressor = self._get_compressor()
+        codec_manager = getattr(compressor, "codec_manager", None)
+        candidates: list[CompressionProfile] = []
+        seen: set[tuple[str, str, bool]] = set()
+
+        def _candidate(name: str, codec: VideoCodec, preset: str, use_hw: bool):
+            profile = CompressionProfile.from_dict(base.to_dict())
+            profile.name = name
+            profile.video_codec = codec
+            profile.preset = preset
+            profile.use_hw_accel = use_hw
+            profile.target_size_mb = None
+            profile.target_reduction_percent = None
+            if codec_manager is not None:
+                profile.video_container = codec_manager.get_compatible_container(
+                    codec, base.video_container
+                ).value
+            return profile
+
+        specs = [
+            (
+                f"Current \u00b7 {base.video_codec.value.upper()}",
+                base.video_codec,
+                base.preset,
+                base.use_hw_accel,
+            ),
+            ("HEVC balanced", VideoCodec.HEVC, "medium", True),
+            ("HEVC smaller", VideoCodec.HEVC, "slow", True),
+            ("H.264 fast", VideoCodec.H264, "fast", True),
+        ]
+        for name, codec, preset, use_hw in specs:
+            key = (codec.value, preset, bool(use_hw))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(_candidate(name, codec, preset, use_hw))
+            if len(candidates) == 3:
+                break
+        return candidates
+
+    def compare_sample(self, path: Path) -> None:
+        """Encode a short piece of one video three ways and show the results."""
+
+        if self._running:
+            return
+        key = str(Path(path).resolve())
+        item = self._files.get(key)
+        info = item.get("info") if item else None
+        if item is None or info is None or not hasattr(info, "video_codec"):
+            self._queue_label.setText("Compare works on videos that SquishIt can read.")
+            return
+        profile = self.job_profile()
+        self._current_profile = profile
+        self._compare_mode = True
+        self._cancel_requested = False
+        self._results.clear()
+        self._awaiting_fallback.clear()
+        self._set_running(True)
+        self._clear_results()
+        self._clear_activity()
+        profiles = self._build_compare_profiles(profile)
+        self._pending = []
+        self._active = 0
+        out_dir = (self._output_folder or Path(item["path"]).parent) / "_compare_samples"
+        self._queue_label.setText(
+            f"Comparing {len(profiles)} short samples of {Path(item['path']).name}\u2026"
+        )
+        compressor = self._get_compressor()
+        source = Path(item["path"])
+
+        def _worker() -> None:
+            try:
+                results = compressor.compare_sample(
+                    input_file=source,
+                    output_dir=out_dir,
+                    profiles=profiles,
+                    sample_seconds=20.0,
+                )
+                for result in results:
+                    self._queue.put(("compare_result", result))
+                self._queue.put(("compare_done",))
+            except Exception as exc:
+                logger.exception("Compare sample failed")
+                self._queue.put(("compare_failed", str(exc) or "The comparison failed."))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_compare(self, error: str = "") -> None:
+        if not self._compare_mode:
+            return
+        self._compare_mode = False
+        self._set_running(False)
+        self._current_profile = None
+        self._cancel_requested = False
+        self._clear_activity()
+        self._clear_results()
+        if error:
+            self._queue_label.setText(f"Could not compare: {error}")
+            return
+        shown = [r for r in self._results if getattr(r, "success", False)]
+        if not shown:
+            self._queue_label.setText("The comparison did not finish.")
+            return
+        smallest = min(shown, key=lambda r: getattr(r, "compressed_size", 0) or 0)
+        label = getattr(smallest, "output_file", None)
+        self._queue_label.setText(
+            "Samples ready. Smallest: "
+            + (Path(label).stem if label else "unknown")
+            + ". Short samples are in a folder called _compare_samples."
+        )
+        open_btn = QPushButton("Show in folder")
+        open_btn.clicked.connect(self._open_output_folder)
+        self._results_box.addWidget(section_header("Sample results", extra=open_btn))
+        for result in self._results:
+            if not getattr(result, "cancelled", False):
+                self._results_box.addWidget(ResultRow(result))
+
     def _cancel_one(self, job_id: str) -> None:
         if self._compressor is not None:
             self._compressor.cancel_job(job_id)
@@ -992,6 +1151,14 @@ class SquishItWindow(QMainWindow):
                     logger.debug("Row for %s is gone", key)
             self._on_file_info(key, item, info)
             self._refresh_preview()
+        elif kind == "compare_result":
+            _kind, result = message
+            self._results.append(result)
+        elif kind == "compare_done":
+            self._finish_compare()
+        elif kind == "compare_failed":
+            _kind, text = message
+            self._finish_compare(error=text)
         elif kind == "thumb":
             _kind, key, width, height, rgb = message
             item = self._files.get(key)

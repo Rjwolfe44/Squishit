@@ -21,9 +21,16 @@ from video_compressor.gui.qt_shell.rows import clip_summary, clock, describe_med
 class _FakeCompressor:
     """Records compress_async calls; never runs ffmpeg."""
 
+    codec_manager = SimpleNamespace(
+        get_compatible_container=lambda codec, container: SimpleNamespace(value="mp4")
+    )
+
     def __init__(self, *args, **kwargs):
         self.calls: list[dict] = []
         self.cancelled: list[str] = []
+        self.compare_calls: list[tuple] = []
+        self.compare_error: str = ""
+        self.plan_durations: list[float] = []
 
     def set_progress_callback(self, callback):
         self.progress = callback
@@ -52,6 +59,34 @@ class _FakeCompressor:
 
     def _select_hw_encoder(self, codec):
         return None
+
+    def _resolve_target_size_plan(self, profile, info):
+        self.plan_durations.append(info.duration)
+        return None
+
+    def compare_sample(self, input_file, output_dir, profiles, sample_seconds=20.0):
+        self.compare_calls.append((input_file, Path(output_dir), [p.name for p in profiles]))
+        if self.compare_error:
+            raise ValueError(self.compare_error)
+        return [
+            SimpleNamespace(
+                success=True,
+                skipped=False,
+                cancelled=False,
+                kept_original=False,
+                input_file=input_file,
+                output_file=Path(output_dir) / f"sample{i}.mp4",
+                original_size=1000,
+                compressed_size=400 + i * 100,
+                reduction_percent=50.0,
+                encoding_time=1.0,
+                encoder_name="",
+                note="Sample compare",
+                error_message="",
+                video_codec="h264",
+            )
+            for i, _ in enumerate(profiles)
+        ]
 
 
 @pytest.fixture
@@ -419,3 +454,125 @@ def test_clock_and_media_description():
     text = describe_media(info)
     assert text.startswith("1:23 \u00b7 1920\u00d71080 \u00b7 ")
     assert text.endswith("h264")
+
+
+# ── compare sample and size preview ──────────────────────────────────────────
+
+
+def _video_info(duration=60.0):
+    from video_compressor.core.compressor import VideoInfo
+
+    return VideoInfo(
+        filepath=Path("movie.mp4"),
+        duration=duration,
+        size=60_000_000,
+        width=1280,
+        height=720,
+        fps=30.0,
+        avg_fps=30.0,
+        video_codec="h264",
+        audio_codec="aac",
+        frame_count=int(duration * 30),
+    )
+
+
+def _wait_until(app, predicate, seconds=5.0):
+    import time
+
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        win_pump = getattr(predicate, "pump", None)
+        if win_pump:
+            win_pump()
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_compare_sample_encodes_three_samples_and_lists_them(window, tmp_path):
+    win, app = window
+    recorded = []
+    win._history = SimpleNamespace(add_entry=lambda entry: recorded.append(entry))
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info()))
+    win._pump()
+    win.compare_sample(Path(key))
+    assert win._running is True and win._compare_btn.isEnabled() is False
+
+    def done():
+        win._pump()
+        return not win._running
+
+    assert _wait_until(app, done)
+    calls = win._compressor.compare_calls
+    assert len(calls) == 1
+    source, out_dir, names = calls[0]
+    assert Path(source) == Path(key) and out_dir.name == "_compare_samples"
+    assert len(names) == 3
+    assert "Smallest" in win._queue_label.text()
+    assert win._results_box.count() == 4  # header + three samples
+    assert recorded == []  # samples never count toward the savings history
+    assert win._compare_btn.isEnabled() is True
+    assert win._files[key]["row"]._busy is False
+
+
+def test_compare_sample_needs_a_readable_video(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win.compare_sample(Path(key))  # still analysing / unreadable
+    assert win._running is False
+    assert win._compressor is None or not win._compressor.compare_calls
+    win._compare_first()
+    assert "Add a video first" in win._queue_label.text()
+
+
+def test_compare_sample_failure_is_explained(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info()))
+    win._pump()
+    win._get_compressor().compare_error = "disk is full"
+    win.compare_sample(Path(key))
+
+    def done():
+        win._pump()
+        return not win._running
+
+    assert _wait_until(app, done)
+    assert "disk is full" in win._queue_label.text()
+    assert win._results_box.count() == 0
+
+
+def test_compare_header_button_uses_the_first_video(window, tmp_path):
+    win, app = window
+    first = _add(win, app, tmp_path, "a.mp4")
+    second = _add(win, app, tmp_path, "b.mp4")
+    win._queue.put(("info", first, None))
+    win._queue.put(("info", second, _video_info()))
+    win._pump()
+    win._compare_first()
+
+    def done():
+        win._pump()
+        return not win._running
+
+    assert _wait_until(app, done)
+    assert Path(win._compressor.compare_calls[0][0]).name == "b.mp4"
+
+
+def test_size_preview_is_judged_against_the_clip_not_the_whole_video(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info(60.0)))
+    win._pump()
+    win.form.target_size_enabled = True
+    win.form.target_size_mb = 8
+    win._refresh_preview()
+    compressor = win._get_compressor()
+    assert compressor.plan_durations[-1] == pytest.approx(60.0)
+    win.set_clips(key, ClipPlan((Clip(10, 22), Clip(30, 45)), ClipMode.SEPARATE))
+    assert compressor.plan_durations[-1] == pytest.approx(12.0)  # the first clip
+    win.set_clips(key, ClipPlan((Clip(10, 22), Clip(30, 45)), ClipMode.JOIN))
+    assert compressor.plan_durations[-1] == pytest.approx(27.0)  # the joined total
