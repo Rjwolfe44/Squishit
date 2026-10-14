@@ -101,6 +101,7 @@ class SettingsPane(QWidget):
 
     def set_profiles(self, profiles: Sequence[CompressionProfile]) -> None:
         self._profiles = list(profiles)
+        self._rebuild_more()
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
