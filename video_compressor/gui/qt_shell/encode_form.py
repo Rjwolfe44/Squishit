@@ -7,6 +7,7 @@ shared quality ladder. Nothing here assembles an FFmpeg command.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +49,26 @@ RESOLUTION_LABELS = ["original", "4K", "1440p", "1080p", "720p", "480p"]
 FRAME_RATE_LABELS = ["original", "60", "30", "24"]
 GOVERNORS = ["auto", "low", "balanced", "max"]
 EXACT_AUDIO = ["keep", "reduce", "drop"]
-AUDIO_CODECS = ["aac", "opus", "mp3", "vorbis", "flac", "ac3"]
+AUDIO_CODECS = ["aac", "opus", "mp3", "vorbis", "flac", "alac", "ac3"]
+AUDIO_KBPS = [64, 96, 128, 160, 192, 256, 320]
+# (label, AudioMode value) for the audio track handling choice.
+AUDIO_HANDLING = [
+    ("Automatic", "auto"),
+    ("Re-encode", "reencode"),
+    ("Keep the original audio", "copy"),
+    ("Remove the audio", "strip"),
+]
+OUTPUT_TYPES = [("Video", "video"), ("Audio only", "audio")]
+IMAGE_FORMATS = ["webp", "avif", "jpg", "png", "jxl"]
+THREAD_CHOICES = ["Auto", "1", "2", "4", "6", "8", "12", "16"]
+QUEUE_ORDERS = [
+    ("As listed", "manual"),
+    ("Largest first", "largest-first"),
+    ("Smallest first", "smallest-first"),
+    ("Longest first", "longest-first"),
+    ("Shortest first", "shortest-first"),
+]
+FILE_NAME_FIELDS = "{name} {profile} {codec} {crf} {date} {timestamp} {clip}"
 
 _RES_TO_HEIGHT = {
     "original": None,
@@ -111,6 +131,8 @@ class EncodeForm:
     trim_start: Optional[float] = None
     trim_end: Optional[float] = None
     extra_ffmpeg_args: str = ""
+    audio_mode: str = "auto"
+    queue_order: str = "manual"
 
     def rung(self) -> QualityRung:
         try:
@@ -250,6 +272,7 @@ class EncodeForm:
         self.trim_start = profile.trim_start
         self.trim_end = profile.trim_end
         self.extra_ffmpeg_args = profile.extra_ffmpeg_args or ""
+        self.audio_mode = profile.audio_mode or "auto"
 
     def build_profile(self, name: str, base: CompressionProfile) -> CompressionProfile:
         """Profile passed to ``compress_async``. Encoder args stay in the backend."""
@@ -284,12 +307,14 @@ class EncodeForm:
             image_format=self.image_format or base.image_format,
             threads=self.threads,
             resource_governor=self.resource_governor or base.resource_governor,
-            trim_enabled=self.trim_enabled,
-            trim_start=self.trim_start,
-            trim_end=self.trim_end,
+            # Trimming is per file now (clips from the Trim editor), so a saved
+            # profile's old single range must not silently cut every file.
+            trim_enabled=False,
+            trim_start=None,
+            trim_end=None,
             extra_ffmpeg_args=self.extra_ffmpeg_args,
             rate_control=base.rate_control,
-            audio_mode=base.audio_mode,
+            audio_mode=self.audio_mode or base.audio_mode,
             tune=base.tune,
         )
 
@@ -299,8 +324,14 @@ def output_path_for(
     profile: CompressionProfile,
     folder: Optional[Path],
     template: str,
+    clip_token: str = "",
 ) -> Path:
-    """Destination path. Container and suffix come from the profile and template."""
+    """Destination path. Container and suffix come from the profile and template.
+
+    ``clip_token`` names one clip of a multi-clip export (``clip01`` or the
+    clip's label). The template may place it with ``{clip}``; without that
+    field it is appended as ``_<token>`` so clips never share a name.
+    """
 
     media_type = detect_media_type(input_path)
     if profile.output_mode == "audio":
@@ -328,7 +359,15 @@ def output_path_for(
             crf=profile.crf,
             date=now.strftime("%Y-%m-%d"),
             timestamp=now.strftime("%H%M%S"),
+            clip=clip_token,
         )
     except Exception:
         stem = f"{input_path.stem}_compressed"
+    else:
+        if "{clip}" in pattern:
+            if not clip_token:
+                # No clip to name: close the gap the empty field left behind.
+                stem = re.sub(r"_{2,}", "_", stem).strip("_- .") or input_path.stem
+        elif clip_token:
+            stem = f"{stem}_{clip_token}"
     return dest / (sanitize_filename(stem) + ext)

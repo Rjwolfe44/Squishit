@@ -36,14 +36,21 @@ from ..copy import (
 )
 from .encode_form import (
     AUDIO_CODECS,
+    AUDIO_HANDLING,
+    AUDIO_KBPS,
     CODEC_CHOICES,
     CODEC_LABELS,
     EXACT_AUDIO,
+    FILE_NAME_FIELDS,
     FRAME_RATE_LABELS,
     GOVERNORS,
+    IMAGE_FORMATS,
+    OUTPUT_TYPES,
+    QUEUE_ORDERS,
     RESOLUTION_LABELS,
     RUNG_LABELS,
     TARGET_MODES,
+    THREAD_CHOICES,
     EncodeForm,
     containers_for,
 )
@@ -218,10 +225,32 @@ class SettingsPane(QWidget):
             self._audio.addItem(name, name)
         self._audio.currentIndexChanged.connect(self._on_audio)
         out_form.addRow("Audio", self._audio)
+        self._audio_kbps = QComboBox()
+        for kbps in AUDIO_KBPS:
+            self._audio_kbps.addItem(f"{kbps} kbps", kbps)
+        self._audio_kbps.currentIndexChanged.connect(self._on_audio_kbps)
+        out_form.addRow("Audio quality", self._audio_kbps)
+        self._audio_handling = QComboBox()
+        for label, value in AUDIO_HANDLING:
+            self._audio_handling.addItem(label, value)
+        self._audio_handling.currentIndexChanged.connect(self._on_audio_handling)
+        out_form.addRow("Audio track", self._audio_handling)
+        self._output_type = QComboBox()
+        for label, value in OUTPUT_TYPES:
+            self._output_type.addItem(label, value)
+        self._output_type.currentIndexChanged.connect(self._on_output_type)
+        out_form.addRow("Save as", self._output_type)
+        self._image_format = QComboBox()
+        self._image_format.addItems(IMAGE_FORMATS)
+        self._image_format.currentIndexChanged.connect(self._on_image_format)
+        out_form.addRow("Pictures as", self._image_format)
         root.addLayout(out_form)
         self._template = QLineEdit()
         self._template.setPlaceholderText("{name}_compressed")
         self._template.editingFinished.connect(self._on_template)
+        self._template.setToolTip(
+            "Words in braces are filled in for each file: " + FILE_NAME_FIELDS
+        )
         template_form = QFormLayout()
         template_form.addRow("File name", self._template)
         root.addLayout(template_form)
@@ -236,7 +265,31 @@ class SettingsPane(QWidget):
         self._parallel.addItems(["1", "2", "3", "4", "6", "8"])
         self._parallel.currentIndexChanged.connect(self._on_parallel)
         perf.addRow("Files at once", self._parallel)
+        self._threads = QComboBox()
+        self._threads.addItems(THREAD_CHOICES)
+        self._threads.setToolTip("How many processor threads one encode may use.")
+        self._threads.currentIndexChanged.connect(self._on_threads)
+        perf.addRow("Processor threads", self._threads)
+        self._queue_order = QComboBox()
+        for label, value in QUEUE_ORDERS:
+            self._queue_order.addItem(label, value)
+        self._queue_order.currentIndexChanged.connect(self._on_queue_order)
+        perf.addRow("Run order", self._queue_order)
         root.addLayout(perf)
+
+        root.addWidget(_section("For experts"))
+        self._extra_args = QLineEdit()
+        self._extra_args.setPlaceholderText("-tune film")
+        self._extra_args.editingFinished.connect(self._on_extra_args)
+        expert_form = QFormLayout()
+        expert_form.addRow("Extra FFmpeg options", self._extra_args)
+        root.addLayout(expert_form)
+        root.addWidget(
+            _hint(
+                "Added to the end of the FFmpeg command as typed. Leave this "
+                "empty unless you know what you are adding."
+            )
+        )
 
     def _rebuild_more(self) -> None:
         self._more.blockSignals(True)
@@ -293,6 +346,27 @@ class SettingsPane(QWidget):
                 parallel_index = self._parallel.findText(str(form.parallel_jobs))
             self._parallel.setCurrentIndex(max(0, parallel_index))
             self._template.setText(form.output_name_template)
+            kbps_index = self._audio_kbps.findData(int(form.audio_kbps))
+            if kbps_index < 0:
+                self._audio_kbps.addItem(f"{int(form.audio_kbps)} kbps", int(form.audio_kbps))
+                kbps_index = self._audio_kbps.findData(int(form.audio_kbps))
+            self._audio_kbps.setCurrentIndex(max(0, kbps_index))
+            self._audio_handling.setCurrentIndex(
+                max(0, self._audio_handling.findData(form.audio_mode))
+            )
+            self._output_type.setCurrentIndex(
+                max(0, self._output_type.findData(form.output_mode))
+            )
+            self._image_format.setCurrentIndex(
+                max(0, self._image_format.findText(form.image_format))
+            )
+            self._threads.setCurrentIndex(
+                max(0, self._threads.findText(str(form.threads or "Auto")))
+            )
+            self._queue_order.setCurrentIndex(
+                max(0, self._queue_order.findData(form.queue_order))
+            )
+            self._extra_args.setText(form.extra_ffmpeg_args or "")
             self._refresh_hints()
             self._refresh_profile_chrome(form.quick_name)
         finally:
@@ -529,6 +603,55 @@ class SettingsPane(QWidget):
         if self._loading:
             return
         self.form.output_name_template = self._template.text().strip() or "{name}_compressed"
+        self._emit_field()
+
+    def _on_audio_kbps(self) -> None:
+        if self._loading:
+            return
+        self.form.audio_kbps = int(self._audio_kbps.currentData() or 128)
+        self.form.note_manual_edit()
+        self._emit_field()
+
+    def _on_audio_handling(self) -> None:
+        if self._loading:
+            return
+        self.form.audio_mode = str(self._audio_handling.currentData() or "auto")
+        self.form.note_manual_edit()
+        self._emit_field()
+
+    def _on_output_type(self) -> None:
+        if self._loading:
+            return
+        self.form.output_mode = str(self._output_type.currentData() or "video")
+        self.form.note_manual_edit()
+        self._emit_field()
+
+    def _on_image_format(self) -> None:
+        if self._loading:
+            return
+        self.form.image_format = self._image_format.currentText() or "webp"
+        self.form.note_manual_edit()
+        self._emit_field()
+
+    def _on_threads(self) -> None:
+        if self._loading:
+            return
+        text = self._threads.currentText()
+        self.form.threads = int(text) if text.isdigit() else None
+        self.form.note_manual_edit()
+        self._emit_field()
+
+    def _on_queue_order(self) -> None:
+        if self._loading:
+            return
+        self.form.queue_order = str(self._queue_order.currentData() or "manual")
+        self._emit_field()
+
+    def _on_extra_args(self) -> None:
+        if self._loading:
+            return
+        self.form.extra_ffmpeg_args = self._extra_args.text().strip()
+        self.form.note_manual_edit()
         self._emit_field()
 
     def _on_governor(self) -> None:

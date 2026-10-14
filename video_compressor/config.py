@@ -82,6 +82,8 @@ class AppConfig:
     notify_on_completion: bool = True
     history_max_entries: int = 100
     batch_queue_order: str = "manual"
+    open_folder_when_done: bool = False
+    last_output_folder: str = ""
 
     # Logging
     log_level: str = "INFO"
@@ -128,6 +130,8 @@ class AppConfig:
             "notify_on_completion": self.notify_on_completion,
             "history_max_entries": self.history_max_entries,
             "batch_queue_order": self.batch_queue_order,
+            "open_folder_when_done": self.open_folder_when_done,
+            "last_output_folder": self.last_output_folder,
         }
     
     @classmethod
@@ -168,6 +172,8 @@ class AppConfig:
             notify_on_completion=data.get("notify_on_completion", True),
             history_max_entries=data.get("history_max_entries", 100),
             batch_queue_order=data.get("batch_queue_order", "manual"),
+            open_folder_when_done=data.get("open_folder_when_done", False),
+            last_output_folder=data.get("last_output_folder", ""),
         )
 
 

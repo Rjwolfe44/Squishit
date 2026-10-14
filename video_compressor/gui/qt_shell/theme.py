@@ -241,6 +241,105 @@ QToolTip {
     border: 1px solid #d4d4d8;
     padding: 4px;
 }
+QLabel#thumb {
+    background: #000000;
+    color: #a1a1aa;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    font-size: 11px;
+}
+QLabel#rowName {
+    font-weight: 700;
+    background: transparent;
+}
+QLabel#clipBadge {
+    background: #1d3461;
+    color: #dbeafe;
+    border: 1px solid #3b82f6;
+    border-radius: 9px;
+    padding: 2px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QToolButton#badgeClear {
+    background: transparent;
+    color: #d4d4d8;
+    border: none;
+    padding: 0 4px;
+    font-size: 15px;
+}
+QToolButton#badgeClear:hover {
+    color: #ffffff;
+}
+QToolButton#moreButton {
+    background: #27272a;
+    color: #fafafa;
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-weight: 700;
+}
+QToolButton#moreButton:hover {
+    background: #3f3f46;
+}
+QToolButton#moreButton::menu-indicator {
+    image: none;
+}
+QFrame#banner {
+    background: #1d3461;
+    border: 1px solid #3b82f6;
+    border-radius: 10px;
+}
+QFrame#banner QLabel {
+    background: transparent;
+}
+QTableWidget, QTableView, QListWidget {
+    background: #18181b;
+    color: #fafafa;
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+    gridline-color: #27272a;
+    selection-background-color: #1d4ed8;
+    selection-color: #ffffff;
+}
+QHeaderView::section {
+    background: #27272a;
+    color: #d4d4d8;
+    border: none;
+    border-bottom: 1px solid #3f3f46;
+    padding: 6px 8px;
+    font-weight: 600;
+}
+QRadioButton {
+    background: transparent;
+    spacing: 8px;
+}
+QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #d4d4d8;
+    border-radius: 9px;
+    background: #27272a;
+}
+QRadioButton::indicator:checked {
+    background: #3b82f6;
+    border: 1px solid #93c5fd;
+}
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #3f3f46;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #d4d4d8;
+    width: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+}
+QSlider::sub-page:horizontal {
+    background: #3b82f6;
+    border-radius: 3px;
+}
 """
 
 

@@ -14,21 +14,22 @@ import queue
 import sys
 import threading
 import webbrowser
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSplitter,
     QVBoxLayout,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...config import APP_NAME, APP_VERSION, get_config, get_config_manager
+from ...core.clips import ClipPlan, expand_clip_jobs
 from ...core.history import HistoryEntry, HistoryManager
 from ...core.profiles import (
     QUICK_COMPRESS_ORDER,
@@ -46,7 +48,10 @@ from ...core.profiles import (
     normalize_quick_compress_name,
 )
 from ...core.updater import RELEASES_URL
-from ...core.utils import collect_media_files, format_size, format_time
+from ...core.utils import (
+    SUPPORTED_MEDIA_EXTENSIONS,
+    collect_media_files,
+)
 from ..copy import (
     DROP_ZONE_NEXT,
     DROP_ZONE_TITLE,
@@ -59,29 +64,51 @@ from ..copy import (
     TRAY_HINT,
     help_menu_items,
     human_progress_status,
-    progress_detail,
 )
 from ..hw_status import (
     HardwareProbe,
     describe_hw_status,
-    encoder_result_label,
     probe_from_compressor,
     status_summary,
 )
 from ..ipc import SingleInstanceServer
 from ..software_fallback_dialog import (
     bind_main_window_software_fallback,
-    declined_software_fallback_notice,
     handle_software_fallback_queue_message,
     with_declined_fallback_summary,
 )
 from .dialogs import qt_yes_no_ask, show_about
 from .encode_form import EncodeForm, output_path_for
 from .hw_card import HardwareStatusCard
+from .rows import (
+    FileRow,
+    ProgressRow,
+    ResultRow,
+    RowActions,
+    clip_summary,
+    pixmap_from_rgb,
+    reveal_in_folder,
+    section_header,
+)
 from .settings_pane import SettingsPane, scroll_wrap
 from .theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
+
+_MEDIA_FILTER = "Media (" + " ".join(
+    f"*{ext}" for ext in sorted(SUPPORTED_MEDIA_EXTENSIONS)
+) + ")"
+
+
+@dataclass
+class _JobSpec:
+    """One encode to start: a file, plus the clip plan for this encode (if any)."""
+
+    key: str
+    path: Path
+    plan: Optional[ClipPlan] = None
+    token: str = ""
+    title: str = ""
 
 
 def _window_icon_path() -> Optional[Path]:
@@ -95,138 +122,6 @@ def _polish_flag(widget, name: str, value: bool) -> None:
     style = widget.style()
     style.unpolish(widget)
     style.polish(widget)
-
-
-class _FileRow(QFrame):
-    def __init__(self, path: Path, on_remove):
-        super().__init__()
-        self.path = path
-        self.setObjectName("card")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        text = QVBoxLayout()
-        self._name = QLabel(path.name)
-        self._meta = QLabel(str(path.parent))
-        self._meta.setObjectName("muted")
-        self._meta.setWordWrap(True)
-        text.addWidget(self._name)
-        text.addWidget(self._meta)
-        layout.addLayout(text, 1)
-        remove = QPushButton("Remove")
-        remove.clicked.connect(lambda: on_remove(path))
-        layout.addWidget(remove)
-
-    def set_info(self, info) -> None:
-        if info is None:
-            return
-        parts = []
-        size = getattr(info, "size", None)
-        if size:
-            parts.append(format_size(size))
-        width = getattr(info, "width", None)
-        height = getattr(info, "height", None)
-        if width and height:
-            parts.append(f"{width}×{height}")
-        codec = getattr(info, "video_codec", None) or getattr(info, "codec", None)
-        if codec:
-            parts.append(str(codec))
-        if parts:
-            self._meta.setText(" · ".join(parts))
-
-
-class _ProgressRow(QFrame):
-    def __init__(self, job_id: str, title: str, on_cancel):
-        super().__init__()
-        self.job_id = job_id
-        self.setObjectName("card")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        header = QHBoxLayout()
-        self._title = QLabel(title)
-        header.addWidget(self._title, 1)
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(lambda: on_cancel(job_id))
-        header.addWidget(cancel)
-        layout.addLayout(header)
-        self._bar = QProgressBar()
-        self._bar.setRange(0, 100)
-        self._bar.setValue(0)
-        self._bar.setTextVisible(True)
-        layout.addWidget(self._bar)
-        self._status = QLabel("Waiting in the queue…")
-        self._status.setObjectName("hint")
-        self._status.setWordWrap(True)
-        layout.addWidget(self._status)
-
-    def update_job(self, job, *, awaiting: bool) -> None:
-        try:
-            percent = int(float(getattr(job, "progress", 0) or 0))
-        except (TypeError, ValueError):
-            percent = 0
-        self._bar.setValue(max(0, min(100, percent)))
-        self._status.setText(
-            "\n".join(
-                part
-                for part in (
-                    human_progress_status(job, awaiting_software_fallback=awaiting),
-                    progress_detail(job),
-                )
-                if part
-            )
-        )
-
-
-class _ResultRow(QFrame):
-    def __init__(self, result):
-        super().__init__()
-        self.setObjectName("card")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        if getattr(result, "cancelled", False):
-            title = "Cancelled"
-        elif getattr(result, "skipped", False):
-            title = "Skipped"
-        elif getattr(result, "success", False):
-            title = "Kept original" if getattr(result, "kept_original", False) else "Compressed"
-        else:
-            title = "Failed"
-        name = ""
-        output = getattr(result, "output_file", None)
-        source = getattr(result, "input_file", None)
-        if output:
-            name = Path(output).name
-        elif source:
-            name = Path(source).name
-        heading = QLabel(f"{title} — {name}" if name else title)
-        layout.addWidget(heading)
-        bits = []
-        if getattr(result, "success", False) and not getattr(result, "skipped", False):
-            original = getattr(result, "original_size", 0) or 0
-            compressed = getattr(result, "compressed_size", 0) or 0
-            if original and compressed:
-                bits.append(f"{format_size(original)} → {format_size(compressed)}")
-            reduction = getattr(result, "reduction_percent", None)
-            if reduction is not None and not getattr(result, "kept_original", False):
-                try:
-                    bits.append(f"{float(reduction):.0f}% smaller")
-                except (TypeError, ValueError):
-                    pass
-            elapsed = getattr(result, "encoding_time", 0) or 0
-            if elapsed:
-                bits.append(format_time(elapsed))
-        encoder = encoder_result_label(str(getattr(result, "encoder_name", "") or ""))
-        if encoder:
-            bits.append(f"Encoder: {encoder}")
-        note = getattr(result, "note", None) or getattr(result, "error_message", None)
-        if note:
-            bits.append(str(note))
-        notice = declined_software_fallback_notice(result)
-        if notice:
-            bits.append(notice)
-        body = QLabel(" · ".join(bits) if bits else "")
-        body.setObjectName("hint")
-        body.setWordWrap(True)
-        layout.addWidget(body)
 
 
 class SquishItWindow(QMainWindow):
@@ -248,9 +143,10 @@ class SquishItWindow(QMainWindow):
         self._profile_manager = ProfileManager()
         self._history = HistoryManager(max_entries=get_config().history_max_entries)
         self._files: dict[str, dict] = {}
-        self._progress_rows: dict[str, _ProgressRow] = {}
+        self._progress_rows: dict[str, ProgressRow] = {}
+        self._job_titles: dict[str, str] = {}
         self._results: list = []
-        self._pending: list[str] = []
+        self._pending: list[_JobSpec] = []
         self._active = 0
         self._running = False
         self._cancel_requested = False
@@ -258,7 +154,8 @@ class SquishItWindow(QMainWindow):
         self._hw_probe: Optional[HardwareProbe] = None
         self._full_profile_active = False
         self._quick_buttons: dict[str, QPushButton] = {}
-        self._output_folder: Optional[Path] = None
+        self._output_folder: Optional[Path] = self._saved_output_folder()
+        self._preview = None
         self._current_profile: Optional[CompressionProfile] = None
         self._selected_profile = get_config().default_profile or "Balanced"
         self.form = EncodeForm(
@@ -267,6 +164,7 @@ class SquishItWindow(QMainWindow):
             parallel_jobs=max(1, int(get_config().max_parallel_jobs or 1)),
             output_name_template=get_config().output_name_template,
             use_hw_accel=bool(get_config().use_hardware_accel),
+            queue_order=get_config().batch_queue_order or "manual",
         )
         base = self._profile_manager.get_profile(self._selected_profile)
         if base is None:
@@ -420,6 +318,14 @@ class SquishItWindow(QMainWindow):
         actions.addWidget(self._queue_label)
         queue_layout.addLayout(actions)
 
+        # Finished jobs, then running jobs, then the files themselves. The files
+        # stay put through a run so trims and settings survive it.
+        self._results_box = QVBoxLayout()
+        self._results_box.setSpacing(8)
+        queue_layout.addLayout(self._results_box)
+        self._activity = QVBoxLayout()
+        self._activity.setSpacing(8)
+        queue_layout.addLayout(self._activity)
         self._rows = QVBoxLayout()
         self._rows.setSpacing(8)
         queue_layout.addLayout(self._rows)
@@ -438,6 +344,7 @@ class SquishItWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         outer.addWidget(splitter, 1)
         self.setAcceptDrops(True)
+        self._install_shortcuts()
         self._refresh_output_button()
 
     def _on_settings_change(self, kind: str, value: Optional[str]) -> None:
@@ -612,9 +519,18 @@ class SquishItWindow(QMainWindow):
             self._refresh_queue_label()
             self._refresh_preview()
 
+    def _row_actions(self) -> RowActions:
+        return RowActions(
+            remove=self.remove_file,
+            trim=self.open_trim_editor,
+            clear_trim=self.clear_trim,
+            move_top=self.move_to_top,
+            compress_only=self.compress_only,
+        )
+
     def _add_file(self, path: Path, key: str) -> None:
-        row = _FileRow(path, self.remove_file)
-        self._files[key] = {"path": path, "row": row, "info": None}
+        row = FileRow(path, self._row_actions())
+        self._files[key] = {"path": path, "row": row, "info": None, "clips": None}
         self._rows.addWidget(row)
 
         def _analyze() -> None:
@@ -641,14 +557,157 @@ class SquishItWindow(QMainWindow):
         self._refresh_queue_label()
         self._refresh_preview()
 
-    def _clear_rows(self) -> None:
-        while self._rows.count():
-            item = self._rows.takeAt(0)
+    def move_to_top(self, path: Path) -> None:
+        if self._running:
+            return
+        key = str(Path(path).resolve())
+        item = self._files.pop(key, None)
+        if item is None:
+            return
+        self._files = {key: item, **self._files}
+        row = item.get("row")
+        if row is not None:
+            self._rows.removeWidget(row)
+            self._rows.insertWidget(0, row)
+
+    def compress_only(self, path: Path) -> None:
+        """Run just this file (the others stay queued for next time)."""
+
+        if self._running:
+            return
+        key = str(Path(path).resolve())
+        if key not in self._files:
+            return
+        self._start([key])
+
+    # -- trimming -------------------------------------------------------
+
+    def open_trim_editor(self, path: Path) -> None:
+        """Open the clip editor for one video and keep what the user saves."""
+
+        if self._running:
+            return
+        key = str(Path(path).resolve())
+        item = self._files.get(key)
+        info = item.get("info") if item else None
+        if item is None or info is None or not hasattr(info, "video_codec"):
+            return
+        from .trim_editor import TrimEditorDialog
+
+        dialog = TrimEditorDialog(
+            self,
+            Path(item["path"]),
+            info,
+            item.get("clips"),
+            self._get_preview(),
+            target_note=self._target_note(),
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.set_clips(key, dialog.result_plan())
+
+    def set_clips(self, key: str, plan: Optional[ClipPlan]) -> None:
+        item = self._files.get(key)
+        if item is None:
+            return
+        item["clips"] = plan
+        row = item.get("row")
+        if row is not None:
+            row.set_clip_summary(clip_summary(plan))
+        self._refresh_preview()
+
+    def clear_trim(self, path: Path) -> None:
+        if self._running:
+            return
+        self.set_clips(str(Path(path).resolve()), None)
+
+    def _target_note(self) -> str:
+        """Plain-words reminder of a size target, shown in the trim editor."""
+
+        if not self.form.target_size_enabled or not self.form.target_size_mb:
+            return ""
+        return f"Target size: {self.form.target_size_mb} MB per file"
+
+    def _get_preview(self):
+        """Frame/preview helper shared by the trim editor and the row thumbnails."""
+
+        if self._preview is None:
+            from ...core.preview import PreviewService
+
+            compressor = self._get_compressor()
+            ffmpeg = getattr(compressor, "ffmpeg_path", None) or "ffmpeg"
+            ffprobe = getattr(compressor, "ffprobe_path", None)
+            self._preview = PreviewService(str(ffmpeg), str(ffprobe) if ffprobe else None)
+        return self._preview
+
+    def _on_file_info(self, key: str, item: dict, info) -> None:
+        """A file finished analysis: ask for its row thumbnail."""
+
+        if info is None or not hasattr(info, "video_codec"):
+            return
+        try:
+            from ...core.preview import display_size
+
+            width, height = display_size(
+                int(info.width or 0) or 16,
+                int(info.height or 0) or 9,
+                int(getattr(info, "rotation", 0) or 0),
+                str(getattr(info, "sar", "1:1") or "1:1"),
+                224,
+                126,
+            )
+            moment = min(1.0, max(0.0, float(info.duration or 0) * 0.1))
+            self._get_preview().request_poster(
+                Path(item["path"]),
+                moment,
+                (width, height),
+                lambda _path, w, h, rgb, _key=key: self._queue.put(
+                    ("thumb", _key, w, h, rgb)
+                ),
+            )
+        except Exception:
+            logger.debug("Could not request a thumbnail", exc_info=True)
+
+    # -- small helpers --------------------------------------------------
+
+    @staticmethod
+    def _saved_output_folder() -> Optional[Path]:
+        saved = (get_config().last_output_folder or "").strip()
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        return None
+
+    def _install_shortcuts(self) -> None:
+        for sequence, handler in (
+            ("Ctrl+O", self._pick_files),
+            ("Ctrl+Shift+O", self._pick_folder),
+            ("Ctrl+Return", self.start_compression),
+            ("Ctrl+Enter", self.start_compression),
+        ):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(handler)
+
+    @staticmethod
+    def _clear_layout(layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
+
+    def _clear_rows(self) -> None:
+        """Remove file rows, running jobs and results (everything in the queue)."""
+
+        self._clear_layout(self._rows)
+        self._clear_activity()
+        self._clear_results()
+
+    def _clear_activity(self) -> None:
+        self._clear_layout(self._activity)
         self._progress_rows.clear()
+
+    def _clear_results(self) -> None:
+        self._clear_layout(self._results_box)
 
     def clear_queue(self) -> None:
         if self._running:
@@ -673,8 +732,7 @@ class SquishItWindow(QMainWindow):
             self,
             "Add media",
             str(Path.home()),
-            "Media (*.mp4 *.mkv *.mov *.avi *.webm *.wmv *.m4v *.mpg *.mpeg "
-            "*.jpg *.jpeg *.png *.webp *.gif *.bmp *.tif *.tiff *.avif)",
+            _MEDIA_FILTER,
         )
         if paths:
             self.add_paths(paths)
@@ -695,6 +753,10 @@ class SquishItWindow(QMainWindow):
         self._output_folder = Path(folder)
         self._output_folder.mkdir(parents=True, exist_ok=True)
         self._refresh_output_button()
+        try:
+            get_config_manager().update_config(last_output_folder=str(folder))
+        except Exception:
+            logger.debug("Could not store the output folder", exc_info=True)
 
     def _refresh_output_button(self) -> None:
         if self._output_folder is None:
@@ -702,8 +764,73 @@ class SquishItWindow(QMainWindow):
         else:
             self._output_btn.setText(f"Output: {self._output_folder.name}")
 
+    def _ordered_keys(self) -> list[str]:
+        """File keys in run order: as listed, or sorted by size/length if asked."""
+
+        keys = list(self._files)
+        order = str(
+            getattr(self.form, "queue_order", None) or get_config().batch_queue_order
+        )
+        if order == "manual" or len(keys) < 2:
+            return keys
+
+        def _size(key: str) -> int:
+            info = self._files[key].get("info")
+            if info is not None and getattr(info, "size", 0):
+                return int(info.size)
+            path = Path(self._files[key]["path"])
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+
+        def _length(key: str) -> float:
+            info = self._files[key].get("info")
+            return float(getattr(info, "duration", 0.0) or 0.0) if info else 0.0
+
+        if order in {"largest-first", "smallest-first"}:
+            return sorted(keys, key=_size, reverse=order == "largest-first")
+        if order in {"longest-first", "shortest-first"}:
+            return sorted(keys, key=_length, reverse=order == "longest-first")
+        return keys
+
+    def _build_job_specs(self, keys: list[str]) -> list[_JobSpec]:
+        """One spec per encode: a file becomes N specs when it has N separate clips."""
+
+        specs: list[_JobSpec] = []
+        for key in keys:
+            item = self._files.get(key)
+            if item is None:
+                continue
+            path = Path(item["path"])
+            info = item.get("info")
+            plan = item.get("clips")
+            if info is not None and not hasattr(info, "video_codec"):
+                plan = None  # images have no timeline
+            for job in expand_clip_jobs(plan):
+                title = f"{path.name} · {job.title}" if job.title else path.name
+                specs.append(_JobSpec(key, path, job.plan, job.token, title))
+        return specs
+
+    def _set_running(self, running: bool) -> None:
+        """One place for the busy/idle look of the buttons and file rows."""
+
+        self._running = running
+        self._compress_btn.setEnabled(not running)
+        self._clear_btn.setEnabled(not running)
+        self._cancel_btn.setEnabled(running)
+        for item in self._files.values():
+            row = item.get("row")
+            if row is not None:
+                row.set_busy(running)
+        if not running:
+            self._refresh_action_label()
+
     def start_compression(self) -> None:
-        if self._running or not self._files:
+        self._start(self._ordered_keys())
+
+    def _start(self, keys: list[str]) -> None:
+        if self._running or not self._files or not keys:
             if not self._files:
                 self._queue_label.setText("Add a file, then press Quick Compress.")
             return
@@ -712,23 +839,17 @@ class SquishItWindow(QMainWindow):
         self._awaiting_fallback.clear()
         profile = self.job_profile()
         self._current_profile = profile
-        self._running = True
-        self._compress_btn.setEnabled(False)
-        self._clear_btn.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
+        self._set_running(True)
         self._persist_run_settings()
-        ordered = list(self._files)
-        self._clear_rows()
-        self._pending = ordered
+        self._clear_results()
+        self._clear_activity()
+        self._pending = self._build_job_specs(keys)
         self._active = 0
         try:
             self._launch_next()
         except Exception as exc:
             logger.exception("Could not start compression")
-            self._running = False
-            self._compress_btn.setEnabled(True)
-            self._clear_btn.setEnabled(True)
-            self._cancel_btn.setEnabled(False)
+            self._set_running(False)
             QMessageBox.critical(self, APP_NAME, str(exc) or "Could not start compression")
 
     def _persist_run_settings(self) -> None:
@@ -738,6 +859,7 @@ class SquishItWindow(QMainWindow):
             "default_target_size_mode": self.form.target_size_mode,
             "resource_governor": self.form.resource_governor,
             "use_hardware_accel": self.form.effective_hw(),
+            "batch_queue_order": self.form.queue_order,
         }
         if self.form.quick_name:
             payload["quick_compress_profile"] = self.form.quick_name
@@ -765,29 +887,35 @@ class SquishItWindow(QMainWindow):
             slots = 1
         slots = max(1, int(slots or 1))
         while self._pending and self._active < slots:
-            key = self._pending.pop(0)
-            item = self._files.get(key)
-            if item is None:
+            spec = self._pending.pop(0)
+            if spec.key not in self._files:
                 continue
-            in_path = Path(item["path"])
+            in_path = spec.path
             job_profile = CompressionProfile.from_dict(profile.to_dict())
             out_path = output_path_for(
                 in_path,
                 job_profile,
                 self._output_folder,
                 self.form.output_name_template,
+                clip_token=spec.token,
             )
-            job_id = compressor.compress_async(
+            kwargs = dict(
                 input_file=in_path,
                 output_file=out_path,
                 profile=job_profile,
                 callback=lambda result: self._queue.put(("result", result)),
                 parallel_jobs=slots,
+                # Never replace a file that is already there; add " (2)" instead.
+                overwrite=False,
             )
+            if spec.plan is not None:
+                kwargs["clips"] = spec.plan
+            job_id = compressor.compress_async(**kwargs)
             self._active += 1
-            row = _ProgressRow(job_id, in_path.name, self._cancel_one)
+            self._job_titles[job_id] = spec.title or in_path.name
+            row = ProgressRow(job_id, self._job_titles[job_id], self._cancel_one)
             self._progress_rows[job_id] = row
-            self._rows.addWidget(row)
+            self._activity.addWidget(row)
             job = compressor.get_job(job_id)
             if job is not None:
                 row.update_job(job, awaiting=job_id in self._awaiting_fallback)
@@ -843,18 +971,34 @@ class SquishItWindow(QMainWindow):
                 return
             item["info"] = info
             row = item.get("row")
-            if row is not None and hasattr(row, "set_info"):
-                row.set_info(info)
+            if row is not None:
+                try:
+                    row.set_info(info)
+                except RuntimeError:
+                    # The row was removed while the file was still being read.
+                    logger.debug("Row for %s is gone", key)
+            self._on_file_info(key, item, info)
             self._refresh_preview()
+        elif kind == "thumb":
+            _kind, key, width, height, rgb = message
+            item = self._files.get(key)
+            row = item.get("row") if item else None
+            if row is not None and rgb:
+                try:
+                    row.set_thumbnail(pixmap_from_rgb(rgb, width, height))
+                except RuntimeError:
+                    pass
         elif kind == "progress":
             _kind, job = message
             job_id = getattr(job, "id", "")
             row = self._progress_rows.get(job_id)
             if row is None and self._running:
-                title = Path(getattr(job, "input_file", "file")).name
-                row = _ProgressRow(job_id, title, self._cancel_one)
+                title = self._job_titles.get(job_id) or Path(
+                    getattr(job, "input_file", "file")
+                ).name
+                row = ProgressRow(job_id, title, self._cancel_one)
                 self._progress_rows[job_id] = row
-                self._rows.addWidget(row)
+                self._activity.addWidget(row)
             if row is not None:
                 row.update_job(job, awaiting=job_id in self._awaiting_fallback)
                 self._hw_card.set_activity(
@@ -926,10 +1070,7 @@ class SquishItWindow(QMainWindow):
                 row.update_job(job, awaiting=job_id in self._awaiting_fallback)
 
     def _finish(self) -> None:
-        self._running = False
-        self._compress_btn.setEnabled(True)
-        self._clear_btn.setEnabled(True)
-        self._cancel_btn.setEnabled(False)
+        self._set_running(False)
         self._current_profile = None
         ok = sum(
             1
@@ -952,13 +1093,19 @@ class SquishItWindow(QMainWindow):
         summary = with_declined_fallback_summary(message, self._results)
         self._queue_label.setText(summary)
         self._hw_card.set_activity(summary)
-        self._clear_rows()
-        for result in self._results:
-            if getattr(result, "cancelled", False):
-                continue
-            self._rows.addWidget(_ResultRow(result))
-        self._files.clear()
-        self._open_output_folder()
+        # Running jobs turn into a results list; the files stay queued so their
+        # trims survive and the same set can be run again with other settings.
+        self._clear_activity()
+        self._clear_results()
+        shown = [r for r in self._results if not getattr(r, "cancelled", False)]
+        if shown:
+            open_btn = QPushButton("Show in folder")
+            open_btn.clicked.connect(self._open_output_folder)
+            self._results_box.addWidget(section_header("Results", extra=open_btn))
+            for result in shown:
+                self._results_box.addWidget(ResultRow(result))
+        if get_config().open_folder_when_done:
+            self._open_output_folder()
         cancelled_run = self._cancel_requested
         self._cancel_requested = False
         if not cancelled_run:
@@ -972,13 +1119,7 @@ class SquishItWindow(QMainWindow):
         ]
         if not successful:
             return
-        if os.name != "nt":
-            return
-        folder = Path(successful[-1].output_file).parent
-        try:
-            os.startfile(folder)  # type: ignore[attr-defined]
-        except Exception:
-            logger.debug("Could not open the output folder", exc_info=True)
+        reveal_in_folder(Path(successful[-1].output_file))
 
     def _notify_done(self, ok: int, total: int) -> None:
         if ok <= 0 or os.name != "nt":
@@ -1056,6 +1197,35 @@ class SquishItWindow(QMainWindow):
         event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        compressor = self._compressor
+        if self._running and compressor is not None:
+            try:
+                encoding = bool(compressor.get_active_jobs())
+            except Exception:
+                encoding = False
+            if encoding:
+                answer = QMessageBox.question(
+                    self,
+                    APP_NAME,
+                    "Compression is still running. Stop it and close?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+            # Never leave an ffmpeg process behind when the window goes away.
+            self._pending.clear()
+            for job_id in list(self._progress_rows):
+                try:
+                    compressor.cancel_job(job_id)
+                except Exception:
+                    logger.debug("Could not cancel %s", job_id, exc_info=True)
+        if self._preview is not None:
+            try:
+                self._preview.shutdown()
+            except Exception:
+                logger.debug("Preview shutdown failed", exc_info=True)
         self._timer.stop()
         try:
             self._ipc.stop()
