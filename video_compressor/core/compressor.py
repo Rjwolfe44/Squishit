@@ -15,7 +15,8 @@ import tempfile
 import sys
 import shlex
 import uuid
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Callable, Tuple, Union
 from pathlib import Path
 from enum import Enum
@@ -25,6 +26,16 @@ import queue
 from PIL import Image, ImageOps, ImageSequence, features
 
 from .codecs import VideoCodec, AudioCodec, CodecSettings, CodecManager, AudioMode, RateControl, ENCODER_REGISTRY
+from .clips import (
+    MAX_JOIN_CLIPS,
+    Clip,
+    ClipMode,
+    ClipPlan,
+    build_concat_filtergraph,
+    effective_media_info,
+    resolve_clip_plan,
+    split_filter_args,
+)
 from .eta import ETACalculator
 from .profiles import (
     CompressionProfile,
@@ -50,7 +61,7 @@ from .utils import (
     format_size, format_time, format_bitrate,
     validate_video_file, validate_image_file, detect_media_type,
     calculate_reduction, get_audio_extension, get_image_extension, get_video_extension,
-    parse_timecode, sanitize_filename,
+    parse_timecode, sanitize_filename, unique_output_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +93,18 @@ class VideoInfo:
     audio_bitrate: int = 0
     total_bitrate: int = 0
     frame_count: int = 0
+    # Clockwise degrees (0/90/180/270) a player turns the picture to show it
+    # upright, the same sense as the legacy ``rotate`` tag. ``width``/``height``
+    # are the stored (unrotated) frame size.
+    rotation: int = 0
+    sar: str = "1:1"
+    avg_fps: float = 0.0
+    pix_fmt: str = ""
+    color_transfer: str = ""
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.audio_codec)
     
     @property
     def resolution(self) -> str:
@@ -248,6 +271,15 @@ class CompressionJob:
     software_fallback_settled: bool = False
     # Set after D3D11VA decode fails so the retry omits -hwaccel. Encode stays put.
     decode_hwaccel_disabled: bool = False
+    # Clips this job encodes (None = whole file). compress() resolves it once;
+    # video_info then holds the trimmed numbers and source_info the real file.
+    clip_plan: Optional[ClipPlan] = None
+    source_info: Optional[MediaInfo] = None
+    # False = never replace an existing file; outputs get " (2)" instead.
+    overwrite: bool = True
+    # Only true while _build_two_pass_commands builds pass 1 of a join, whose
+    # graph must not carry audio (-an does not cancel an explicit -map).
+    video_only_pass: bool = field(default=False, repr=False)
     
     def __post_init__(self):
         if isinstance(self.input_file, str):
@@ -324,6 +356,58 @@ def decode_hwaccel_failed(argv: List[str], stderr_text: str) -> bool:
     return any(marker in lowered for marker in _DECODE_HWACCEL_FAILURE_MARKERS)
 
 
+def _parse_frame_rate(value: Any) -> float:
+    """ffprobe rate (``"30000/1001"``, ``"25"``) as frames per second; 0 when unknown."""
+
+    text = str(value or "").strip()
+    try:
+        if "/" in text:
+            num, den = text.split("/", 1)
+            return float(num) / float(den) if float(den) > 0 else 0.0
+        return float(text) if text else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _probe_rotation(stream: Dict[str, Any]) -> int:
+    """Display rotation of a probed video stream, clockwise, snapped to 0/90/180/270.
+
+    The display-matrix side data counts counter-clockwise (an upright phone
+    clip reads ``-90``); the legacy ``rotate`` tag counts clockwise (``90``).
+    """
+
+    degrees: Optional[float] = None
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and side_data.get("rotation") is not None:
+            try:
+                degrees = -float(side_data["rotation"])
+            except (TypeError, ValueError):
+                continue
+            break
+    if degrees is None:
+        tag = (stream.get("tags") or {}).get("rotate")
+        try:
+            degrees = float(tag) if tag not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            degrees = 0.0
+    if math.isnan(degrees) or math.isinf(degrees):
+        return 0
+    return (int(round(degrees / 90.0)) * 90) % 360
+
+
+def _probe_sar(value: Any) -> str:
+    """Sample aspect ratio as ``"N:D"``; unknown or ``0:1`` means square pixels."""
+
+    text = str(value or "").strip()
+    num, sep, den = text.partition(":")
+    try:
+        if sep and int(num) > 0 and int(den) > 0:
+            return f"{int(num)}:{int(den)}"
+    except ValueError:
+        pass
+    return "1:1"
+
+
 class VideoCompressor:
     """
     Main video compression engine.
@@ -356,6 +440,22 @@ class VideoCompressor:
         # Target-size ask before a hardware encoder is replaced with software.
         # None declines. See set_software_fallback_callback.
         self._software_fallback_callback: Optional[Callable[[SoftwareFallbackRequest], bool]] = None
+
+        # Output names claimed by running overwrite=False jobs (lower-cased
+        # absolute paths), so two jobs never pick the same "name (2)".
+        self._outputs_lock = threading.Lock()
+        self._reserved_outputs: set = set()
+        self._job_outputs: Dict[str, List[str]] = {}
+
+    @property
+    def ffmpeg_path(self) -> str:
+        """The FFmpeg executable this compressor runs."""
+        return self._ffmpeg_path
+
+    @property
+    def ffprobe_path(self) -> str:
+        """The FFprobe executable this compressor runs."""
+        return self._ffprobe_path
     
     def _find_ffmpeg(self) -> str:
         """Find FFmpeg executable."""
@@ -469,10 +569,54 @@ class VideoCompressor:
         if self._progress_callback:
             self._progress_callback(job)
 
+    @staticmethod
+    def _output_key(path: Union[str, Path]) -> str:
+        return os.path.abspath(str(path)).lower()
+
+    def _claim_output(
+        self,
+        path: Union[str, Path],
+        overwrite: bool,
+        job_id: Optional[str] = None,
+    ) -> Path:
+        """The output path to write.
+
+        ``overwrite=True`` returns ``path`` unchanged (an existing file is
+        replaced). ``overwrite=False`` returns ``path`` or ``name (2).ext``...
+        that is neither on disk nor claimed by another running job, and
+        reserves it until ``_release_outputs(job_id)``. That also keeps an
+        output from replacing the source it reads.
+        """
+        path = Path(path)
+        if overwrite:
+            return path
+        with self._outputs_lock:
+            claimed = unique_output_path(
+                path,
+                lambda candidate: self._output_key(candidate) in self._reserved_outputs,
+            )
+            key = self._output_key(claimed)
+            self._reserved_outputs.add(key)
+            if job_id is not None:
+                self._job_outputs.setdefault(job_id, []).append(key)
+        return claimed
+
+    def _release_outputs(self, job_id: str) -> None:
+        """Drop the output names ``job_id`` reserved (its files stay on disk)."""
+        with self._outputs_lock:
+            for key in self._job_outputs.pop(job_id, []):
+                self._reserved_outputs.discard(key)
+
+    def _owns_output(self, job: CompressionJob) -> bool:
+        with self._outputs_lock:
+            return self._output_key(job.output_file) in self._job_outputs.get(job.id, [])
+
     def _cancel_result(self, job: CompressionJob) -> CompressionResult:
         """Finalize a job as cancelled and clean up any partial output."""
         try:
-            if job.output_file.exists():
+            # overwrite=False jobs only delete a name they claimed; before the
+            # claim, output_file may still be someone else's existing file.
+            if job.output_file.exists() and (job.overwrite or self._owns_output(job)):
                 job.output_file.unlink()
         except Exception:
             pass
@@ -556,13 +700,10 @@ class VideoCompressor:
             video_codec = video_stream.get("codec_name", "")
             video_bitrate = int(video_stream.get("bit_rate", 0) or total_bitrate)
             
-            # Parse frame rate
-            fps_str = video_stream.get("r_frame_rate", "0/1")
-            if "/" in fps_str:
-                num, den = fps_str.split("/")
-                fps = float(num) / float(den) if float(den) > 0 else 0
-            else:
-                fps = float(fps_str)
+            # Parse frame rate. r_frame_rate is the stream's base rate;
+            # avg_frame_rate is frames/duration, the better count for VFR.
+            fps = _parse_frame_rate(video_stream.get("r_frame_rate", "0/1"))
+            avg_fps = _parse_frame_rate(video_stream.get("avg_frame_rate"))
             
             # Calculate frame count
             nb_frames = video_stream.get("nb_frames")
@@ -592,7 +733,12 @@ class VideoCompressor:
                 video_bitrate=video_bitrate,
                 audio_bitrate=audio_bitrate,
                 total_bitrate=total_bitrate,
-                frame_count=frame_count
+                frame_count=frame_count,
+                rotation=_probe_rotation(video_stream),
+                sar=_probe_sar(video_stream.get("sample_aspect_ratio")),
+                avg_fps=avg_fps,
+                pix_fmt=str(video_stream.get("pix_fmt") or ""),
+                color_transfer=str(video_stream.get("color_transfer") or ""),
             )
             
         except Exception as e:
@@ -1612,8 +1758,27 @@ class VideoCompressor:
         if hw_encoder and codec_settings.crf is not None and not codec_settings.video_bitrate:
             apply_hardware_ladder(codec_settings, hw_encoder)
 
+        extra_args = self._parse_extra_ffmpeg_args(profile.extra_ffmpeg_args)
+        join_count = self._join_input_count(self._job_clip_plan(job, profile))
+        join_audio = False
+        user_video_filters: List[str] = []
+        user_audio_filters: List[str] = []
+        if join_count:
+            # A join is one -filter_complex graph, and FFmpeg rejects -vf/-af
+            # beside it, so the user's chains move into the graph.
+            user_video_filters, user_audio_filters, extra_args = split_filter_args(extra_args)
+            join_audio = bool(
+                not job.video_only_pass
+                and getattr(media, "has_audio", True)
+                and not codec_settings.disable_audio
+                and codec_settings.audio_mode != AudioMode.STRIP
+                and "-an" not in extra_args
+            )
+            if join_audio and codec_settings.audio_mode == AudioMode.COPY:
+                # Joined audio comes out of a filter, which cannot be stream-copied.
+                codec_settings.audio_mode = AudioMode.REENCODE
+
         codec_args = codec_settings.to_ffmpeg_args(hw_encoder)
-        cmd.extend(codec_args)
 
         filters: List[str] = []
         if isinstance(video_info, VideoInfo):
@@ -1626,7 +1791,21 @@ class VideoCompressor:
             if scale_filter:
                 filters.append(scale_filter)
 
-        if filters:
+        if join_count:
+            graph, video_label, audio_label = build_concat_filtergraph(
+                join_count,
+                with_video=True,
+                with_audio=join_audio,
+                video_filters=[*user_video_filters, *filters],
+                audio_filters=user_audio_filters,
+            )
+            cmd.extend(["-filter_complex", graph, "-map", f"[{video_label}]"])
+            if audio_label:
+                cmd.extend(["-map", f"[{audio_label}]"])
+
+        cmd.extend(codec_args)
+
+        if filters and not join_count:
             cmd.extend(["-vf", ",".join(filters)])
 
         if profile.frame_rate:
@@ -1639,7 +1818,6 @@ class VideoCompressor:
         if job.output_file.suffix.lower() == ".mp4":
             cmd.extend(["-movflags", "+faststart"])
 
-        extra_args = self._parse_extra_ffmpeg_args(profile.extra_ffmpeg_args)
         if extra_args:
             cmd.extend(extra_args)
 
@@ -1661,31 +1839,80 @@ class VideoCompressor:
 
         ``decode_hwaccel`` is an input option (``-hwaccel d3d11va``) placed
         before ``-i``. It does not select the encoder.
+
+        Clips seek on the input side (``-ss``/``-t`` before ``-i``): with a
+        re-encode that is frame-accurate and only decodes the clip. A join
+        opens the same file once per clip, each input with its own options.
         """
         cmd = [
             self._ffmpeg_path,
             "-y",
             "-hide_banner",
         ]
-        if decode_hwaccel:
-            cmd.extend(["-hwaccel", decode_hwaccel])
-        cmd.extend([
-            "-i",
-            str(job.input_file),
-        ])
+        plan = self._job_clip_plan(job, profile)
+        if plan is None:
+            if decode_hwaccel:
+                cmd.extend(["-hwaccel", decode_hwaccel])
+            cmd.extend([
+                "-i",
+                str(job.input_file),
+            ])
+            return cmd
 
-        if profile.trim_enabled:
-            start = parse_timecode(profile.trim_start)
-            end = parse_timecode(profile.trim_end)
-            if start is not None and start > 0:
-                cmd.extend(["-ss", f"{start:.3f}"])
-            if end is not None:
-                if start is not None and end > start:
-                    cmd.extend(["-t", f"{(end - start):.3f}"])
-                elif start is None and end > 0:
-                    cmd.extend(["-t", f"{end:.3f}"])
-
+        clips = plan.clips if self._join_input_count(plan) else plan.clips[:1]
+        for clip in clips:
+            if decode_hwaccel:
+                cmd.extend(["-hwaccel", decode_hwaccel])
+            cmd.extend(self._clip_input_args(clip))
+            cmd.extend(["-i", str(job.input_file)])
         return cmd
+
+    @staticmethod
+    def _clip_input_args(clip: Clip) -> List[str]:
+        """Input-side ``-ss``/``-t`` for one clip (no ``-ss`` from 0, no ``-t`` to the end)."""
+        args: List[str] = []
+        if clip.start > 0:
+            args.extend(["-ss", f"{clip.start:.3f}"])
+        if not math.isinf(clip.end):
+            args.extend(["-t", f"{clip.end - clip.start:.3f}"])
+        return args
+
+    @staticmethod
+    def _check_clip_plan(plan: ClipPlan) -> None:
+        """Reject plans one FFmpeg run cannot encode."""
+        if plan.mode is ClipMode.JOIN and plan.count > MAX_JOIN_CLIPS:
+            raise ValueError(
+                f"You can join up to {MAX_JOIN_CLIPS} clips at once; this video has {plan.count}."
+            )
+        if plan.mode is not ClipMode.JOIN and plan.count > 1:
+            raise ValueError(
+                "Separate clips are encoded one job per clip; split the plan with expand_clip_jobs."
+            )
+
+    def _job_clip_plan(self, job: CompressionJob, profile: CompressionProfile) -> Optional[ClipPlan]:
+        """The clips this job encodes, or None for the whole file.
+
+        compress() resolves the plan once and sets ``job.source_info``; after
+        that ``job.clip_plan`` is final. A builder called on its own (tests,
+        previews) falls back to the legacy profile trim.
+        """
+        plan = job.clip_plan
+        if plan is None:
+            if job.source_info is not None or not getattr(profile, "trim_enabled", False):
+                return None
+            duration = float(getattr(job.video_info, "duration", 0.0) or 0.0)
+            plan = resolve_clip_plan(None, profile, duration)
+        if plan is None or not plan.clips:
+            return None
+        self._check_clip_plan(plan)
+        return plan
+
+    @staticmethod
+    def _join_input_count(plan: Optional[ClipPlan]) -> int:
+        """How many clips a join concatenates; 0 when ``plan`` is not a join of 2+."""
+        if plan is not None and plan.mode is ClipMode.JOIN and plan.count >= 2:
+            return plan.count
+        return 0
 
     def _parse_extra_ffmpeg_args(self, raw_args: str) -> List[str]:
         """Parse optional expert FFmpeg flags from the UI."""
@@ -1729,13 +1956,27 @@ class VideoCompressor:
         )
         output_path = str(job.output_file)
         common_args = second_pass[:-1]
+        first_pass_source = common_args
+        if self._join_input_count(self._job_clip_plan(job, profile)):
+            # Pass 1 only measures video. A joined graph has to leave audio out
+            # itself: -an does not cancel an explicit -map of the audio label.
+            job.video_only_pass = True
+            try:
+                first_pass_source = self._build_video_ffmpeg_command(
+                    job,
+                    profile,
+                    target_plan=target_plan,
+                    target_video_bitrate=target_video_bitrate,
+                )[:-1]
+            finally:
+                job.video_only_pass = False
         first_pass_common: List[str] = []
         skip_next = False
-        for index, value in enumerate(common_args):
+        for index, value in enumerate(first_pass_source):
             if skip_next:
                 skip_next = False
                 continue
-            if value == "-movflags" and index + 1 < len(common_args):
+            if value == "-movflags" and index + 1 < len(first_pass_source):
                 skip_next = True
                 continue
             first_pass_common.append(value)
@@ -1856,13 +2097,27 @@ class VideoCompressor:
         profile: CompressionProfile,
     ) -> List[str]:
         """Build an FFmpeg command for audio extraction."""
+        plan = self._job_clip_plan(job, profile)
+        if plan is not None and not getattr(job.video_info, "has_audio", True):
+            raise ValueError("This video has no audio track to save.")
         cmd = self._build_input_command(job, profile)
+        extra_args = self._parse_extra_ffmpeg_args(profile.extra_ffmpeg_args)
+        join_count = self._join_input_count(plan)
+        if join_count:
+            # Video chains have nothing to act on here; audio chains join the graph.
+            _video_filters, audio_filters, extra_args = split_filter_args(extra_args)
+            graph, _video_label, audio_label = build_concat_filtergraph(
+                join_count,
+                with_video=False,
+                with_audio=True,
+                audio_filters=audio_filters,
+            )
+            cmd.extend(["-filter_complex", graph, "-map", f"[{audio_label}]"])
         cmd.extend(["-vn", "-sn", "-dn", "-c:a", profile.audio_codec.ffmpeg_encoder])
 
         if not profile.audio_codec.is_lossless and profile.audio_bitrate > 0:
             cmd.extend(["-b:a", str(profile.audio_bitrate)])
 
-        extra_args = self._parse_extra_ffmpeg_args(profile.extra_ffmpeg_args)
         if extra_args:
             cmd.extend(extra_args)
 
@@ -2045,7 +2300,11 @@ class VideoCompressor:
 
         start_time = time.time()
         output_ext, save_kwargs = self._get_image_output_details(image_info, profile)
-        job.output_file = job.output_file.with_suffix(f".{output_ext}")
+        job.output_file = self._claim_output(
+            job.output_file.with_suffix(f".{output_ext}"),
+            job.overwrite,
+            job.id,
+        )
         job.output_file.parent.mkdir(parents=True, exist_ok=True)
 
         with Image.open(job.input_file) as source:
@@ -2122,7 +2381,11 @@ class VideoCompressor:
         """Compress animated GIF/WebP inputs while keeping animation frames."""
         start_time = time.time()
         output_ext = "webp"
-        job.output_file = job.output_file.with_suffix(f".{output_ext}")
+        job.output_file = self._claim_output(
+            job.output_file.with_suffix(f".{output_ext}"),
+            job.overwrite,
+            job.id,
+        )
         job.output_file.parent.mkdir(parents=True, exist_ok=True)
 
         quality = max(45, min(profile.image_quality, 100))
@@ -2223,6 +2486,10 @@ class VideoCompressor:
             job.output_file.unlink(missing_ok=True)
 
         if fallback_output.resolve() != job.input_file.resolve():
+            if not job.overwrite and fallback_output != job.output_file:
+                # The copy takes the source's extension; never land it on a
+                # different file that already has that name.
+                fallback_output = self._claim_output(fallback_output, False, job.id)
             fallback_output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(job.input_file, fallback_output)
 
@@ -2329,6 +2596,9 @@ class VideoCompressor:
         profile: CompressionProfile,
         job_id: Optional[str] = None,
         parallel_jobs: int = 1,
+        *,
+        clips: Optional[ClipPlan] = None,
+        overwrite: bool = True,
     ) -> CompressionResult:
         """
         Compress a video file.
@@ -2338,6 +2608,13 @@ class VideoCompressor:
             output_file: Output video file path
             profile: Compression profile to use
             job_id: Optional job ID for tracking
+            clips: Clips to encode (videos only; images ignore it). A join plan
+                becomes one file; a separate plan must hold one clip (split it
+                with ``clips.expand_clip_jobs``). None uses the profile's legacy
+                trim, if any, else the whole file.
+            overwrite: False never replaces an existing file; the output is
+                written as ``name (2).ext`` instead. ``result.output_file`` is
+                the path actually written.
             
         Returns:
             CompressionResult object
@@ -2352,6 +2629,7 @@ class VideoCompressor:
             output_file=Path(output_file),
             profile=profile,
             parallel_jobs=max(1, int(parallel_jobs or 1)),
+            overwrite=bool(overwrite),
         )
         
         self._jobs[job_id] = job
@@ -2373,6 +2651,18 @@ class VideoCompressor:
             if not media_info:
                 raise ValueError(f"Failed to analyze media: {input_file}")
 
+            if isinstance(media_info, VideoInfo):
+                # Resolve the clips once. From here on media_info describes only
+                # the clips, so frames, progress, ETA, target-size planning and
+                # the result's sizes/duration all match what is encoded.
+                source_info = media_info
+                plan = resolve_clip_plan(clips, profile, source_info.duration)
+                if plan is not None:
+                    self._check_clip_plan(plan)
+                    media_info = effective_media_info(source_info, plan)
+                job.clip_plan = plan
+                job.source_info = source_info
+
             job.video_info = media_info
 
             if self._cancelled.get(job_id, False):
@@ -2388,7 +2678,11 @@ class VideoCompressor:
 
             if profile.output_mode == "audio":
                 output_ext = get_audio_extension(profile.audio_codec.value)
-                job.output_file = job.output_file.with_suffix(f".{output_ext}")
+                job.output_file = self._claim_output(
+                    job.output_file.with_suffix(f".{output_ext}"),
+                    overwrite,
+                    job_id,
+                )
                 job.output_file.parent.mkdir(parents=True, exist_ok=True)
 
                 self._reserve_encode_slot(
@@ -2453,11 +2747,18 @@ class VideoCompressor:
             desired_suffix = f".{get_video_extension(optimized_profile.video_codec.value, optimized_profile.video_container)}"
             if job.output_file.suffix.lower() != desired_suffix:
                 job.output_file = job.output_file.with_suffix(desired_suffix)
+            job.output_file = self._claim_output(job.output_file, overwrite, job_id)
 
             job.output_file.parent.mkdir(parents=True, exist_ok=True)
 
             target_plan = self._resolve_target_size_plan(optimized_profile, media_info)
-            if target_plan and target_plan.target_size_bytes >= media_info.size:
+            # A clip's "source size" is only a proportional estimate, and no
+            # untrimmed file can stand in for it, so clip jobs always encode.
+            if (
+                target_plan
+                and target_plan.target_size_bytes >= media_info.size
+                and job.clip_plan is None
+            ):
                 logger.info(
                     "Skipping %s because target %s MB is not smaller than source %.1f MB",
                     job.input_file,
@@ -2899,7 +3200,15 @@ class VideoCompressor:
                         f"after {job.attempt_count} attempt(s); target was {target_plan.target_size_mb} MB."
                     )
 
-            if compressed_size >= media_info.size:
+            if compressed_size >= media_info.size and job.clip_plan is not None:
+                # Copying the source back would hand over the whole untrimmed
+                # file, so a clip keeps its encode even when it grew.
+                logger.info("Encoded clip of %s was larger than that part of the source; keeping it", job.input_file)
+                result_note = (
+                    f"{result_note} The clip came out larger than the same part of the original. "
+                    "SquishIt kept it because the original can't be cut without re-encoding."
+                ).strip()
+            elif compressed_size >= media_info.size:
                 logger.info("Encoded output for %s was larger than the source; preserving original", job.input_file)
                 result = self._copy_software_fallback_result(
                     self._keep_original_result(
@@ -2970,6 +3279,7 @@ class VideoCompressor:
         finally:
             # Cleanup
             self.governor.release(job_id)
+            self._release_outputs(job_id)
             self._processes.pop(job_id, None)
             self._paused.pop(job_id, None)
             self._cancelled.pop(job_id, None)
@@ -2982,6 +3292,9 @@ class VideoCompressor:
         job_id: Optional[str] = None,
         callback: Optional[Callable] = None,
         parallel_jobs: int = 1,
+        *,
+        clips: Optional[ClipPlan] = None,
+        overwrite: bool = True,
     ) -> str:
         """
         Compress a video file asynchronously.
@@ -2992,12 +3305,20 @@ class VideoCompressor:
             profile: Compression profile
             job_id: Optional job ID
             callback: Callback function(result: CompressionResult)
+            clips, overwrite: as for ``compress``
             
         Returns:
             Job ID
         """
         import uuid
         job_id = job_id or str(uuid.uuid4())[:8]
+        # Forward only non-defaults so compress() stand-ins with the older
+        # signature keep working.
+        options: Dict[str, Any] = {}
+        if clips is not None:
+            options["clips"] = clips
+        if not overwrite:
+            options["overwrite"] = False
         
         def worker():
             result = self.compress(
@@ -3006,6 +3327,7 @@ class VideoCompressor:
                 profile,
                 job_id,
                 parallel_jobs=parallel_jobs,
+                **options,
             )
             if callback:
                 callback(result)
