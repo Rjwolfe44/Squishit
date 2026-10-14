@@ -1200,9 +1200,15 @@ class SquishItWindow(QMainWindow):
     def _profiles_changed(self) -> None:
         """Custom profiles were saved, deleted or imported: refresh the menu."""
 
-        profiles = self._profile_manager.get_all_profiles()
-        self._settings.set_profiles(profiles)
-        self._settings._rebuild_more()
+        self._settings.set_profiles(self._profile_manager.get_all_profiles())
+        if self._full_profile_active:
+            # The profile in use may have been edited or removed.
+            if self._profile_manager.get_profile(self._selected_profile) is not None:
+                self.select_profile(self._selected_profile)
+            else:
+                self.select_quick(get_config().quick_compress_profile or "Quick Lite")
+        else:
+            self._settings.set_active_quick(self.form.quick_name)
 
     def check_for_updates_on_startup(self) -> None:
         """Quietly look for a newer version; a banner appears only if there is one."""
