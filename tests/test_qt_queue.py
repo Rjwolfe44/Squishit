@@ -68,6 +68,14 @@ class _FakeCompressor:
         self.compare_calls.append((input_file, Path(output_dir), [p.name for p in profiles]))
         if self.compare_error:
             raise ValueError(self.compare_error)
+        gate = getattr(self, "compare_gate", None)
+        if gate is not None:
+            gate.wait(10)
+            if getattr(self, "compare_cancelled", False):
+                return [
+                    SimpleNamespace(success=False, skipped=False, cancelled=True, input_file=input_file,
+                                    output_file=None, note="", error_message="")
+                ]
         return [
             SimpleNamespace(
                 success=True,
@@ -507,10 +515,11 @@ def test_compare_sample_encodes_three_samples_and_lists_them(window, tmp_path):
 
     assert _wait_until(app, done)
     calls = win._compressor.compare_calls
-    assert len(calls) == 1
-    source, out_dir, names = calls[0]
-    assert Path(source) == Path(key) and out_dir.name == "_compare_samples"
-    assert len(names) == 3
+    # one sample per call, so Cancel can stop between samples
+    assert len(calls) == 3
+    assert {Path(c[0]) for c in calls} == {Path(key)}
+    assert {c[1].name for c in calls} == {"_compare_samples"}
+    assert all(len(c[2]) == 1 for c in calls)
     assert "Smallest" in win._queue_label.text()
     assert win._results_box.count() == 4  # header + three samples
     assert recorded == []  # samples never count toward the savings history
@@ -576,3 +585,171 @@ def test_size_preview_is_judged_against_the_clip_not_the_whole_video(window, tmp
     assert compressor.plan_durations[-1] == pytest.approx(12.0)  # the first clip
     win.set_clips(key, ClipPlan((Clip(10, 22), Clip(30, 45)), ClipMode.JOIN))
     assert compressor.plan_durations[-1] == pytest.approx(27.0)  # the joined total
+
+
+# ── fixes found in review ────────────────────────────────────────────────────
+
+
+def test_cancelling_a_comparison_waits_for_the_worker_and_never_ends_a_later_run(window, tmp_path):
+    import threading
+
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info()))
+    win._pump()
+    compressor = win._get_compressor()
+    compressor.compare_gate = threading.Event()
+    win.compare_sample(Path(key))
+    assert _wait_until(app, lambda: bool(compressor.compare_calls), 5)  # first sample is "encoding"
+
+    win.cancel_all()
+    assert win._running is True and win._compare_mode is True  # not finished early
+    assert win._cancel_btn.isEnabled() is False
+    assert "Stopping" in win._queue_label.text()
+    win.start_compression()  # must be refused while the comparison is still stopping
+    assert not compressor.calls
+
+    compressor.compare_cancelled = True
+    compressor.compare_gate.set()
+
+    def done():
+        win._pump()
+        return not win._running
+
+    assert _wait_until(app, done)
+    assert len(compressor.compare_calls) == 1  # the remaining samples never started
+    assert win._queue_label.text() == "Comparison cancelled."
+    assert win._results_box.count() == 0
+    win.start_compression()  # and a normal run works afterwards
+    assert len(compressor.calls) == 1
+
+
+def test_cancel_repeats_until_a_sample_that_was_still_starting_is_stopped(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info()))
+    win._pump()
+    compressor = win._get_compressor()
+    cancelled = []
+    compressor.get_active_jobs = lambda: [SimpleNamespace(id="late-sample")] if len(cancelled) < 1 else []
+    compressor.cancel_job = lambda job_id: cancelled.append(job_id)
+    win._compare_mode = True
+    win._set_running(True)
+    win.cancel_all()
+    assert cancelled == ["late-sample"]
+    assert win._compare_cancel.is_set()
+
+
+def test_output_folder_can_be_reset_to_next_to_the_originals(window, tmp_path):
+    win, app = window
+    win._output_folder = tmp_path
+    win._refresh_output_button()
+    assert win._output_btn.text() == f"Output: {tmp_path.name}"
+    win.reset_output_folder()
+    assert win._output_folder is None
+    assert win._output_btn.text() == "Output: next to source"
+
+
+def test_dialogs_are_freed_after_they_close(window, tmp_path, monkeypatch):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info()))
+    win._pump()
+    freed = []
+
+    class FakeEditor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return 0
+
+        def result_plan(self):
+            return None
+
+        def deleteLater(self):
+            freed.append(1)
+
+    monkeypatch.setattr("video_compressor.gui.qt_shell.trim_editor.TrimEditorDialog", FakeEditor)
+    win.open_trim_editor(Path(key))
+    assert freed == [1]
+
+    class FakeDialog(FakeEditor):
+        pass
+
+    win._run_dialog(FakeDialog())
+    assert freed == [1, 1]
+
+
+def test_a_video_too_short_to_trim_cannot_be_trimmed(window, tmp_path):
+    win, app = window
+    key = _add(win, app, tmp_path)
+    win._queue.put(("info", key, _video_info(0.2)))
+    win._pump()
+    assert win._files[key]["row"].can_trim is False
+    win.open_trim_editor(Path(key))
+    assert "too short" in win._queue_label.text()
+
+
+def test_ctrl_enter_takes_the_text_being_typed_before_it_starts(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    win, app = window
+    _add(win, app, tmp_path)
+    box = win._settings._extra_args
+    box.setText("-tune film")
+    # An offscreen window gets no real keyboard focus, so stand in for it: the box
+    # "has focus", and losing focus makes it commit exactly as a real one does.
+    monkeypatch.setattr(QApplication, "focusWidget", staticmethod(lambda: box))
+    monkeypatch.setattr(box, "clearFocus", lambda: box.editingFinished.emit())
+    win._start_from_shortcut()
+    assert win._compressor.calls[0]["profile"].extra_ffmpeg_args == "-tune film"
+
+
+def test_clicking_into_and_out_of_the_ffmpeg_box_keeps_the_quick_preset(window):
+    win, app = window
+    assert win.form.quick_name == "Quick Lite"
+    win._settings._extra_args.editingFinished.emit()  # focus in and out, nothing typed
+    assert win.form.quick_name == "Quick Lite"
+    assert win.job_profile().name == "Quick Lite"
+    win._settings._extra_args.setText("-tune film")
+    win._settings._extra_args.editingFinished.emit()  # a real edit still counts
+    assert win.form.quick_name is None
+
+
+def test_settings_the_lists_do_not_know_are_shown_not_replaced_by_the_first_entry(window):
+    win, app = window
+    win.form.threads = 3
+    win.form.image_format = "heic"
+    win._settings.load(win.form)
+    assert win._settings._threads.currentText() == "3"
+    assert win._settings._image_format.currentText() == "heic"
+    # and "Auto" really is a choice that can be made again
+    win._settings._threads.setCurrentIndex(win._settings._threads.findText("Auto"))
+    assert win.form.threads is None
+
+
+def test_audio_track_choice_is_off_for_audio_only_output(window):
+    win, app = window
+    pane = win._settings
+    assert pane._audio_handling.isEnabled()
+    pane._output_type.setCurrentIndex(pane._output_type.findData("audio"))
+    assert not pane._audio_handling.isEnabled()
+    pane._output_type.setCurrentIndex(pane._output_type.findData("video"))
+    assert pane._audio_handling.isEnabled()
+
+
+def test_a_template_that_cannot_be_filled_in_still_names_each_clip_apart(tmp_path):
+    names = {
+        output_path_for(Path("C:/v/trip.mov"), _profile(), tmp_path, "{name}_{size}", token).name
+        for token in ("clip01", "clip02")
+    }
+    assert len(names) == 2
+    assert all(n.startswith("trip_compressed_clip") for n in names)
+
+
+def test_a_clip_field_does_not_eat_double_underscores_elsewhere_in_the_name(tmp_path):
+    path = output_path_for(Path("C:/v/my__video.mov"), _profile(), tmp_path, "{name}_{clip}_small", "")
+    assert path.name.startswith("my__video_small.")
+    named = output_path_for(Path("C:/v/my__video.mov"), _profile(), tmp_path, "{name}_{clip}_small", "Intro")
+    assert named.name.startswith("my__video_Intro_small.")

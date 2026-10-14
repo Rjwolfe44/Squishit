@@ -171,3 +171,32 @@ def test_a_trimmed_run_reports_sensible_progress(window, source):
     _run_all(win, app)
     assert win._results[0].success
     assert seen and max(seen) >= 90.0  # the bar reaches the end of the 2 s clip
+
+
+def test_a_join_that_repeats_a_part_is_longer_than_that_part_and_reported_so(window, source):
+    win, app = window
+    ffprobe = _tool("ffprobe")
+    for stale in source.parent.glob("talk_small*"):
+        stale.unlink()
+    key = _load(win, app, source)
+    win.set_clips(key, ClipPlan((Clip(0, 3), Clip(0, 3)), ClipMode.JOIN))  # the same 3 s twice
+    lengths = set()
+    original = win._handle
+
+    def spy(message):
+        if message[0] == "progress":
+            info = getattr(message[1], "video_info", None)
+            if info is not None:
+                lengths.add(round(float(getattr(info, "duration", 0) or 0), 2))
+        original(message)
+
+    win._handle = spy
+    _run_all(win, app)
+
+    result = win._results[0]
+    assert result.success
+    output = Path(result.output_file)
+    assert _duration(ffprobe, output) == pytest.approx(6.0, abs=0.35)
+    assert result.duration_seconds == pytest.approx(6.0, abs=0.01)  # not capped at the 10 s source
+    # progress and ETA divide by the length of what is encoded: 6 s, not 3 s or 10 s
+    assert lengths == {6.0}

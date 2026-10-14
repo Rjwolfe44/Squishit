@@ -882,3 +882,48 @@ def test_video_info_defaults_and_public_tool_paths(monkeypatch, tmp_path):
     assert info.has_audio is False
     assert compressor.ffmpeg_path == "ffmpeg"
     assert compressor.ffprobe_path == "ffprobe"
+
+
+# --- fixes found in review ------------------------------------------------------
+
+
+def test_a_quoted_user_filter_keeps_its_quotes_inside_a_join(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(extra_ffmpeg_args="-vf format=pix_fmts='yuv420p'")
+    job = _job(tmp_path, profile, plan=_join((0, 5), (10, 15)))
+
+    graph = _graph(compressor._build_video_ffmpeg_command(job, profile))
+
+    assert "format=pix_fmts='yuv420p'" in graph  # not "...'yuv420p" with the end quote eaten
+
+
+def test_a_user_filter_complex_is_refused_for_a_join_with_a_clear_message(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(extra_ffmpeg_args="-filter_complex [0:v]null[v]")
+    job = _job(tmp_path, profile, plan=_join((0, 5), (10, 15)))
+
+    with pytest.raises(ValueError, match="joined clips"):
+        compressor._build_video_ffmpeg_command(job, profile)
+
+
+def test_two_vf_options_behave_as_ffmpeg_does_in_a_join(monkeypatch, tmp_path):
+    compressor = _compressor(monkeypatch)
+    profile = _profile(extra_ffmpeg_args="-vf hflip -vf vflip")
+    job = _job(tmp_path, profile, plan=_join((0, 5), (10, 15)))
+
+    graph = _graph(compressor._build_video_ffmpeg_command(job, profile))
+
+    assert "vflip" in graph and "hflip" not in graph  # the last one wins, like a single clip
+
+
+def test_a_join_of_repeated_parts_is_measured_at_its_real_length(monkeypatch, tmp_path):
+    from video_compressor.core.clips import effective_media_info
+
+    source = tmp_path / "source.mp4"
+    info = _info(source, duration=60.0, size=60_000_000)
+    plan = _join((0, 50), (0, 50))  # the same 50 seconds twice
+
+    eff = effective_media_info(info, plan)
+
+    assert eff.duration == pytest.approx(100.0)  # not capped at the 60 s source
+    assert eff.frame_count == 3000

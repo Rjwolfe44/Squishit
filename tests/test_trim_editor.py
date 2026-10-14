@@ -54,6 +54,12 @@ class StubPreview:
     def cancel_all(self):
         self.cancelled += 1
 
+    def cancel_filmstrip(self):
+        self.cancelled += 1
+
+    def cancel_frames(self):
+        self.frames_cancelled = getattr(self, "frames_cancelled", 0) + 1
+
 
 def _info(duration=60.0):
     return SimpleNamespace(
@@ -127,7 +133,9 @@ def test_split_delete_and_save_returns_a_plan(editor):
     plan = dialog.result_plan()
     assert plan is not None and plan.clips[0].end == pytest.approx(60.0, abs=0.05)
     assert dialog.result() == dialog.DialogCode.Accepted
-    assert preview.cancelled >= 1  # background work is stopped when it closes
+    assert preview.cancelled >= 1  # the editor's own background work is stopped
+    assert preview.stopped >= 1
+    assert getattr(preview, "frames_cancelled", 0) >= 1
 
 
 def test_use_whole_video_clears_the_trim(editor):
@@ -452,3 +460,185 @@ def test_timeline_paints_everything_without_error(editor):
     dialog.timeline.zoom(4.0)
     dialog.timeline.set_playhead(25.0, follow=True)
     assert not dialog.timeline.grab().isNull()
+
+
+# ── fixes found in review ────────────────────────────────────────────────────
+
+
+def _press(timeline, x, y=None):
+    y = RULER_H + 30 if y is None else y
+    QTest.mousePress(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(int(x), int(y)))
+
+
+def _move(timeline, x, y=None):
+    y = RULER_H + 30 if y is None else y
+    QTest.mouseMove(timeline, QPoint(int(x), int(y)))
+
+
+def _release(timeline, x, y=None):
+    y = RULER_H + 30 if y is None else y
+    QTest.mouseRelease(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(int(x), int(y)))
+
+
+def test_escape_during_a_drag_only_cancels_the_drag(editor, monkeypatch):
+    plan = ClipPlan((Clip(10, 30), Clip(40, 50)), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    monkeypatch.setattr(
+        QMessageBox, "question", staticmethod(lambda *a, **k: pytest.fail("no prompt for a drag"))
+    )
+    timeline = dialog.timeline
+    before = dialog.model.clips
+    _press(timeline, timeline.view.time_to_x(30.0) - 3)
+    _move(timeline, timeline.view.time_to_x(25.0))
+    assert dialog.model.clips != before and timeline.is_dragging
+    dialog.reject()  # what Esc does
+    assert dialog.isVisible()
+    assert dialog.model.clips == before  # the drag was undone
+    assert not timeline.is_dragging
+    assert not dialog.model.can_undo
+
+
+def test_closing_after_real_changes_still_asks(editor, monkeypatch):
+    dialog, preview, app = editor(ClipPlan((Clip(10, 30),), ClipMode.SEPARATE))
+    dialog.seek(20.0)
+    dialog.split()
+    asked = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        staticmethod(lambda *a, **k: (asked.append(1), QMessageBox.StandardButton.No)[1]),
+    )
+    dialog.reject()
+    assert asked and dialog.isVisible()
+
+
+def test_saving_while_a_table_cell_is_being_typed_keeps_the_text(editor):
+    from PySide6.QtWidgets import QLineEdit
+
+    plan = ClipPlan((Clip(5, 15),), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    dialog.activateWindow()
+    app.processEvents()
+    item = dialog.table.item(0, 1)
+    dialog.table.setCurrentItem(item)
+    dialog.table.editItem(item)
+    app.processEvents()
+    editor_widget = dialog.table.findChild(QLineEdit)
+    assert editor_widget is not None, "the cell editor should be open"
+    editor_widget.setText("0:08")
+    dialog.save()  # Ctrl+Enter while still typing
+    assert dialog.result_plan().clips[0].start == pytest.approx(8.0)
+
+
+def test_enter_in_the_time_box_jumps_but_does_not_save(editor):
+    dialog, preview, app = editor()
+    dialog.time_field.setFocus()
+    dialog.time_field.setText("0:45")
+    QTest.keyClick(dialog.time_field, Qt.Key.Key_Return)
+    app.processEvents()
+    assert dialog.isVisible(), "Enter in the time box must not close the editor"
+    assert dialog._t == pytest.approx(45.0)
+    assert dialog.result() != dialog.DialogCode.Accepted
+
+
+def test_enter_elsewhere_still_saves(editor):
+    dialog, preview, app = editor()
+    dialog.video.setFocus()
+    QTest.keyClick(dialog, Qt.Key.Key_Return)
+    assert dialog.result() == dialog.DialogCode.Accepted
+
+
+def test_a_clip_removed_during_a_drag_does_not_break_the_drag(editor):
+    plan = ClipPlan((Clip(10, 20), Clip(30, 40)), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    timeline = dialog.timeline
+    _press(timeline, timeline.view.time_to_x(15.0))
+    _move(timeline, timeline.view.time_to_x(16.0))
+    dialog.model.delete(0)  # e.g. a stray Delete key while the mouse is down
+    _move(timeline, timeline.view.time_to_x(25.0))  # must not raise or edit the other clip
+    _release(timeline, timeline.view.time_to_x(25.0))
+    assert dialog.model.count == 1
+    clip = dialog.model.clips[0]
+    assert (clip.start, clip.end) == (pytest.approx(30.0), pytest.approx(40.0))
+    assert not timeline.is_dragging
+
+
+def test_edit_shortcuts_are_ignored_while_dragging(editor):
+    plan = ClipPlan((Clip(10, 20), Clip(30, 40)), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    timeline = dialog.timeline
+    _press(timeline, timeline.view.time_to_x(15.0))
+    _move(timeline, timeline.view.time_to_x(16.0))
+    dialog.delete_clip()
+    dialog.split()
+    dialog.undo()
+    assert dialog.model.count == 2
+    _release(timeline, timeline.view.time_to_x(16.0))
+
+
+def test_a_lost_mouse_release_is_cleaned_up_by_the_next_press(editor):
+    plan = ClipPlan((Clip(10, 30),), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    timeline = dialog.timeline
+    _press(timeline, timeline.view.time_to_x(30.0) - 3)
+    _move(timeline, timeline.view.time_to_x(25.0))
+    # ...the release never arrives; a new press must end the old gesture first
+    _press(timeline, timeline.view.time_to_x(50.0))
+    _release(timeline, timeline.view.time_to_x(50.0))
+    assert not dialog.model.in_gesture
+    assert dialog.model.can_undo  # the first drag was kept as one step
+
+
+def test_dragging_an_edge_follows_the_pointer_instead_of_snapping_back(editor):
+    plan = ClipPlan((Clip(10, 50),), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    timeline = dialog.timeline
+    start_x = timeline.view.time_to_x(50.0) - 3
+    target = timeline.view.time_to_x(33.0)
+    _press(timeline, start_x)
+    steps = 40
+    for step in range(1, steps + 1):
+        _move(timeline, start_x + (target - start_x) * step / steps)
+    _release(timeline, target)
+    px = 1.0 / timeline.view.px_per_sec
+    assert dialog.model.clips[0].end == pytest.approx(33.0, abs=max(0.2, 3 * px))
+
+
+def test_typed_times_that_overlap_a_neighbour_are_refused(editor):
+    plan = ClipPlan((Clip(5, 15), Clip(30, 40)), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    dialog.table.item(0, 2).setText("0:35")  # would run into the second clip
+    app.processEvents()
+    assert dialog.model.clips[0].end == pytest.approx(15.0)
+    assert "overlap" in dialog.status.text()
+    dialog.table.item(1, 1).setText("0:50")  # starts after it ends
+    app.processEvents()
+    assert dialog.model.clips[1].start == pytest.approx(30.0)
+    assert "after it starts" in dialog.status.text()
+    dialog.table.item(0, 2).setText("0:15.05")  # leaves a 10.05 s clip: fine
+    assert dialog.model.clips[0].end == pytest.approx(15.05)
+
+
+def test_a_clip_cannot_be_typed_shorter_than_the_minimum(editor):
+    plan = ClipPlan((Clip(5, 15),), ClipMode.SEPARATE)
+    dialog, preview, app = editor(plan)
+    dialog.table.item(0, 2).setText("0:05.02")
+    app.processEvents()
+    assert dialog.model.clips[0].end == pytest.approx(15.0)
+    assert "at least" in dialog.status.text()
+
+
+def test_an_error_message_clears_after_a_change_goes_through(editor):
+    dialog, preview, app = editor()
+    dialog.add_clip()  # no room: complains
+    assert dialog.status.text()
+    dialog.seek(30.0)
+    dialog.split()  # works
+    assert dialog.status.text() == ""
+
+
+def test_closing_leaves_the_shared_preview_service_usable(editor):
+    dialog, preview, app = editor()
+    dialog.done(0)
+    assert getattr(preview, "frames_cancelled", 0) >= 1
+    assert preview.cancelled >= 1  # only the filmstrip, not "everything"

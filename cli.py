@@ -717,7 +717,18 @@ def plan_clip_run(
     plan = resolve_clip_plan(clips, profile, duration)
     if plan is None:
         print(f"Note: the clip covers all of {input_path.name}; compressing the whole video")
-    return ClipRun(plan, expand_clip_jobs(plan), info)
+    # Name files after the clips the user typed: when some were dropped the
+    # survivors keep their own numbers, and a lone survivor of several
+    # requested clips still gets its clipNN suffix instead of the whole-file name.
+    numbers = [n for n, clip in enumerate(clips.clips, start=1) if normalize_clips([clip], duration)]
+    if plan is None or len(numbers) != len(plan.clips):
+        numbers = None
+    jobs = expand_clip_jobs(
+        plan,
+        force_tokens=clips.mode is ClipMode.SEPARATE and len(clips.clips) >= 2,
+        numbers=numbers,
+    )
+    return ClipRun(plan, jobs, info)
 
 
 def _print_target_preview(

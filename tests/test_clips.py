@@ -265,3 +265,73 @@ def test_unique_output_path_respects_reserved_names(tmp_path):
     reserved = {str(tmp_path / "clip.mp4").lower()}
     result = unique_output_path(tmp_path / "clip.mp4", lambda p: str(p).lower() in reserved)
     assert result.name == "clip (2).mp4"
+
+
+# ── fixes found in review ────────────────────────────────────────────────────
+
+
+def test_a_join_can_be_longer_than_the_source():
+    plan = ClipPlan((Clip(0, 50), Clip(0, 50)), ClipMode.JOIN)  # the same part twice
+    eff = effective_media_info(_Info(duration=60.0, size=60_000_000), plan)
+    assert eff.duration == 100.0
+    assert eff.frame_count == 3000
+    assert eff.size == 100_000_000
+
+
+def test_non_join_plans_stay_capped_at_the_source_length():
+    plan = ClipPlan((Clip(0, 900),), ClipMode.SEPARATE)
+    assert effective_media_info(_Info(), plan).duration == 600.0
+
+
+def test_legacy_trim_with_an_end_before_the_start_keeps_to_the_end():
+    profile = SimpleNamespace(trim_enabled=True, trim_start=30, trim_end=10)
+    plan = resolve_clip_plan(None, profile, 120)
+    assert plan.clips == (Clip(30.0, 120.0),)  # the old code ignored such an end
+
+
+def test_quotes_are_only_removed_when_they_wrap_the_whole_value():
+    vf, af, rest = split_filter_args(["-vf", "format=pix_fmts='yuv420p'", "-af", '"volume=2"'])
+    assert vf == ["format=pix_fmts='yuv420p'"]
+    assert af == ["volume=2"]
+
+
+def test_the_last_filter_chain_wins_like_ffmpeg_does():
+    vf, af, rest = split_filter_args(["-vf", "a", "-vf", "b", "-filter:v:0", "c", "-af:x", "d"])
+    assert vf == ["c"]
+    assert rest == ["-af:x", "d"]
+
+
+def test_a_user_filter_complex_cannot_join_a_joined_graph():
+    for flag in ("-filter_complex", "-lavfi"):
+        with pytest.raises(ValueError, match="joined clips"):
+            split_filter_args([flag, "[0:v]null[v]"])
+
+
+def test_enormous_clip_times_are_rejected_not_crashed():
+    for text in ("1e306-", "5-1e300", "99999999999-"):
+        with pytest.raises(ValueError):
+            parse_clip_range(text)
+    assert parse_clip_range("1:00-").start == 60.0
+
+
+def test_a_lone_survivor_of_several_clips_still_gets_its_suffix():
+    plan = ClipPlan((Clip(5, 10),), ClipMode.SEPARATE)
+    assert expand_clip_jobs(plan)[0].token == ""  # a plain single trim has no suffix
+    forced = expand_clip_jobs(plan, force_tokens=True, numbers=[3])
+    assert [j.token for j in forced] == ["clip03"]
+    assert forced[0].title == "Clip 3"
+
+
+def test_surviving_clips_keep_the_numbers_the_user_gave_them():
+    plan = ClipPlan((Clip(5, 10), Clip(12, 15)), ClipMode.SEPARATE)
+    jobs = expand_clip_jobs(plan, numbers=[2, 3])
+    assert [j.token for j in jobs] == ["clip02", "clip03"]
+
+
+def test_audio_only_extensions_hold_the_codec():
+    from video_compressor.core.utils import get_audio_extension
+
+    assert get_audio_extension("vorbis") == "ogg"  # Vorbis cannot live in .m4a
+    assert get_audio_extension("pcm_s16le") == "wav"
+    assert get_audio_extension("aac") == "m4a"
+    assert get_audio_extension("alac") == "m4a"

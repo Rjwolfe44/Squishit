@@ -347,6 +347,11 @@ def output_path_for(
     dest.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     pattern = (template or "").strip() or "{name}_compressed"
+    if "{clip}" in pattern and not clip_token:
+        # No clip to name: take the field out together with the separator
+        # next to it, and leave every other character of the name alone.
+        pattern = re.sub(r"^\{clip\}[_\-. ]*|[_\-. ]?\{clip\}", "", pattern) or "{name}"
+    token_placed = bool(clip_token) and "{clip}" in pattern
     try:
         stem = pattern.format(
             name=input_path.stem,
@@ -362,12 +367,10 @@ def output_path_for(
             clip=clip_token,
         )
     except Exception:
+        # A template that does not format (say {size}) falls back to the usual
+        # name; a clip still needs its own suffix so clips never share a name.
         stem = f"{input_path.stem}_compressed"
-    else:
-        if "{clip}" in pattern:
-            if not clip_token:
-                # No clip to name: close the gap the empty field left behind.
-                stem = re.sub(r"_{2,}", "_", stem).strip("_- .") or input_path.stem
-        elif clip_token:
-            stem = f"{stem}_{clip_token}"
+        token_placed = False
+    if clip_token and not token_placed:
+        stem = f"{stem}_{clip_token}"
     return dest / (sanitize_filename(stem) + ext)

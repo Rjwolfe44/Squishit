@@ -243,6 +243,10 @@ def get_audio_extension(codec: str) -> str:
         "mp3": "mp3",
         "flac": "flac",
         "ac3": "ac3",
+        "vorbis": "ogg",
+        "pcm_s16le": "wav",
+        "pcm_s24le": "wav",
+        "pcm_f32le": "wav",
     }
     return mapping.get(normalized, "m4a")
 

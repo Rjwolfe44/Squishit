@@ -36,6 +36,8 @@ from ..software_fallback_dialog import declined_software_fallback_notice
 logger = logging.getLogger(__name__)
 
 THUMB_W, THUMB_H = 112, 63
+#: Videos shorter than this have nothing to cut; the editor needs a real timeline.
+MIN_TRIM_SECONDS = 0.5
 
 
 @dataclass
@@ -270,9 +272,8 @@ class FileRow(QFrame):
             self._ready = False
         else:
             self._meta.setText(describe_media(info) or str(self.path.parent))
-            self._ready = hasattr(info, "video_codec") and bool(
-                getattr(info, "duration", 0)
-            )
+            length = float(getattr(info, "duration", 0) or 0)
+            self._ready = hasattr(info, "video_codec") and length >= MIN_TRIM_SECONDS
             if not hasattr(info, "video_codec"):
                 self._thumb.setText("Image")
         self._sync_buttons()
@@ -448,6 +449,7 @@ __all__ = [
     "ProgressRow",
     "ResultRow",
     "RowActions",
+    "MIN_TRIM_SECONDS",
     "THUMB_H",
     "THUMB_W",
     "clip_summary",

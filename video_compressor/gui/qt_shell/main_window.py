@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -85,6 +86,7 @@ from .encode_form import EncodeForm, output_path_for
 from .history_dialog import HistoryDialog
 from .hw_card import HardwareStatusCard
 from .rows import (
+    MIN_TRIM_SECONDS,
     FileRow,
     ProgressRow,
     ResultRow,
@@ -164,6 +166,7 @@ class SquishItWindow(QMainWindow):
         self._update_info = None
         self._update_check = None
         self._compare_mode = False
+        self._compare_cancel = threading.Event()
         self._current_profile: Optional[CompressionProfile] = None
         self._selected_profile = get_config().default_profile or "Balanced"
         self.form = EncodeForm(
@@ -240,6 +243,10 @@ class SquishItWindow(QMainWindow):
         header.addLayout(titles, 1)
         self._output_btn = QPushButton("Output folder")
         self._output_btn.clicked.connect(self._pick_output_folder)
+        self._output_btn.setToolTip(
+            "Choose where finished files go. To save next to the originals "
+            "again, use More \u25be Save next to the original files."
+        )
         header.addWidget(self._output_btn)
         history_btn = QPushButton("History")
         history_btn.clicked.connect(self._open_history)
@@ -638,6 +645,10 @@ class SquishItWindow(QMainWindow):
         info = item.get("info") if item else None
         if item is None or info is None or not hasattr(info, "video_codec"):
             return
+        length = float(getattr(info, "duration", 0) or 0)
+        if not length >= MIN_TRIM_SECONDS or length == float("inf"):
+            self._queue_label.setText("That video is too short to trim.")
+            return
         from .trim_editor import TrimEditorDialog
 
         dialog = TrimEditorDialog(
@@ -648,8 +659,11 @@ class SquishItWindow(QMainWindow):
             self._get_preview(),
             target_note=self._target_note(),
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.set_clips(key, dialog.result_plan())
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.set_clips(key, dialog.result_plan())
+        finally:
+            dialog.deleteLater()
 
     def set_clips(self, key: str, plan: Optional[ClipPlan]) -> None:
         item = self._files.get(key)
@@ -722,12 +736,20 @@ class SquishItWindow(QMainWindow):
             return Path(saved)
         return None
 
+    def _start_from_shortcut(self) -> None:
+        """Ctrl+Enter: let a text box the user is still typing in take its value first."""
+
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            focus.clearFocus()  # editingFinished fires when it loses focus
+        self.start_compression()
+
     def _install_shortcuts(self) -> None:
         for sequence, handler in (
             ("Ctrl+O", self._pick_files),
             ("Ctrl+Shift+O", self._pick_folder),
-            ("Ctrl+Return", self.start_compression),
-            ("Ctrl+Enter", self.start_compression),
+            ("Ctrl+Return", self._start_from_shortcut),
+            ("Ctrl+Enter", self._start_from_shortcut),
         ):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(handler)
@@ -803,6 +825,16 @@ class SquishItWindow(QMainWindow):
             get_config_manager().update_config(last_output_folder=str(folder))
         except Exception:
             logger.debug("Could not store the output folder", exc_info=True)
+
+    def reset_output_folder(self) -> None:
+        """Go back to saving each result next to its original file."""
+
+        self._output_folder = None
+        self._refresh_output_button()
+        try:
+            get_config_manager().update_config(last_output_folder="")
+        except Exception:
+            logger.debug("Could not clear the output folder", exc_info=True)
 
     def _refresh_output_button(self) -> None:
         if self._output_folder is None:
@@ -1054,17 +1086,24 @@ class SquishItWindow(QMainWindow):
         )
         compressor = self._get_compressor()
         source = Path(item["path"])
+        cancel = self._compare_cancel = threading.Event()
 
         def _worker() -> None:
             try:
-                results = compressor.compare_sample(
-                    input_file=source,
-                    output_dir=out_dir,
-                    profiles=profiles,
-                    sample_seconds=20.0,
-                )
-                for result in results:
-                    self._queue.put(("compare_result", result))
+                # One sample per call, so Cancel can stop between samples.
+                for sample_profile in profiles:
+                    if cancel.is_set():
+                        break
+                    results = compressor.compare_sample(
+                        input_file=source,
+                        output_dir=out_dir,
+                        profiles=[sample_profile],
+                        sample_seconds=20.0,
+                    )
+                    for result in results:
+                        self._queue.put(("compare_result", result))
+                    if any(getattr(r, "cancelled", False) for r in results):
+                        break
                 self._queue.put(("compare_done",))
             except Exception as exc:
                 logger.exception("Compare sample failed")
@@ -1076,11 +1115,15 @@ class SquishItWindow(QMainWindow):
         if not self._compare_mode:
             return
         self._compare_mode = False
+        cancelled = self._cancel_requested
         self._set_running(False)
         self._current_profile = None
         self._cancel_requested = False
         self._clear_activity()
         self._clear_results()
+        if cancelled and not error:
+            self._queue_label.setText("Comparison cancelled.")
+            return
         if error:
             self._queue_label.setText(f"Could not compare: {error}")
             return
@@ -1106,10 +1149,36 @@ class SquishItWindow(QMainWindow):
         if self._compressor is not None:
             self._compressor.cancel_job(job_id)
 
+    def _cancel_compare(self) -> None:
+        """Stop a running Compare sample: no new samples, and end the one encoding now.
+
+        A sample can start between two checks, so this repeats until the worker
+        reports back.
+        """
+
+        self._compare_cancel.set()
+        compressor = self._compressor
+        if compressor is not None:
+            try:
+                for job in compressor.get_active_jobs():
+                    compressor.cancel_job(job.id)
+            except Exception:
+                logger.debug("Could not cancel a sample", exc_info=True)
+        if self._compare_mode:
+            QTimer.singleShot(250, self._cancel_compare)
+
     def cancel_all(self) -> None:
         if not self._running:
             return
         self._cancel_requested = True
+        if self._compare_mode:
+            # Samples are not counted in _active, so the normal "nothing left,
+            # finish now" check below would end the run too early. The compare
+            # worker reports back when it has really stopped.
+            self._cancel_btn.setEnabled(False)
+            self._queue_label.setText("Stopping the comparison\u2026")
+            self._cancel_compare()
+            return
         self._pending.clear()
         self._cancel_btn.setEnabled(False)
         compressor = self._compressor
@@ -1333,6 +1402,7 @@ class SquishItWindow(QMainWindow):
 
     def _open_help_menu(self) -> None:
         menu = QMenu(self)
+        menu.addAction("Save next to the original files", self.reset_output_folder)
         menu.addAction("Statistics\u2026", self._open_stats)
         menu.addAction("Custom profiles\u2026", self._open_profile_editor)
         menu.addSeparator()
@@ -1351,27 +1421,40 @@ class SquishItWindow(QMainWindow):
     def _explain_tray(self) -> None:
         QMessageBox.information(self, f"{APP_NAME} tray", TRAY_HELP)
 
+    @staticmethod
+    def _run_dialog(dialog) -> None:
+        """Show a dialog modally, then free it (children of the window pile up otherwise)."""
+
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _open_about(self) -> None:
-        AboutDialog(
-            self,
-            hardware_summary=self._hw_card.found.text(),
-            update_info=self._update_info,
-        ).exec()
+        self._run_dialog(
+            AboutDialog(
+                self,
+                hardware_summary=self._hw_card.found.text(),
+                update_info=self._update_info,
+            )
+        )
 
     def _open_history(self) -> None:
-        HistoryDialog(self, history=self._history).exec()
+        self._run_dialog(HistoryDialog(self, history=self._history))
 
     def _open_stats(self) -> None:
-        StatsDialog(self, history=self._history).exec()
+        self._run_dialog(StatsDialog(self, history=self._history))
 
     def _open_profile_editor(self) -> None:
         from .profile_editor import ProfileEditorDialog
 
-        ProfileEditorDialog(
-            self,
-            profile_manager=self._profile_manager,
-            on_changed=self._profiles_changed,
-        ).exec()
+        self._run_dialog(
+            ProfileEditorDialog(
+                self,
+                profile_manager=self._profile_manager,
+                on_changed=self._profiles_changed,
+            )
+        )
 
     def _profiles_changed(self) -> None:
         """Custom profiles were saved, deleted or imported: refresh the menu."""
@@ -1441,6 +1524,13 @@ class SquishItWindow(QMainWindow):
                     return
             # Never leave an ffmpeg process behind when the window goes away.
             self._pending.clear()
+            if self._compare_mode:
+                self._compare_cancel.set()
+                try:
+                    for job in compressor.get_active_jobs():
+                        compressor.cancel_job(job.id)
+                except Exception:
+                    logger.debug("Could not cancel a sample", exc_info=True)
             for job_id in list(self._progress_rows):
                 try:
                     compressor.cancel_job(job_id)

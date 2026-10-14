@@ -1713,3 +1713,41 @@ def test_smoke_service_shutdown_kills_playback_process(long_clip):
     second_proc = second.process
     svc.shutdown()
     assert second_proc.poll() is not None
+
+
+# ── fixes found in review ────────────────────────────────────────────────────
+
+
+def test_cache_key_matches_the_millisecond_ffmpeg_is_asked_for(tmp_path):
+    clip = tmp_path / "a.mp4"
+    clip.write_bytes(b"x")
+    key = ThumbnailCache.make_key
+    # 1.0004 s and 1.0 s both seek to 1.000, so they are the same frame...
+    assert key(clip, 1.0004, 8, 8, False) == key(clip, 1.0, 8, 8, False)
+    # ...but 1.0009 s must not be served the 1.001 s picture (and vice versa).
+    assert key(clip, 1.0016, 8, 8, False) != key(clip, 1.0004, 8, 8, False)
+    assert key(clip, 1.0009, 8, 8, False)[3] == 1000
+
+
+def test_cancel_frames_leaves_posters_and_the_filmstrip_alone(tmp_path):
+    import threading
+
+    clip = tmp_path / "a.mp4"
+    clip.write_bytes(b"x")
+    gate = threading.Event()
+    poster_done = threading.Event()
+    seen = []
+
+    def grab(*args, **kwargs):
+        if not gate.wait(5):
+            return None
+        return bytes(2 * 2 * 3)
+
+    service = PreviewService("ffmpeg", grab=grab)
+    try:
+        service.request_poster(clip, 0.0, (2, 2), lambda *a: (seen.append(a), poster_done.set()))
+        service.cancel_frames()
+        gate.set()
+        assert poster_done.wait(5), "cancel_frames must not drop queued posters"
+    finally:
+        service.shutdown()

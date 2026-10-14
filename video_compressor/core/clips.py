@@ -15,6 +15,7 @@ Typical flow::
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
@@ -27,6 +28,8 @@ MIN_CLIP_SECONDS = 0.1
 MAX_JOIN_CLIPS = 30
 #: A clip that covers the whole source to within this many seconds means "no trim".
 WHOLE_SOURCE_TOLERANCE = 0.05
+#: Largest time accepted when parsing a clip range (about 115 days).
+MAX_CLIP_SECONDS = 10_000_000.0
 
 
 class ClipMode(str, Enum):
@@ -84,7 +87,10 @@ def _ms(value: float) -> float:
     """Round to whole milliseconds (``inf`` passes through)."""
     if math.isinf(value):
         return value
-    return round(value * 1000.0) / 1000.0
+    try:
+        return round(value * 1000.0) / 1000.0
+    except OverflowError:
+        return value
 
 
 def normalize_clips(
@@ -152,6 +158,8 @@ def resolve_clip_plan(
     elif getattr(profile, "trim_enabled", False):
         start = parse_timecode(getattr(profile, "trim_start", None)) or 0.0
         end = parse_timecode(getattr(profile, "trim_end", None))
+        if end is not None and end <= start:
+            end = None  # an end before the start was always ignored: keep to the end
         raw = (Clip(start, math.inf if end is None else end),)
     else:
         return None
@@ -180,7 +188,8 @@ def effective_media_info(info: Any, plan: Optional[ClipPlan]) -> Any:
     total = plan.total_duration
     if math.isinf(total):
         return info
-    if source_duration > 0:
+    if source_duration > 0 and plan.mode is not ClipMode.JOIN:
+        # A join may repeat parts of the video, so only other plans are capped.
         total = min(total, source_duration)
     changes: dict = {"duration": total}
     fps = float(getattr(info, "avg_fps", 0.0) or getattr(info, "fps", 0.0) or 0.0)
@@ -206,29 +215,45 @@ def _clip_token(clip: Clip, index: int, used: set) -> str:
     return token
 
 
-def expand_clip_jobs(plan: Optional[ClipPlan]) -> List[ClipJob]:
+def expand_clip_jobs(
+    plan: Optional[ClipPlan],
+    *,
+    force_tokens: bool = False,
+    numbers: Optional[Sequence[int]] = None,
+) -> List[ClipJob]:
     """Turn a plan into the encodes to run.
 
     * ``None`` -> one job for the whole file (no suffix).
     * separate mode, 2+ clips -> one job per clip (``clip01``... or the clip's label).
     * join mode, or a single clip -> one job with the whole plan.
+
+    ``force_tokens`` keeps the ``clipNN`` suffix even when only one clip is left
+    (the user asked for several, so the name must not look like a whole-file
+    result). ``numbers`` gives each clip's original 1-based number, so names stay
+    stable when some requested clips were dropped.
     """
     if plan is None or not plan.clips:
         return [ClipJob(None)]
-    if plan.mode is ClipMode.JOIN or len(plan.clips) == 1:
+    if plan.mode is ClipMode.JOIN:
+        return [ClipJob(plan)]
+    if len(plan.clips) == 1 and not force_tokens:
         return [ClipJob(plan)]
     used: set = set()
     count = len(plan.clips)
-    return [
-        ClipJob(
-            ClipPlan((clip,), ClipMode.SEPARATE),
-            index=i,
-            count=count,
-            token=_clip_token(clip, i, used),
-            title=f"Clip {i + 1} of {count}",
+    jobs: List[ClipJob] = []
+    unbroken = numbers is None or [int(n) for n in numbers] == list(range(1, count + 1))
+    for i, clip in enumerate(plan.clips):
+        number = int(numbers[i]) if numbers is not None and i < len(numbers) else i + 1
+        jobs.append(
+            ClipJob(
+                ClipPlan((clip,), ClipMode.SEPARATE),
+                index=i,
+                count=count,
+                token=_clip_token(clip, number - 1, used),
+                title=f"Clip {number} of {count}" if unbroken else f"Clip {number}",
+            )
         )
-        for i, clip in enumerate(plan.clips)
-    ]
+    return jobs
 
 
 def build_concat_filtergraph(
@@ -269,15 +294,19 @@ def build_concat_filtergraph(
     return ";".join(parts), vlabel, alabel
 
 
-_VIDEO_FILTER_FLAGS = {"-vf", "-filter:v"}
-_AUDIO_FILTER_FLAGS = {"-af", "-filter:a"}
+_VIDEO_FILTER_FLAG = re.compile(r"^-(?:vf|filter:v)(?::\d+)?$")
+_AUDIO_FILTER_FLAG = re.compile(r"^-(?:af|filter:a)(?::\d+)?$")
+_COMPLEX_FILTER_FLAGS = {"-filter_complex", "-lavfi", "-filter_complex_script", "-/filter_complex"}
 
 
 def split_filter_args(extra_args: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
     """Pull ``-vf``/``-af`` chains out of user "extra ffmpeg args".
 
     Returns ``(video_chains, audio_chains, remaining_args)``. Needed for join mode,
-    where the chains must move into the ``filter_complex`` graph.
+    where the chains must move into the ``filter_complex`` graph. As in FFmpeg,
+    when a chain is given twice only the last one counts. Quotes are removed only
+    when they wrap the whole value. A user ``-filter_complex``/``-lavfi`` cannot be
+    combined with a joined graph, so it raises ``ValueError``.
     """
     video: List[str] = []
     audio: List[str] = []
@@ -286,16 +315,29 @@ def split_filter_args(extra_args: Sequence[str]) -> Tuple[List[str], List[str], 
     i = 0
     while i < len(args):
         flag = args[i]
-        if flag in _VIDEO_FILTER_FLAGS and i + 1 < len(args):
-            video.append(args[i + 1].strip("\"'"))
+        if flag in _COMPLEX_FILTER_FLAGS:
+            raise ValueError(
+                f"The extra FFmpeg option {flag} can't be combined with joined clips. "
+                "Remove it or save the clips as separate files."
+            )
+        if _VIDEO_FILTER_FLAG.match(flag) and i + 1 < len(args):
+            video = [_unwrap(args[i + 1])]
             i += 2
-        elif flag in _AUDIO_FILTER_FLAGS and i + 1 < len(args):
-            audio.append(args[i + 1].strip("\"'"))
+        elif _AUDIO_FILTER_FLAG.match(flag) and i + 1 < len(args):
+            audio = [_unwrap(args[i + 1])]
             i += 2
         else:
             rest.append(flag)
             i += 1
     return video, audio, rest
+
+
+def _unwrap(value: str) -> str:
+    """Drop one pair of quotes that wrap the whole value."""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
 
 
 def parse_clip_range(text: str) -> Clip:
@@ -321,6 +363,8 @@ def parse_clip_range(text: str) -> Clip:
         if parsed is None:
             raise ValueError(f"'{end_text}' is not a valid end time")
         end = parsed
+    if start > MAX_CLIP_SECONDS or (not math.isinf(end) and end > MAX_CLIP_SECONDS):
+        raise ValueError(f"clip '{text}' is far longer than any video")
     if end <= start:
         raise ValueError(f"clip '{text}' ends before it starts")
     return Clip(_ms(start), end)

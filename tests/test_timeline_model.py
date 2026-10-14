@@ -1270,3 +1270,13 @@ def test_module_stays_free_of_qt_and_tkinter():
         timeout=120,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_a_drag_that_ends_where_it_started_leaves_no_undo_step():
+    model = ClipEditModel(60.0, 30.0, [Clip(10, 20), Clip(30, 40)])
+    model.begin_gesture()
+    model.resize(0, "end", 25.0)
+    model.resize(0, "end", 20.0)  # back to where it began
+    assert model.end_gesture() is False
+    assert not model.can_undo
+    assert model.clips[0].end == 20.0

@@ -315,7 +315,8 @@ def test_clip_outside_the_video_is_dropped_with_a_warning(env, capsys):
     out = capsys.readouterr().out
 
     assert code == 0
-    assert _names(env) == ["movie_compressed.mp4"]  # one clip left -> plain name
+    # One of two clips is left, but the name must not look like a whole-file result.
+    assert _names(env) == ["movie_compressed_clip01.mp4"]
     assert (env.calls[0].kwargs["clips"].clips[0].start, env.calls[0].kwargs["clips"].clips[0].end) == (5, 10)
     assert "clip 2 (08:20.000 - 10:00.000)" in out
     assert "outside the video" in out
@@ -506,3 +507,23 @@ def test_dry_run_target_size_preview_uses_the_clip_length(monkeypatch, env, caps
     assert seen == [10.0, 30.0]  # sized per clip, not for the full 120 s source
     assert out.count("Target: 100 MB (balanced)") == 2
     assert "Skip:" not in out
+
+
+def test_surviving_clips_keep_the_numbers_the_user_typed(env, capsys):
+    movie = _video(env.dir)
+
+    code = main([str(movie), "--clip", "500-600", "--clip", "5-10", "--clip", "12-15", "--quiet"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    # clip 1 was dropped, so the others stay clip02 / clip03, as the warning calls them
+    assert _names(env) == ["movie_compressed_clip02.mp4", "movie_compressed_clip03.mp4"]
+    assert "clip 1 (08:20.000 - 10:00.000)" in out
+
+
+def test_single_clip_still_uses_the_plain_name(env):
+    movie = _video(env.dir)
+
+    main([str(movie), "--clip", "5-10", "--quiet"])
+
+    assert _names(env) == ["movie_compressed.mp4"]

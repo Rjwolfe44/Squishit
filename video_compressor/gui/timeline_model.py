@@ -763,6 +763,8 @@ class ClipEditModel:
         self._gesture_base, self._gesture_dirty = None, False
         if not dirty or base is None:
             return False
+        if base.clips == self._clips and base.mode == self._mode:
+            return False  # dragged away and back: nothing to undo
         self._push_undo(base)
         self._redo.clear()
         self._notify()

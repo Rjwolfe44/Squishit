@@ -347,31 +347,42 @@ class SettingsPane(QWidget):
                 parallel_index = self._parallel.findText(str(form.parallel_jobs))
             self._parallel.setCurrentIndex(max(0, parallel_index))
             self._template.setText(form.output_name_template)
+            self._select_text(self._image_format, form.image_format)
+            self._select_data(self._audio_handling, form.audio_mode)
+            self._select_data(self._output_type, form.output_mode)
+            self._select_text(self._threads, str(form.threads) if form.threads else "Auto")
+            self._select_data(self._queue_order, form.queue_order)
+            self._audio_handling.setEnabled(form.output_mode != "audio")
             kbps_index = self._audio_kbps.findData(int(form.audio_kbps))
             if kbps_index < 0:
                 self._audio_kbps.addItem(f"{int(form.audio_kbps)} kbps", int(form.audio_kbps))
                 kbps_index = self._audio_kbps.findData(int(form.audio_kbps))
             self._audio_kbps.setCurrentIndex(max(0, kbps_index))
-            self._audio_handling.setCurrentIndex(
-                max(0, self._audio_handling.findData(form.audio_mode))
-            )
-            self._output_type.setCurrentIndex(
-                max(0, self._output_type.findData(form.output_mode))
-            )
-            self._image_format.setCurrentIndex(
-                max(0, self._image_format.findText(form.image_format))
-            )
-            self._threads.setCurrentIndex(
-                max(0, self._threads.findText(str(form.threads or "Auto")))
-            )
-            self._queue_order.setCurrentIndex(
-                max(0, self._queue_order.findData(form.queue_order))
-            )
             self._extra_args.setText(form.extra_ffmpeg_args or "")
             self._refresh_hints()
             self._refresh_profile_chrome(form.quick_name)
         finally:
             self._loading = False
+
+    @staticmethod
+    def _select_text(combo: QComboBox, text: str) -> None:
+        """Show ``text``; add it when the list does not have it yet."""
+
+        index = combo.findText(text)
+        if index < 0:
+            combo.addItem(text)
+            index = combo.findText(text)
+        combo.setCurrentIndex(max(0, index))
+
+    @staticmethod
+    def _select_data(combo: QComboBox, data: str) -> None:
+        """Show the entry holding ``data``; add it when the list does not have it."""
+
+        index = combo.findData(data)
+        if index < 0:
+            combo.addItem(str(data), data)
+            index = combo.findData(data)
+        combo.setCurrentIndex(max(0, index))
 
     def set_size_preview(self, text: str) -> None:
         self._size_preview.setText(text or "")
@@ -624,6 +635,7 @@ class SettingsPane(QWidget):
         if self._loading:
             return
         self.form.output_mode = str(self._output_type.currentData() or "video")
+        self._audio_handling.setEnabled(self.form.output_mode != "audio")
         self.form.note_manual_edit()
         self._emit_field()
 
@@ -651,7 +663,10 @@ class SettingsPane(QWidget):
     def _on_extra_args(self) -> None:
         if self._loading:
             return
-        self.form.extra_ffmpeg_args = self._extra_args.text().strip()
+        text = self._extra_args.text().strip()
+        if text == (self.form.extra_ffmpeg_args or ""):
+            return  # clicked in and out again: not an edit
+        self.form.extra_ffmpeg_args = text
         self.form.note_manual_edit()
         self._emit_field()
 

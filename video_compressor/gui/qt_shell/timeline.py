@@ -105,9 +105,37 @@ class TimelineWidget(QWidget):
         self.viewChanged.emit()
         self.update()
 
+    @property
+    def is_dragging(self) -> bool:
+        return self._drag is not None
+
+    def cancel_drag(self) -> bool:
+        """Abandon a drag in progress and undo what it changed (Esc). True if one was open."""
+
+        return self._abort_drag(commit=False)
+
+    def finish_drag(self) -> bool:
+        """End a drag in progress as if the button was released here."""
+
+        return self._abort_drag(commit=True)
+
+    def _abort_drag(self, *, commit: bool) -> bool:
+        drag, self._drag = self._drag, None
+        self._create_rect = None
+        if drag is None:
+            return False
+        if drag["kind"] in ("edge", "move"):
+            if commit:
+                self.model.end_gesture()
+            else:
+                self.model.cancel_gesture()
+        self.update()
+        return True
+
     def dispose(self) -> None:
         """Stop listening to the model (the dialog is going away)."""
 
+        self._abort_drag(commit=False)
         try:
             self._unsubscribe()
         except Exception:
@@ -286,14 +314,17 @@ class TimelineWidget(QWidget):
         if event.modifiers() & Qt.KeyboardModifier.AltModifier:
             return t
         candidates = list(self.model.snap_points(exclude_index=exclude))
-        candidates.append(self._playhead)
+        # The editor moves the playhead onto the edge being dragged; snapping to
+        # that moving target would pull the edge back. Use where it was at press.
+        fixed = self._drag.get("playhead") if self._drag else None
+        candidates.append(self._playhead if fixed is None else fixed)
         return self.view.snap(t, candidates)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
             return
         x, y = event.position().x(), event.position().y()
-        self._drag = None
+        self._abort_drag(commit=True)  # a release may have been lost
         if y < RULER_H:
             self._drag = {"kind": "playhead"}
             self._scrub_to(x)
@@ -306,7 +337,13 @@ class TimelineWidget(QWidget):
         self.model.select(index)
         self.model.begin_gesture()
         if part in ("start", "end"):
-            self._drag = {"kind": "edge", "index": index, "which": part}
+            self._drag = {
+                "kind": "edge",
+                "index": index,
+                "which": part,
+                "playhead": self._playhead,
+                "expect": self.model.clips[index],
+            }
         else:
             clip = self.model.clips[index]
             self._drag = {
@@ -316,6 +353,8 @@ class TimelineWidget(QWidget):
                 "anchor_t": self.view.x_to_time(x),
                 "origin": clip.start,
                 "moved": False,
+                "playhead": self._playhead,
+                "expect": clip,
             }
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -327,6 +366,11 @@ class TimelineWidget(QWidget):
             self.update()
             return
         kind = drag["kind"]
+        if kind in ("edge", "move") and not self._drag_target_ok(drag):
+            # The list changed under the mouse (Delete, Undo...): stop dragging
+            # but keep what happened, rather than guess which clip to move.
+            self._abort_drag(commit=True)
+            return
         if kind == "playhead":
             self._scrub_to(x)
         elif kind == "edge":
@@ -335,6 +379,7 @@ class TimelineWidget(QWidget):
             t = self._snap(self.view.x_to_time(x), index, event)
             self.model.resize(index, drag["which"], t)
             clip = self.model.clips[index]
+            drag["expect"] = clip
             self.scrubbing.emit(clip.start if drag["which"] == "start" else clip.end)
         elif kind == "move":
             if abs(x - drag["press_x"]) > _CLICK_SLOP_PX:
@@ -353,6 +398,7 @@ class TimelineWidget(QWidget):
                 else:
                     wanted = snapped_end
                 self.model.move(index, wanted - clip.start)
+                drag["expect"] = self.model.clips[index]
                 self.scrubbing.emit(self.model.clips[index].start)
         elif kind == "create":
             if abs(x - drag["anchor_x"]) > _CLICK_SLOP_PX + 1:
@@ -365,6 +411,10 @@ class TimelineWidget(QWidget):
         drag, self._drag = self._drag, None
         x = event.position().x()
         kind = drag["kind"]
+        if kind in ("edge", "move") and not self._drag_target_ok(drag):
+            self.model.end_gesture()
+            self.update()
+            return
         if kind == "playhead":
             self.scrubFinished.emit(self._playhead)
         elif kind == "edge":
@@ -410,6 +460,15 @@ class TimelineWidget(QWidget):
         event.accept()
 
     # -- helpers --------------------------------------------------------
+
+    def _drag_target_ok(self, drag: dict) -> bool:
+        """True while the clip being dragged is still the one the drag started on.
+
+        Delete, Undo or a typed edit can change the list under the mouse; the
+        index alone would then point at a different clip.
+        """
+        index = drag["index"]
+        return 0 <= index < self.model.count and self.model.clips[index] == drag["expect"]
 
     def _scrub_to(self, x: float) -> None:
         t = self.view.x_to_time(x)

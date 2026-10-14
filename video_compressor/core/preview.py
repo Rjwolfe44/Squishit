@@ -444,7 +444,14 @@ class ThumbnailCache:
             st = os.stat(path)
         except OSError:
             return None
-        return (os.fspath(path), st.st_mtime_ns, st.st_size, int(round(float(t) * 1000)), int(w), int(h), bool(fast))
+        # Floor to the millisecond exactly like the -ss value sent to ffmpeg
+        # (_format_seek), so two times that ask ffmpeg for the same frame
+        # share one entry and two that don't never do.
+        try:
+            t_ms = int(math.floor(float(t) * 1000.0 + 1e-6))
+        except (TypeError, ValueError, OverflowError):
+            t_ms = 0
+        return (os.fspath(path), st.st_mtime_ns, st.st_size, t_ms, int(w), int(h), bool(fast))
 
     @property
     def max_bytes(self) -> int:
@@ -1208,6 +1215,14 @@ class PreviewService:
             session.stop()
 
     # -- lifecycle ------------------------------------------------------
+
+    def cancel_frames(self) -> None:
+        """Drop only the pending scrub-frame request.
+
+        For a dialog that shares this service with the main window: posters
+        for the queue rows must keep loading, so it must not use ``cancel_all``.
+        """
+        self._interactive.cancel()
 
     def cancel_all(self) -> None:
         """Cancel pending/running grabs, posters, the filmstrip and playback.

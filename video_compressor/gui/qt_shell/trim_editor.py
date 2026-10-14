@@ -411,7 +411,8 @@ class TrimEditorDialog(QDialog):
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             focus = self.focusWidget()
-            if not isinstance(focus, QLineEdit):
+            editing = self.table.state() == QAbstractItemView.State.EditingState
+            if not isinstance(focus, QLineEdit) and not editing:
                 self.save()
             event.accept()
             return
@@ -420,6 +421,7 @@ class TrimEditorDialog(QDialog):
     # -- model -> widgets -----------------------------------------------
 
     def _on_model_changed(self) -> None:
+        self._set_status("")  # an earlier complaint no longer applies
         self._refresh_table()
         self._refresh_chrome()
 
@@ -534,6 +536,11 @@ class TrimEditorDialog(QDialog):
             QTimer.singleShot(0, self._refresh_table)
             return
         start, end = (value, clip.end) if column == 1 else (clip.start, value)
+        problem = self._table_edit_problem(row, start, end)
+        if problem:
+            self._set_status(problem, error=True)
+            QTimer.singleShot(0, self._refresh_table)
+            return
         if not self.model.set_times(row, start, end):
             self._set_status("A clip must end after it starts and fit in the video.", error=True)
             QTimer.singleShot(0, self._refresh_table)
@@ -541,6 +548,20 @@ class TrimEditorDialog(QDialog):
         self._set_status("")
         self._request_frame(value, fast=False)
         self._set_playhead(value)
+
+    def _table_edit_problem(self, row: int, start: float, end: float) -> str:
+        """Why a typed start/end cannot be used, or an empty string if it can."""
+
+        tolerance = 0.0006
+        shortest = self.model.min_len
+        if end - start < shortest - tolerance:
+            if end <= start:
+                return "A clip has to end after it starts."
+            return f"A clip has to be at least {shortest:.1f} seconds long."
+        limits = self.model.limits(row)
+        if limits is not None and (start < limits[0] - tolerance or end > limits[1] + tolerance):
+            return "That would overlap the neighbouring clip."
+        return ""
 
     def _on_mode_radio(self, checked: bool) -> None:
         if self._syncing or not checked:
@@ -554,7 +575,12 @@ class TrimEditorDialog(QDialog):
 
     # -- editing actions --------------------------------------------------
 
+    def _dragging(self) -> bool:
+        return self.timeline.is_dragging
+
     def set_in(self) -> None:
+        if self._dragging():
+            return
         selected = self.model.selected
         if selected is None:
             self.add_clip()
@@ -563,6 +589,8 @@ class TrimEditorDialog(QDialog):
             self._set_status("The start has to come before the end of the clip.", error=True)
 
     def set_out(self) -> None:
+        if self._dragging():
+            return
         selected = self.model.selected
         if selected is None:
             self.add_clip()
@@ -571,12 +599,16 @@ class TrimEditorDialog(QDialog):
             self._set_status("The end has to come after the start of the clip.", error=True)
 
     def split(self) -> None:
+        if self._dragging():
+            return
         if self.model.split_at(self._t) is None:
             self._set_status("Move the playhead inside a clip, away from its edges, to split it.", error=True)
         else:
             self._set_status("")
 
     def add_clip(self) -> None:
+        if self._dragging():
+            return
         end = min(self.duration, self._t + NEW_CLIP_SECONDS)
         if self.model.add_clip(self._t, end) is None:
             self._set_status(
@@ -587,6 +619,8 @@ class TrimEditorDialog(QDialog):
             self._set_status("")
 
     def delete_clip(self) -> None:
+        if self._dragging():
+            return
         selected = self.model.selected
         if selected is None:
             return
@@ -594,15 +628,19 @@ class TrimEditorDialog(QDialog):
             self._set_status("That is the only clip. Use 'Use whole video' to remove it.", error=True)
 
     def move_clip(self, direction: int) -> None:
+        if self._dragging():
+            return
         selected = self.model.selected
         if selected is not None:
             self.model.reorder(selected, selected + direction)
 
     def undo(self) -> None:
-        self.model.undo()
+        if not self._dragging():
+            self.model.undo()
 
     def redo(self) -> None:
-        self.model.redo()
+        if not self._dragging():
+            self.model.redo()
 
     def timeline_fit(self) -> None:
         self.timeline.fit()
@@ -614,17 +652,30 @@ class TrimEditorDialog(QDialog):
 
         return self._result
 
+    def _settle_pending_input(self) -> None:
+        """Commit what the user is typing and end any drag before reading the model."""
+
+        self.timeline.finish_drag()
+        focus = self.focusWidget()
+        if focus is not None and focus is not self.video:
+            focus.clearFocus()  # a table cell commits its text when it loses focus
+        self.video.setFocus()
+
     def save(self) -> None:
+        self._settle_pending_input()
         if self.model.join_cap_exceeded:
             return
         self._result = self.model.to_plan()
         self.accept()
 
     def use_whole_video(self) -> None:
+        self.timeline.cancel_drag()
         self._result = None
         self.accept()
 
     def reject(self) -> None:
+        if self.timeline.cancel_drag():
+            return  # Esc (or Cancel) while dragging only cancels the drag
         if self.model.can_undo and not self._confirm_discard():
             return
         super().reject()
@@ -650,10 +701,13 @@ class TrimEditorDialog(QDialog):
         self._settle.stop()
         self._playing = False
         self._play_id += 1
-        try:
-            self.preview.cancel_all()
-        except Exception:
-            logger.debug("Could not stop the preview", exc_info=True)
+        # The service is shared with the main window's row thumbnails, so stop
+        # only this editor's own work, not everything.
+        for name in ("cancel_filmstrip", "stop_playback", "cancel_frames"):
+            try:
+                getattr(self.preview, name)()
+            except Exception:
+                logger.debug("Could not stop preview work (%s)", name, exc_info=True)
         self.timeline.dispose()
         try:
             self._unsubscribe()
@@ -745,7 +799,9 @@ class TrimEditorDialog(QDialog):
             return
         self._set_status("")
         self.seek(value)
-        self.time_field.clearFocus()
+        # Not now: the same Enter is still travelling to the dialog and must
+        # still find the box focused, or it would count as "Save".
+        QTimer.singleShot(0, self.video.setFocus)
 
     def _on_seek_requested(self, t: float) -> None:
         self.seek(t)
