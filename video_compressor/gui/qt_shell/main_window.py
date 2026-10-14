@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...config import APP_NAME, APP_VERSION, get_config, get_config_manager
+from ...config import APP_NAME, get_config, get_config_manager
 from ...core.clips import ClipPlan, expand_clip_jobs
 from ...core.history import HistoryEntry, HistoryManager
 from ...core.profiles import (
@@ -47,7 +48,6 @@ from ...core.profiles import (
     describe_target_size_plan,
     normalize_quick_compress_name,
 )
-from ...core.updater import RELEASES_URL
 from ...core.utils import (
     SUPPORTED_MEDIA_EXTENSIONS,
     collect_media_files,
@@ -62,6 +62,7 @@ from ..copy import (
     QUICK_PRESET_BLURBS,
     TRAY_HELP,
     TRAY_HINT,
+    TRIM_HINT,
     help_menu_items,
     human_progress_status,
 )
@@ -77,8 +78,10 @@ from ..software_fallback_dialog import (
     handle_software_fallback_queue_message,
     with_declined_fallback_summary,
 )
-from .dialogs import qt_yes_no_ask, show_about
+from .about_dialog import AboutDialog, UpdateBanner, start_update_check
+from .dialogs import qt_yes_no_ask
 from .encode_form import EncodeForm, output_path_for
+from .history_dialog import HistoryDialog
 from .hw_card import HardwareStatusCard
 from .rows import (
     FileRow,
@@ -91,6 +94,7 @@ from .rows import (
     section_header,
 )
 from .settings_pane import SettingsPane, scroll_wrap
+from .stats_dialog import StatsDialog
 from .theme import DARK_STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -156,6 +160,8 @@ class SquishItWindow(QMainWindow):
         self._quick_buttons: dict[str, QPushButton] = {}
         self._output_folder: Optional[Path] = self._saved_output_folder()
         self._preview = None
+        self._update_info = None
+        self._update_check = None
         self._current_profile: Optional[CompressionProfile] = None
         self._selected_profile = get_config().default_profile or "Balanced"
         self.form = EncodeForm(
@@ -233,12 +239,12 @@ class SquishItWindow(QMainWindow):
         self._output_btn = QPushButton("Output folder")
         self._output_btn.clicked.connect(self._pick_output_folder)
         header.addWidget(self._output_btn)
-        help_btn = QPushButton("Help")
-        help_btn.clicked.connect(self._open_help_menu)
-        header.addWidget(help_btn)
-        about_btn = QPushButton("About")
-        about_btn.clicked.connect(self._open_about)
-        header.addWidget(about_btn)
+        history_btn = QPushButton("History")
+        history_btn.clicked.connect(self._open_history)
+        header.addWidget(history_btn)
+        more_btn = QPushButton("More \u25be")
+        more_btn.clicked.connect(self._open_help_menu)
+        header.addWidget(more_btn)
         outer.addLayout(header)
 
         self._hw_card = HardwareStatusCard()
@@ -253,6 +259,9 @@ class SquishItWindow(QMainWindow):
         queue_layout.setContentsMargins(0, 0, 8, 0)
         queue_layout.setSpacing(8)
 
+        self._update_banner = UpdateBanner()
+        queue_layout.addWidget(self._update_banner)
+
         self._drop = QFrame()
         self._drop.setObjectName("dropZone")
         drop_layout = QVBoxLayout(self._drop)
@@ -264,6 +273,10 @@ class SquishItWindow(QMainWindow):
         drop_next.setObjectName("hint")
         drop_next.setWordWrap(True)
         drop_layout.addWidget(drop_next)
+        trim_hint = QLabel(TRIM_HINT)
+        trim_hint.setObjectName("hint")
+        trim_hint.setWordWrap(True)
+        drop_layout.addWidget(trim_hint)
         drop_actions = QHBoxLayout()
         add_files = QPushButton("Add files")
         add_files.clicked.connect(self._pick_files)
@@ -1143,13 +1156,16 @@ class SquishItWindow(QMainWindow):
             logger.debug("Toast notification failed", exc_info=True)
 
     def _open_help_menu(self) -> None:
-        from PySide6.QtWidgets import QMenu
-
         menu = QMenu(self)
-        menu.addAction(HELP_TRAY, self._explain_tray)
+        menu.addAction("Statistics\u2026", self._open_stats)
+        menu.addAction("Custom profiles\u2026", self._open_profile_editor)
         menu.addSeparator()
+        menu.addAction(HELP_TRAY, self._explain_tray)
         for label, url in help_menu_items():
             menu.addAction(label, lambda target=url: webbrowser.open(target))
+        menu.addSeparator()
+        menu.addAction("Check for updates\u2026", self._open_about)
+        menu.addAction(f"About {APP_NAME}", self._open_about)
         button = self.sender()
         if button is not None and hasattr(button, "mapToGlobal"):
             menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
@@ -1160,17 +1176,44 @@ class SquishItWindow(QMainWindow):
         QMessageBox.information(self, f"{APP_NAME} tray", TRAY_HELP)
 
     def _open_about(self) -> None:
-        show_about(
+        AboutDialog(
             self,
-            f"About {APP_NAME}",
-            (
-                f"{APP_NAME} {APP_VERSION}\n\n"
-                "Desktop media compression. Source-available under the "
-                "PolyForm Noncommercial License 1.0.0. Commercial rights "
-                "are reserved to Rjwolfe44.\n\n"
-                f"Downloads: {RELEASES_URL}"
-            ),
-        )
+            hardware_summary=self._hw_card.found.text(),
+            update_info=self._update_info,
+        ).exec()
+
+    def _open_history(self) -> None:
+        HistoryDialog(self, history=self._history).exec()
+
+    def _open_stats(self) -> None:
+        StatsDialog(self, history=self._history).exec()
+
+    def _open_profile_editor(self) -> None:
+        from .profile_editor import ProfileEditorDialog
+
+        ProfileEditorDialog(
+            self,
+            profile_manager=self._profile_manager,
+            on_changed=self._profiles_changed,
+        ).exec()
+
+    def _profiles_changed(self) -> None:
+        """Custom profiles were saved, deleted or imported: refresh the menu."""
+
+        profiles = self._profile_manager.get_all_profiles()
+        self._settings.set_profiles(profiles)
+        self._settings._rebuild_more()
+
+    def check_for_updates_on_startup(self) -> None:
+        """Quietly look for a newer version; a banner appears only if there is one."""
+
+        if not get_config().check_updates_on_startup:
+            return
+        self._update_check = start_update_check(self, self._on_update_result)
+
+    def _on_update_result(self, info) -> None:
+        self._update_info = info
+        self._update_banner.set_update(info)
 
     def _on_ipc_open(self, paths: list[Path]) -> None:
         self._queue.put(("external_open", list(paths)))
@@ -1257,4 +1300,5 @@ def run_app(startup_files: Optional[list[Path]] = None, auto_start: bool = False
     apply_theme(app)
     window = SquishItWindow(startup_files=startup_files, auto_start=auto_start)
     window.show()
+    window.check_for_updates_on_startup()
     return app.exec()

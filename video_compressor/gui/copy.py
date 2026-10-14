@@ -27,6 +27,7 @@ EXTRA_SETTINGS_LABEL = "Show extra settings"
 DROP_ZONE_TITLE = "Drop a video or image"
 DROP_ZONE_NEXT = "Then pick a preset below and press Quick Compress."
 EMPTY_QUEUE = "Nothing here yet"
+TRIM_HINT = "Want only part of a video? Press Trim on its row to cut out clips."
 QUICK_PRESET_BLURBS = {
     "Quick Lite": "Fastest. A smaller file without a long wait.",
     "Balanced": "Recommended. Smaller file that still looks good.",
@@ -66,6 +67,7 @@ __all__ = [
     "DROP_ZONE_NEXT",
     "DROP_ZONE_TITLE",
     "EMPTY_QUEUE",
+    "TRIM_HINT",
     "EXTRA_SETTINGS_LABEL",
     "FINISHING_PROGRESS",
     "HELP_TRAY",
