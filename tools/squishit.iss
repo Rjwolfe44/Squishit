@@ -1,5 +1,5 @@
 #define MyAppName "SquishIt"
-#define MyAppVersion "2.0.2"
+#define MyAppVersion "2.1.0"
 #define MyAppPublisher "Vlad"
 #define MyAppExeName "SquishIt.exe"
 

@@ -8,6 +8,30 @@ Found a bug or want a feature? Open a [GitHub Issue](https://github.com/Rjwolfe4
 
 ## Features
 
+### Trim and clips
+Press **Trim** on any video in the queue (or double-click it) to open the clip editor.
+
+- **See what you keep.** A filmstrip timeline shows the whole video. Drag the edges of a blue box to trim, drag its middle to move it, or drag across empty space to add another clip. The mouse wheel zooms, Shift + wheel scrolls, and edges snap to the playhead and to other clips (hold Alt to turn snapping off).
+- **Preview as you go.** Scrub, step frame by frame, or press Space to play. Playback is silent. SquishIt uses its bundled FFmpeg for the pictures, so there is nothing extra to install.
+- **Many clips from one video.** Choose **Save each clip as its own file** (default) or **Join all clips into one video**. A size target applies to each output file.
+- **Exact times.** Type times such as `1:30` or `90.5` in the clip table or the time box.
+- **Safe by default.** SquishIt never replaces a file that is already there; it saves `name (2).mp4` instead. Your files and their clips stay in the list after a run, so you can run them again with other settings.
+
+| Key | Action |
+|-----|--------|
+| `Space` | Play / pause |
+| `I` / `O` | Start / end the selected clip at the playhead |
+| `S` | Split the clip at the playhead |
+| `←` / `→` | Back / forward one frame |
+| `Shift` + `←` / `→` | Back / forward one second |
+| `Home` / `End` | Jump to the start / end |
+| `Delete` | Remove the selected clip |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / fit |
+| `Enter` | Save the clips |
+
+Progress, time left, and size targets are worked out from the clips, not the whole video. From the command line, use `--clip START-END` (see below).
+
 ### Video Codecs
 - **HEVC (H.265)** — Default speed lane. Quick Compress Max stays on HEVC
 - **SVT-AV1** — Max / Archival. Best compression, on the CPU. Hardware encode stays off
@@ -73,13 +97,15 @@ Rolling 5-second window with exponential smoothing. Shows per-job FPS, MB/s, ETA
 - Resolution scaling (4K, 1440p, 1080p, 720p, 480p)
 - Frame rate adjustment
 - Encoding speed/preset control
-- Audio quality settings
-- Optional trim before compress
-- Audio extraction mode
-- Custom FFmpeg passthrough for power users
-- Preset import/export
+- Audio quality and audio track handling (keep, re-encode, or remove)
+- Audio-only output
+- Custom FFmpeg options for power users
+- Custom profiles editor with YAML import and export
+- Compare sample: try a few settings on a short piece of a video before the full run
+- Run order (as listed, largest, smallest, longest, or shortest first)
 - Folder recursion and animated GIF/WebP compression
-- Stats dashboard and history tracking
+- History and statistics windows, and an update notice when a newer version is out
+- Shortcuts: `Ctrl+O` add files, `Ctrl+Shift+O` add a folder, `Ctrl+Enter` compress
 
 ---
 
@@ -123,6 +149,11 @@ python cli.py video.mp4 --target-size 100
 # Batch compress
 python cli.py *.mp4 --output ./compressed/
 
+# Cut clips: one file per clip, or --join to make one video
+python cli.py talk.mp4 --clip 1:30-2:45 --clip 10:00-10:30
+python cli.py talk.mp4 --clip 5-10 --clip 20-25 --join
+python cli.py talk.mp4 --clip -30 --dry-run      # first 30 seconds; show the plan only
+
 # Show hardware info
 python cli.py --hardware
 ```
@@ -140,6 +171,8 @@ python cli.py --hardware
 | `-f, --fps` | Target frame rate |
 | `--no-hw-accel` | Disable hardware acceleration |
 | `--allow-software-fallback` | Target-size only: confirm a software retry after hardware misses the size, fails, or would need padding to hit an exact target. Omitted, the unpadded hardware result stays |
+| `--clip START-END` | Keep only this part of a video. Repeat for more clips. Times are seconds or `[h:]mm:ss`; `-30` means the first 30 s, `1:00-` means 1:00 to the end. One file per clip unless `--join` |
+| `--join` | Join all `--clip` ranges into one video, in the order given (needs two or more) |
 | `-o, --output` | Output directory |
 
 ---
@@ -173,7 +206,7 @@ dev.bat build
 
 # Build installer (requires Inno Setup)
 dev.bat installer
-# Output: dist\SquishIt-Setup-v2.0.0.exe
+# Output: dist\SquishIt-Setup-v<version>.exe
 ```
 
 ---
@@ -186,15 +219,18 @@ video_compressor/          # Main package (launch: python -m video_compressor)
 ├── __main__.py             # CLI dispatch (--quick-compress, --open, --register)
 ├── config.py               # App config, paths, defaults
 ├── core/
+│   ├── clips.py            # Clip plans: trim, join, effective length, filter graph
 │   ├── codecs.py           # Codec definitions, container compatibility matrix
 │   ├── compressor.py       # Compression engine, FFmpeg integration
 │   ├── eta.py              # Rolling-window ETA calculator
 │   ├── hardware.py         # GPU/CPU detection
+│   ├── preview.py          # Frames, filmstrip and silent playback for the trim editor
 │   ├── profiles.py         # Compression profiles
 │   └── utils.py            # Utility functions
 └── gui/
     ├── launch.py           # Default Qt shell; SQUISHIT_UI=ctk for legacy
-    ├── qt_shell/           # PySide6 main window, Quick Compress, settings
+    ├── qt_shell/           # PySide6 main window, trim editor, dialogs, settings
+    ├── timeline_model.py   # Pure timeline and clip-editing logic (no Qt)
     ├── main_window.py      # Legacy CustomTkinter window
     ├── quick_compress.py   # Legacy context-menu window
     └── widgets.py          # Legacy CustomTkinter widgets
@@ -215,6 +251,12 @@ tests/                      # Test suite (pytest; Qt launch check is offscreen)
 ├── test_codecs.py
 ├── test_config.py
 ├── test_eta.py
+├── test_clips.py           # Clip plans, timecodes, output names
+├── test_trim_engine.py     # Trim and join FFmpeg commands, progress and size maths
+├── test_trim_smoke.py      # Real clip encodes checked with ffprobe (marker: smoke)
+├── test_window_clips_smoke.py  # The window through the real engine (marker: smoke)
+├── test_timeline_model.py  # Timeline geometry, clip editing, undo
+├── test_trim_editor.py     # Trim editor and timeline widget (offscreen Qt)
 ├── test_ffmpeg_smoke.py    # Real FFmpeg and VideoCompressor encodes (marker: smoke)
 ├── test_profiles.py
 └── test_target_size.py
